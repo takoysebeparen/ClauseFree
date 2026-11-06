@@ -34,8 +34,6 @@ const FRAME_COLOR: Color = Color::srgb(0.9, 0.9, 0.86);
 const SELECTED_FRAME_COLOR: Color = Color::srgb(1.0, 0.85, 0.1);
 const FILL_COLOR: Color = Color::srgb(0.14, 0.16, 0.2);
 const DIVISION_Z: f32 = 10.0;
-/// Игровых часов на переход в соседнюю провинцию.
-const MARCH_HOURS: u32 = 24;
 /// Скорость сглаживания визуальной позиции (1/сек), только для отрисовки.
 const VISUAL_SMOOTHING: f32 = 10.0;
 /// Максимальный сдвиг курсора между нажатием и отпусканием ПКМ, чтобы считать это кликом, а не панорамой.
@@ -318,12 +316,40 @@ fn dist_floor(a: (i64, i64), b: (i64, i64)) -> u32 {
     isqrt(dist_sq(a, b)) as u32
 }
 
-/// Евклидово расстояние, округлённое вверх (стоимость ребра g).
-/// Пара floor (h) / ceil (g) сохраняет согласованность эвристики после округления.
+/// Евклидово расстояние, округлённое вверх.
 fn dist_ceil(a: (i64, i64), b: (i64, i64)) -> u32 {
     let n = dist_sq(a, b);
     let r = isqrt(n);
     (if r * r < n { r + 1 } else { r }) as u32
+}
+
+/// Минимальное время перехода в любую провинцию (нижняя граница для эвристики).
+const MIN_STEP_HOURS: u32 = 24;
+
+/// Время перехода в провинцию с данной местностью, игровых часов.
+pub fn terrain_hours(terrain: Option<&str>) -> u32 {
+    match terrain {
+        Some("plains" | "urban" | "desert") => 24,
+        Some("forest" | "hills") => 36,
+        Some("marsh") => 42,
+        Some("mountain") => 60,
+        _ => 24, // прочие типы и неизвестная местность
+    }
+}
+
+/// Самое длинное ребро графа (расстояние между центрами соседних провинций, округлено вверх).
+fn max_hop_distance(adjacency: &ProvinceAdjacency, centers: &ProvinceCenters) -> u32 {
+    let mut max = 0;
+    for (&a, set) in &adjacency.neighbors {
+        let Some(pa) = center_i(centers, a) else { continue };
+        for &b in set.range(a + 1..) {
+            // каждое ребро учитываем один раз (b > a)
+            if let Some(pb) = center_i(centers, b) {
+                max = max.max(dist_ceil(pa, pb));
+            }
+        }
+    }
+    max
 }
 
 /// A* от `start` к `goal` по `ProvinceAdjacency`; только суша. Возвращает путь включая обе точки.
@@ -350,8 +376,15 @@ pub fn find_path_a_star(
     let mut g_score: BTreeMap<u32, u32> = BTreeMap::new();
     let mut came_from: BTreeMap<u32, u32> = BTreeMap::new();
 
+    // Эвристика в часах: до цели нужно минимум dist / max_hop переходов, каждый стоит >= MIN_STEP_HOURS.
+    // Округление вниз, max_hop вверх — оценка никогда не завышает.
+    let max_hop = u64::from(max_hop_distance(adjacency, centers).max(1));
+    let heuristic = |pos: (i64, i64)| -> u32 {
+        (u64::from(MIN_STEP_HOURS) * u64::from(dist_floor(pos, goal_pos)) / max_hop) as u32
+    };
+
     g_score.insert(start, 0);
-    open.push(Reverse((dist_floor(center_i(centers, start)?, goal_pos), start, 0)));
+    open.push(Reverse((heuristic(center_i(centers, start)?), start, 0)));
 
     while let Some(Reverse((_, node, g))) = open.pop() {
         if g_score.get(&node).is_some_and(|&best| g > best) {
@@ -367,18 +400,18 @@ pub fn find_path_a_star(
             path.reverse();
             return Some(path);
         }
-        let Some(node_pos) = center_i(centers, node) else { continue };
         let Some(neighbors) = adjacency.neighbors.get(&node) else { continue };
         for &n in neighbors {
             if is_water(map, n) {
                 continue;
             }
             let Some(n_pos) = center_i(centers, n) else { continue };
-            let tentative = g.saturating_add(dist_ceil(node_pos, n_pos));
+            // Стоимость шага — время перехода в целевую провинцию с учётом местности (часы).
+            let tentative = g.saturating_add(terrain_hours(map.terrain_of(n)));
             if g_score.get(&n).is_none_or(|&best| tentative < best) {
                 g_score.insert(n, tentative);
                 came_from.insert(n, node);
-                open.push(Reverse((tentative.saturating_add(dist_floor(n_pos, goal_pos)), n, tentative)));
+                open.push(Reverse((tentative.saturating_add(heuristic(n_pos)), n, tentative)));
             }
         }
     }
@@ -443,6 +476,7 @@ fn advance_marches(
     mut divisions: Query<(Entity, &mut Division)>,
     combats: Query<&ActiveCombat>,
     adjacency: Res<ProvinceAdjacency>,
+    map: Res<ProvinceMap>,
 ) {
     for _ in ticks.read() {
         // Дивизии в бою (участвуют в уже существующих боях или созданных на этом тике).
@@ -522,11 +556,13 @@ fn advance_marches(
                     .get(&division.current_province)
                     .is_some_and(|set| set.contains(&next));
                 if reachable {
+                    // Время шага зависит от местности целевой провинции
+                    let hours = terrain_hours(map.terrain_of(next));
                     division.movement = Some(MovementProgress {
                         from: division.current_province,
                         to: next,
-                        hours_left: MARCH_HOURS,
-                        total_hours: MARCH_HOURS,
+                        hours_left: hours,
+                        total_hours: hours,
                     });
                     if let Some(s) = snapshots.iter_mut().find(|s| s.entity == entity) {
                         s.stationary = false;
@@ -825,6 +861,7 @@ fn division_info_ui(
     selected: Res<SelectedDivision>,
     divisions: Query<&Division>,
     combats: Query<&ActiveCombat>,
+    map: Res<ProvinceMap>,
 ) {
     let Some(entity) = selected.0 else { return };
     let Ok(d) = divisions.get(entity) else { return };
@@ -852,6 +889,16 @@ fn division_info_ui(
             ui.label(format!("Прочность: {}/{}", d.current_strength, d.max_strength));
             ui.label(format!("Атака: {} | Защита: {}", d.soft_attack, d.defense));
             ui.label(format!("Состояние: {status}"));
+            if let Some(m) = d.movement {
+                ui.label(format!(
+                    "Шаг: {} -> {} ({}) | Осталось: {}/{} ч",
+                    m.from,
+                    m.to,
+                    map.terrain_of(m.to).unwrap_or("unknown"),
+                    m.hours_left,
+                    m.total_hours
+                ));
+            }
             match (d.path.first(), d.path.last()) {
                 (Some(_), Some(goal)) => {
                     let via = if d.path.len() > 1 { "... -> " } else { "" };

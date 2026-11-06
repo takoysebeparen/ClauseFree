@@ -1,6 +1,7 @@
 mod camera;
 mod clock;
 mod division;
+mod economy;
 mod map;
 
 use std::path::PathBuf;
@@ -13,6 +14,7 @@ use bevy_egui::EguiPlugin;
 use camera::CameraPlugin;
 use clock::ClockPlugin;
 use division::DivisionPlugin;
+use economy::EconomyPlugin;
 use map::MapPlugin;
 
 const HOI4_PATH: &str = "D:\\SteamLibrary\\steamapps\\common\\Hearts of Iron IV";
@@ -40,6 +42,6 @@ fn main() {
                 }),
         )
         .add_plugins(EguiPlugin)
-        .add_plugins((CameraPlugin, MapPlugin { root: PathBuf::from(HOI4_PATH) }, ClockPlugin, DivisionPlugin))
+        .add_plugins((CameraPlugin, MapPlugin { root: PathBuf::from(HOI4_PATH) }, ClockPlugin, DivisionPlugin, EconomyPlugin))
         .run();
 }

@@ -156,6 +156,10 @@ pub struct StateDef {
     pub name: String,
     pub owner: String,
     pub provinces: Vec<u32>,
+    /// `industrial_complex` — гражданские фабрики стейта.
+    pub civilian_factories: u32,
+    /// `arms_factory` — военные заводы стейта.
+    pub military_factories: u32,
 }
 
 /// Все стейты мира + O(1) lookup провинция -> стейт.
@@ -168,6 +172,18 @@ pub struct StateRegistry {
 impl StateRegistry {
     pub fn state_of(&self, province_id: u32) -> Option<&Arc<StateDef>> {
         self.province_to_state.get(&province_id)
+    }
+
+    /// Суммы фабрик по странам-владельцам: тег -> (гражданские, военные).
+    /// `BTreeMap` — детерминированный порядок для экономики.
+    pub fn factories_by_owner(&self) -> BTreeMap<String, (u32, u32)> {
+        let mut totals: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+        for state in &self.states {
+            let entry = totals.entry(state.owner.clone()).or_default();
+            entry.0 = entry.0.saturating_add(state.civilian_factories);
+            entry.1 = entry.1.saturating_add(state.military_factories);
+        }
+        totals
     }
 }
 
@@ -491,6 +507,8 @@ fn parse_state(text: &str) -> Option<StateDef> {
     let mut name = None;
     let mut owner = None;
     let mut provinces = Vec::new();
+    let mut civilian_factories = None;
+    let mut military_factories = None;
     let mut depth = 0usize;
 
     let mut i = 0;
@@ -512,6 +530,14 @@ fn parse_state(text: &str) -> Option<StateDef> {
                         // owner внутри history = { ... } (depth 2); берём первое вхождение
                         ("owner", _) if owner.is_none() => {
                             owner = value.cloned();
+                        }
+                        // history { buildings { industrial_complex = N } }: ключ на глубине 3.
+                        // Здания провинций (`123 = { naval_base = 1 }`) и датированные блоки глубже.
+                        ("industrial_complex", 3) if civilian_factories.is_none() => {
+                            civilian_factories = value.and_then(|t| t.parse::<u32>().ok());
+                        }
+                        ("arms_factory", 3) if military_factories.is_none() => {
+                            military_factories = value.and_then(|t| t.parse::<u32>().ok());
                         }
                         ("provinces", 1) if provinces.is_empty() => {
                             if tokens.get(i + 2).map(String::as_str) == Some("{") {
@@ -539,6 +565,8 @@ fn parse_state(text: &str) -> Option<StateDef> {
         name: name.unwrap_or_else(|| format!("STATE_{id}")),
         owner: owner.unwrap_or_else(|| "?".to_string()),
         provinces,
+        civilian_factories: civilian_factories.unwrap_or(0),
+        military_factories: military_factories.unwrap_or(0),
     })
 }
 

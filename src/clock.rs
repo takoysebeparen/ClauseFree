@@ -92,6 +92,15 @@ pub enum ClockCommand {
 #[derive(Event, Debug, Clone, Copy)]
 pub struct HourTick;
 
+/// Суточный такт: срабатывает при переходе часов с 23:00 на 00:00. Поля — дата нового дня.
+/// Для тяжёлой логики (экономика), которая не должна считаться каждый час.
+#[derive(Event, Debug, Clone, Copy)]
+pub struct DailyTickEvent {
+    pub day: u32,
+    pub month: u32,
+    pub year: u32,
+}
+
 /// Системы, генерирующие `HourTick`. Симуляция упорядочивается `.after(ClockSet)`.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClockSet;
@@ -107,6 +116,7 @@ impl Plugin for ClockPlugin {
         app.init_resource::<GameClock>()
             .add_event::<ClockCommand>()
             .add_event::<HourTick>()
+            .add_event::<DailyTickEvent>()
             .add_systems(
                 Update,
                 (clock_input, apply_clock_commands, tick_clock).chain().in_set(ClockSet),
@@ -155,7 +165,12 @@ fn apply_clock_commands(mut events: EventReader<ClockCommand>, mut clock: ResMut
 }
 
 /// Накапливает реальное время (целые микросекунды) и выдаёт `HourTick`.
-fn tick_clock(time: Res<Time>, mut clock: ResMut<GameClock>, mut ticks: EventWriter<HourTick>) {
+fn tick_clock(
+    time: Res<Time>,
+    mut clock: ResMut<GameClock>,
+    mut ticks: EventWriter<HourTick>,
+    mut daily: EventWriter<DailyTickEvent>,
+) {
     if clock.paused {
         clock.accumulator_us = 0;
         return;
@@ -168,6 +183,10 @@ fn tick_clock(time: Res<Time>, mut clock: ResMut<GameClock>, mut ticks: EventWri
         acc -= interval;
         clock.advance_hour();
         ticks.send(HourTick);
+        // Переход 23:00 -> 00:00: наступили новые сутки
+        if clock.hour == 0 {
+            daily.send(DailyTickEvent { day: clock.day, month: clock.month, year: clock.year });
+        }
         emitted += 1;
     }
     if emitted == MAX_TICKS_PER_FRAME {
