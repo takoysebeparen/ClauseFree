@@ -26,6 +26,12 @@ use crate::map::{
 const COMBAT_INTENSITY_BP: u32 = 800;
 /// Максимальная окопанность; каждый пункт даёт +2% к эффективной защите.
 pub const MAX_ENTRENCHMENT: u32 = 10;
+/// Максимум планирования: +30% к атаке наступающей дивизии.
+pub const MAX_PLANNING: u32 = 30;
+/// Прирост планирования в сутки для дивизии на рубеже фронта.
+pub const PLANNING_GAIN_PER_DAY: u32 = 2;
+/// Расход планирования в сутки на марше и в бою.
+pub const PLANNING_DECAY_PER_DAY: u32 = 3;
 /// Базовая ширина фронта столкновения (на каждую из сторон).
 const BASE_COMBAT_WIDTH: u32 = 80;
 /// Прибавка к ширине за каждое дополнительное направление атаки (удар из другой соседней провинции).
@@ -98,6 +104,8 @@ pub struct Division {
     pub piercing: u32,
     /// Твердость, %.
     pub hardness: u32,
+    /// Планирование 0..=`MAX_PLANNING` (%): копится на рубеже фронта, тратится на марше и в бою.
+    pub planning: u32,
 }
 
 /// Положение дивизии в бою. Резерв не наносит и не получает урон.
@@ -176,6 +184,7 @@ impl Division {
             armor: stats.armor,
             piercing: stats.piercing,
             hardness: stats.hardness,
+            planning: 0,
         }
     }
 }
@@ -873,8 +882,10 @@ fn advance_marches(
 
 /// Часовая интенсивность удара `att` по `def` в bp от организации цели (целые числа).
 /// Атака и защита пропорциональны укомплектованности (current_strength / max_strength).
-fn combat_bp(att: &Division, def: &Division) -> u32 {
-    let attack = att.soft_attack * att.current_strength / att.max_strength.max(1);
+/// `planning` — бонус планирования атакующего в процентах: `attack * (100 + planning) / 100`.
+fn combat_bp(att: &Division, def: &Division, planning: u32) -> u32 {
+    let base_attack = att.soft_attack * att.current_strength / att.max_strength.max(1);
+    let attack = base_attack * (100 + planning.min(MAX_PLANNING)) / 100;
     let base_defense = def.defense * def.current_strength / def.max_strength.max(1);
     // Окопанность: +2% защиты за пункт (у наступающих она всегда 0 — марш её сбрасывает)
     let defense = base_defense * (100 + def.entrenchment.min(MAX_ENTRENCHMENT) * 2) / 100;
@@ -1124,7 +1135,8 @@ fn resolve_combats(
                 let mut hits: Vec<(Entity, u32, u32)> = Vec::new();
                 for (k, (_, striker)) in att_line.iter().enumerate() {
                     let (target_e, target) = &def_line[k % def_line.len()];
-                    let bp = combat_bp(striker, target);
+                    // Наступающая дивизия получает бонус планирования к атаке
+                    let bp = combat_bp(striker, target, striker.planning);
                     // Броня меняет урон и по организации, и по прочности
                     let org_milli = apply_armor_rule(target.max_org * bp / 10, striker, target).max(1);
                     let strength = apply_armor_rule(target.max_strength * bp / 50_000, striker, target).max(1);
@@ -1132,7 +1144,7 @@ fn resolve_combats(
                 }
                 for (k, (_, striker)) in def_line.iter().enumerate() {
                     let (target_e, target) = &att_line[k % att_line.len()];
-                    let bp = combat_bp(striker, target);
+                    let bp = combat_bp(striker, target, 0); // обороняющиеся бонуса планирования не имеют
                     // Броня меняет урон и по организации, и по прочности
                     let org_milli = apply_armor_rule(target.max_org * bp / 10, striker, target).max(1);
                     let strength = apply_armor_rule(target.max_strength * bp / 50_000, striker, target).max(1);
@@ -1551,6 +1563,10 @@ fn division_info_ui(
             ui.label(format!("Состояние: {status}"));
             ui.label(format!("Боевая ширина дивизии: {}", d.combat_width));
             ui.label(format!(
+                "План наступления: {}/{MAX_PLANNING} (+{}% к атаке)",
+                d.planning, d.planning
+            ));
+            ui.label(format!(
                 "Скорость: {}.{} км/ч | Броня: {} | Пробитие: {} | Твердость: {}%",
                 d.max_speed / 10,
                 d.max_speed % 10,
@@ -1758,6 +1774,44 @@ mod tests {
         assert!(att_armored < att_plain, "атакующие теряют больше из-за непробиваемой брони");
     }
 
+    #[test]
+    fn planning_boosts_attacker_damage_only() {
+        let run = |planning: u32| {
+            let (mut app, att, def) = scenario(&[1; 4], 4, 1);
+            for &e in &att {
+                app.world_mut().get_mut::<Division>(e).unwrap().planning = planning;
+            }
+            for _ in 0..5 {
+                tick(&mut app);
+            }
+            (totals(&app, &att).0, totals(&app, &def).0)
+        };
+        let (att_plain, def_plain) = run(0);
+        let (att_planned, def_planned) = run(30);
+        assert!(def_planned < def_plain, "подготовленные атакующие бьют сильнее");
+        assert_eq!(att_planned, att_plain, "потери атакующих не зависят от их планирования");
+    }
+
+    #[test]
+    fn planning_scales_effective_attack() {
+        let templates = DivisionTemplates::default();
+        let make = |id| {
+            Division::from_template(
+                id,
+                "d".into(),
+                "GER".into(),
+                1,
+                BASE_TEMPLATE.to_string(),
+                templates.get_or_base(BASE_TEMPLATE),
+            )
+        };
+        let (attacker, defender) = (make(1), make(2));
+        // атака 90, защита 225: 800 * 90 / 315 = 228; с +30%: атака 117 -> 800 * 117 / 342 = 273
+        assert_eq!(combat_bp(&attacker, &defender, 0), 228);
+        assert_eq!(combat_bp(&attacker, &defender, 30), 273);
+        // выше MAX_PLANNING не работает
+        assert_eq!(combat_bp(&attacker, &defender, 100), 273);
+    }
     #[test]
     fn attack_repelled_when_line_breaks() {
         // Слабые атакующие против сильной обороны: линия атаки выбита, провинция остаётся за защитой

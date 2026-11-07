@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
-use crate::division::{ActiveCombat, Division, OrderMove};
+use crate::clock::{ClockSet, DailyTickEvent};
+use crate::division::{
+    ActiveCombat, Division, OrderMove, MAX_PLANNING, PLANNING_DECAY_PER_DAY, PLANNING_GAIN_PER_DAY,
+};
 use crate::economy::PlayerCountry;
 use crate::map::{ProvinceAdjacency, ProvinceCenters, ProvinceControllerChanged, ProvinceControllers};
 
@@ -104,7 +107,45 @@ impl Plugin for FrontlinePlugin {
     fn build(&self, app: &mut App) {
         app.add_event::<CreateFrontline>()
             .add_event::<ExecuteFrontlineAttack>()
-            .add_systems(Update, (create_frontlines, execute_frontline_attacks, refresh_frontlines, frontline_panel));
+            .add_systems(Update, (create_frontlines, execute_frontline_attacks, refresh_frontlines, frontline_panel))
+            .add_systems(Update, daily_planning.after(ClockSet));
+    }
+}
+
+/// Новое значение планирования за сутки (целые числа):
+/// - дивизия не назначена на фронт (снята или фронт удалён) — сброс в 0;
+/// - в бою или на марше (в том числе при наличии маршрута) — расход `PLANNING_DECAY_PER_DAY`;
+/// - стоит на пограничной провинции рубежа — прирост `PLANNING_GAIN_PER_DAY` до `MAX_PLANNING`;
+/// - назначена, но ещё в тылу — без изменений.
+fn next_planning(current: u32, assigned: bool, busy: bool, on_border: bool) -> u32 {
+    if !assigned {
+        0
+    } else if busy {
+        current.saturating_sub(PLANNING_DECAY_PER_DAY)
+    } else if on_border {
+        (current + PLANNING_GAIN_PER_DAY).min(MAX_PLANNING)
+    } else {
+        current
+    }
+}
+
+/// Суточное накопление и расход планирования.
+fn daily_planning(
+    mut events: EventReader<DailyTickEvent>,
+    frontlines: Query<&Frontline>,
+    mut divisions: Query<(Entity, &mut Division)>,
+    combats: Query<&ActiveCombat>,
+) {
+    for _ in events.read() {
+        for (entity, mut d) in &mut divisions {
+            let front = frontlines.iter().find(|f| f.owner == d.owner && f.assigned_divisions.contains(&entity));
+            let busy = d.movement.is_some() || !d.path.is_empty() || combats.iter().any(|c| c.involves(entity));
+            let on_border = front.is_some_and(|f| f.provinces.binary_search(&d.current_province).is_ok());
+            let next = next_planning(d.planning, front.is_some(), busy, on_border);
+            if next != d.planning {
+                d.planning = next;
+            }
+        }
     }
 }
 
@@ -343,6 +384,13 @@ fn create_frontlines(
 // UI
 // ---------------------------------------------------------------------------
 
+/// Средний `planning` назначенных на фронт дивизий (целочисленное деление, 0 для пустого фронта).
+fn average_planning(frontline: &Frontline, divisions: &Query<(Entity, &Division)>) -> u32 {
+    let planning: Vec<u32> =
+        frontline.assigned_divisions.iter().filter_map(|&e| divisions.get(e).ok()).map(|(_, d)| d.planning).collect();
+    if planning.is_empty() { 0 } else { planning.iter().sum::<u32>() / planning.len() as u32 }
+}
+
 /// Панель управления внизу справа: кнопка развёртывания фронта и сводка по фронтам.
 fn frontline_panel(
     mut contexts: EguiContexts,
@@ -388,6 +436,7 @@ fn frontline_panel(
             }
 
             for (_, f) in &frontlines {
+                let avg = average_planning(f, &divisions);
                 ui.label(format!(
                     "Фронт {} vs {}: участков {}, дивизий {}",
                     f.owner,
@@ -395,6 +444,102 @@ fn frontline_panel(
                     f.provinces.len(),
                     f.assigned_divisions.len()
                 ));
+                // Средний план наступления армии фронта (проценты от максимума — целочисленно)
+                ui.label(format!(
+                    "Готовность наступления: {avg}/{MAX_PLANNING} ({}%)",
+                    avg * 100 / MAX_PLANNING
+                ));
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::division::MovementProgress;
+    use crate::units::{DivisionTemplates, BASE_TEMPLATE};
+
+    #[test]
+    fn next_planning_rules() {
+        // на рубеже: +2 до потолка 30
+        assert_eq!(next_planning(0, true, false, true), 2);
+        assert_eq!(next_planning(29, true, false, true), 30);
+        assert_eq!(next_planning(30, true, false, true), 30);
+        // в бою / на марше: -3, не ниже нуля (даже на рубеже)
+        assert_eq!(next_planning(30, true, true, true), 27);
+        assert_eq!(next_planning(2, true, true, false), 0);
+        // назначена, но в тылу: без изменений
+        assert_eq!(next_planning(10, true, false, false), 10);
+        // снята с фронта: сброс
+        assert_eq!(next_planning(30, false, false, true), 0);
+        assert_eq!(next_planning(12, false, true, false), 0);
+    }
+
+    fn spawn_division(app: &mut App, id: u32, province: u32) -> Entity {
+        let templates = DivisionTemplates::default();
+        let d = Division::from_template(
+            id,
+            format!("Div {id}"),
+            "GER".to_string(),
+            province,
+            BASE_TEMPLATE.to_string(),
+            templates.get_or_base(BASE_TEMPLATE),
+        );
+        app.world_mut().spawn(d).id()
+    }
+
+    fn day(app: &mut App) {
+        app.world_mut().send_event(DailyTickEvent { day: 1, month: 1, year: 1936 });
+        app.update();
+    }
+
+    fn planning(app: &App, e: Entity) -> u32 {
+        app.world().get::<Division>(e).expect("дивизия жива").planning
+    }
+
+    #[test]
+    fn daily_planning_accumulates_spends_and_resets() {
+        let mut app = App::new();
+        app.add_event::<DailyTickEvent>().add_systems(Update, daily_planning);
+
+        let on_border = spawn_division(&mut app, 1, 5); // рубеж: провинция 5
+        let in_rear = spawn_division(&mut app, 2, 9); // назначена, но стоит в тылу
+        let unassigned = spawn_division(&mut app, 3, 5); // на фронт не назначена
+        app.world_mut().get_mut::<Division>(unassigned).unwrap().planning = 10;
+
+        let front = app
+            .world_mut()
+            .spawn(Frontline {
+                owner: "GER".into(),
+                enemy: "FRA".into(),
+                provinces: vec![5, 6],
+                assigned_divisions: vec![on_border, in_rear],
+            })
+            .id();
+
+        // Накопление: +2 в сутки до потолка 30 (15 суток), в тылу — ничего, не назначенная — сброс
+        for _ in 0..10 {
+            day(&mut app);
+        }
+        assert_eq!(planning(&app, on_border), 20);
+        assert_eq!(planning(&app, in_rear), 0);
+        assert_eq!(planning(&app, unassigned), 0);
+        for _ in 0..10 {
+            day(&mut app);
+        }
+        assert_eq!(planning(&app, on_border), 30, "потолок MAX_PLANNING");
+
+        // Марш: накопление стоп, расход -3 в сутки
+        app.world_mut().get_mut::<Division>(on_border).unwrap().movement =
+            Some(MovementProgress { from: 5, to: 6, hours_left: 24, total_hours: 24 });
+        day(&mut app);
+        assert_eq!(planning(&app, on_border), 27);
+        day(&mut app);
+        assert_eq!(planning(&app, on_border), 24);
+
+        // Фронт удалён — на следующих сутках планирование сбрасывается
+        app.world_mut().despawn(front);
+        day(&mut app);
+        assert_eq!(planning(&app, on_border), 0);
+    }
 }
