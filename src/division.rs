@@ -255,7 +255,7 @@ pub struct OrderMove {
 /// - отрезанная дивизия: `is_supplied = false`, +1 день истощения, организация не восстанавливается,
 ///   теряется `ATTRITION_STRENGTH_PCT`% текущей прочности (не ниже 1 единицы, минимум потери 1).
 ///   Эти небоевые потери не входят в счётчик боевых `losses`.
-fn daily_supply(
+pub fn daily_supply(
     mut events: EventReader<DailyTickEvent>,
     network: Res<SupplyNetwork>,
     mut divisions: Query<(Entity, &mut Division)>,
