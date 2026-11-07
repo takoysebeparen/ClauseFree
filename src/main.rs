@@ -1,8 +1,13 @@
+mod ai;
 mod camera;
 mod clock;
 mod division;
 mod economy;
+mod frontline;
 mod map;
+mod oob;
+mod surrender;
+mod units;
 
 use std::path::PathBuf;
 
@@ -11,10 +16,13 @@ use bevy::render::settings::{Backends, RenderCreation, WgpuSettings};
 use bevy::render::RenderPlugin;
 use bevy_egui::EguiPlugin;
 
+use ai::AiPlugin;
 use camera::CameraPlugin;
 use clock::ClockPlugin;
 use division::DivisionPlugin;
 use economy::EconomyPlugin;
+use frontline::FrontlinePlugin;
+use surrender::SurrenderPlugin;
 use map::MapPlugin;
 
 const HOI4_PATH: &str = "D:\\SteamLibrary\\steamapps\\common\\Hearts of Iron IV";
@@ -42,6 +50,6 @@ fn main() {
                 }),
         )
         .add_plugins(EguiPlugin)
-        .add_plugins((CameraPlugin, MapPlugin { root: PathBuf::from(HOI4_PATH) }, ClockPlugin, DivisionPlugin, EconomyPlugin))
+        .add_plugins((CameraPlugin, MapPlugin { root: PathBuf::from(HOI4_PATH) }, ClockPlugin, DivisionPlugin, EconomyPlugin, FrontlinePlugin, AiPlugin, SurrenderPlugin))
         .run();
 }

@@ -6,30 +6,36 @@
 //! Позиции, масштаб спрайтов и UI-полоски — чисто визуальные и на симуляцию не влияют.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
 
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::camera::MainCamera;
-use crate::clock::{ClockSet, HourTick};
+use crate::clock::{ClockSet, DailyTickEvent, HourTick};
+use crate::oob::OobDivisions;
+use crate::units::{DivisionTemplate, DivisionTemplates, BASE_TEMPLATE};
 use crate::map::{
-    country_color, pick_province, setup_map, HoveredProvince, ProvinceAdjacency, ProvinceCenters, ProvinceMap,
-    StateRegistry,
+    country_color, pick_province, setup_map, HoveredProvince, ProvinceAdjacency, ProvinceCenters, ProvinceControllerChanged,
+    ProvinceControllers, ProvinceMap,
 };
 
-/// Тестовые дивизии: (id дивизии, провинция, soft_attack, defense).
-/// 6521 — Берлин, 11506 — Париж (victory points).
-const TEST_DIVISIONS: [(u32, u32, u32, u32); 2] = [(1, 6521, 130, 80), (2, 11506, 120, 80)];
-/// Тестовый противник: id, тег владельца, soft_attack, defense. Ставится в соседнюю с Берлином провинцию.
-const ENEMY_DIVISION: (u32, &str, u32, u32) = (3, "FRA", 120, 80);
-const ENEMY_NEXT_TO_PROVINCE: u32 = 6521;
-
-const BASE_ORG: u32 = 1000;
-const BASE_STRENGTH: u32 = 1000;
+/// Интенсивность боя: доля организации цели, снимаемая за час, в сотых долях процента (bp),
+/// при равных атаке и защите. Подобрана так, чтобы равные дивизии дрались около суток.
+const COMBAT_INTENSITY_BP: u32 = 800;
+/// Максимальная окопанность; каждый пункт даёт +2% к эффективной защите.
+pub const MAX_ENTRENCHMENT: u32 = 10;
+/// Базовая ширина фронта столкновения (на каждую из сторон).
+const BASE_COMBAT_WIDTH: u32 = 80;
+/// Прибавка к ширине за каждое дополнительное направление атаки (удар из другой соседней провинции).
+const FLANK_WIDTH_BONUS: u32 = 40;
+/// Минимальный шанс (%) выхода резерва на линию за час; к нему добавляется 0..=3 по id дивизии (итого 2..=5%).
+const RESERVE_MIN_CHANCE_PCT: u32 = 2;
 
 const DIVISION_SIZE: Vec2 = Vec2::new(24.0, 14.0);
+/// Сдвиг каждой следующей дивизии в стеке, экранные пиксели (по диагонали вправо-вниз).
+const STACK_STEP_PX: Vec2 = Vec2::new(10.0, -8.0);
 const FRAME_COLOR: Color = Color::srgb(0.9, 0.9, 0.86);
 const SELECTED_FRAME_COLOR: Color = Color::srgb(1.0, 0.85, 0.1);
 const FILL_COLOR: Color = Color::srgb(0.14, 0.16, 0.2);
@@ -56,6 +62,8 @@ pub struct MovementProgress {
 #[derive(Component, Debug, Clone)]
 pub struct Division {
     pub id: u32,
+    /// Историческое имя из OOB.
+    pub name: String,
     pub owner: String,
     /// Провинция, где дивизия находится; во время марша — провинция отправления.
     pub current_province: u32,
@@ -68,36 +76,125 @@ pub struct Division {
     pub current_strength: u32,
     pub soft_attack: u32,
     pub defense: u32,
+    /// Накопленные безвозвратные боевые потери (единиц прочности ~ винтовок).
+    pub losses: u32,
+    /// Имя шаблона из OOB (отображается в панели).
+    pub template_name: String,
+    pub battalion_count: u32,
+    /// Личный состав и снаряжение в полном составе (из шаблона).
+    pub max_manpower: u32,
+    pub required_equipment: u32,
+    /// Ещё не списанный дробный урон организации, в тысячных долях очка (0..1000).
+    pub org_frac: u32,
+    /// Окопанность 0..=10: растёт раз в сутки на месте, сбрасывается при марше и отступлении.
+    pub entrenchment: u32,
+    /// Ширина фронта, которую дивизия занимает на активной линии боя (из шаблона).
+    pub combat_width: u32,
+    /// Роль в текущем бою: вне боя, на активной линии или в резерве.
+    pub combat_state: CombatState,
+}
+
+/// Положение дивизии в бою. Резерв не наносит и не получает урон.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CombatState {
+    #[default]
+    None,
+    Active,
+    Reserve,
 }
 
 impl Division {
-    pub fn new(id: u32, owner: String, province: u32, soft_attack: u32, defense: u32) -> Self {
+    /// Личный состав сейчас: пропорционален укомплектованности.
+    pub fn current_manpower(&self) -> u32 {
+        (u64::from(self.max_manpower) * u64::from(self.current_strength) / u64::from(self.max_strength.max(1))) as u32
+    }
+
+    /// Снаряжение сейчас: пропорционально укомплектованности.
+    pub fn current_equipment(&self) -> u32 {
+        (u64::from(self.required_equipment) * u64::from(self.current_strength) / u64::from(self.max_strength.max(1)))
+            as u32
+    }
+
+    /// Урон организации в тысячных долях очка; дробный остаток копится в `org_frac`.
+    fn lose_org_milli(&mut self, milli: u32) {
+        let total = self.org_frac.saturating_add(milli);
+        self.current_org = self.current_org.saturating_sub(total / 1000);
+        self.org_frac = if self.current_org == 0 { 0 } else { total % 1000 };
+    }
+
+    /// Организация в тысячных долях очка (с учётом ещё не списанного урона).
+    fn org_milli(&self) -> u32 {
+        (self.current_org * 1000).saturating_sub(self.org_frac)
+    }
+
+    /// Боевые потери: уменьшает прочность и фиксирует реально потерянное в `losses`.
+    fn lose_strength(&mut self, amount: u32) {
+        let lost = amount.min(self.current_strength);
+        self.current_strength -= lost;
+        self.losses = self.losses.saturating_add(lost);
+    }
+
+    /// Дивизия в полном составе; все характеристики считает `DivisionTemplate::calculate_stats()`.
+    pub fn from_template(
+        id: u32,
+        name: String,
+        owner: String,
+        province: u32,
+        template_name: String,
+        template: &DivisionTemplate,
+    ) -> Self {
+        let stats = template.calculate_stats();
         Self {
             id,
+            name,
             owner,
             current_province: province,
             movement: None,
             path: Vec::new(),
-            max_org: BASE_ORG,
-            current_org: BASE_ORG,
-            max_strength: BASE_STRENGTH,
-            current_strength: BASE_STRENGTH,
-            soft_attack,
-            defense,
+            max_org: stats.max_org,
+            current_org: stats.max_org,
+            max_strength: stats.max_strength,
+            current_strength: stats.max_strength,
+            soft_attack: stats.soft_attack,
+            defense: stats.defense,
+            losses: 0,
+            template_name,
+            battalion_count: template.battalion_count(),
+            max_manpower: stats.total_manpower,
+            required_equipment: stats.total_required_equipment,
+            org_frac: 0,
+            entrenchment: 0,
+            combat_width: stats.combat_width,
+            combat_state: CombatState::None,
         }
     }
 }
 
-/// Идущий бой. Отдельная сущность, существует до победы одной из сторон.
+/// Идущий бой за провинцию. Отдельная сущность, существует до победы одной из сторон.
+/// В бою участвуют все дивизии обеих сторон; на линию каждой стороны попадает столько,
+/// сколько вмещает `max_width`, остальные ждут в резерве (`Division::combat_state`).
 #[derive(Component, Debug, Clone)]
 pub struct ActiveCombat {
     pub province_id: u32,
-    pub attacker: Entity,
-    pub defender: Entity,
-    /// Процент потерянной защитником организации, 0..=100.
+    pub attacker_owner: String,
+    pub defender_owner: String,
+    /// Все атакующие (линия и резерв), по возрастанию id дивизии.
+    pub attackers: Vec<Entity>,
+    /// Все защитники (линия и резерв), по возрастанию id дивизии.
+    pub defenders: Vec<Entity>,
+    /// Лимит ширины фронта для каждой стороны: база + бонус за каждое дополнительное направление атаки.
+    pub max_width: u32,
+    /// Процент потерянной защитниками организации, 0..=100.
     pub combat_progress: u32,
-    /// Сколько игровых часов длится бой (детерминированный источник «случайности» для отступления).
+    /// Сколько игровых часов длится бой (детерминированный источник «случайности» для резервов и отступления).
     pub elapsed_hours: u32,
+}
+
+impl ActiveCombat {
+    /// Участвует ли дивизия в бою (на линии или в резерве).
+    pub fn involves(&self, entity: Entity) -> bool {
+        self.attackers.contains(&entity) || self.defenders.contains(&entity)
+    }
 }
 
 #[derive(Resource, Default)]
@@ -110,6 +207,27 @@ pub struct OrderMove {
     pub target: u32,
 }
 
+/// Раз в сутки (00:00): стоящая дивизия, не в бою и без приказа на марш, окапывается на 1 пункт.
+fn daily_entrenchment(
+    mut events: EventReader<DailyTickEvent>,
+    mut divisions: Query<(Entity, &mut Division)>,
+    combats: Query<&ActiveCombat>,
+) {
+    for _ in events.read() {
+        let in_combat: HashSet<Entity> =
+            combats.iter().flat_map(|c| c.attackers.iter().chain(c.defenders.iter()).copied()).collect();
+        for (entity, mut d) in &mut divisions {
+            if d.movement.is_none()
+                && d.path.is_empty()
+                && !in_combat.contains(&entity)
+                && d.entrenchment < MAX_ENTRENCHMENT
+            {
+                d.entrenchment += 1;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Плагин
 // ---------------------------------------------------------------------------
@@ -119,9 +237,10 @@ pub struct DivisionPlugin;
 impl Plugin for DivisionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SelectedDivision>()
+            .init_resource::<DivisionTemplates>()
             .add_event::<OrderMove>()
-            // adjacency вставляется командами из setup_map, поэтому спавн строго после него
-            .add_systems(Startup, spawn_test_divisions.after(setup_map))
+            // метрики графа считаются сразу после того, как setup_map построил граф смежности
+            .add_systems(Startup, (spawn_oob_divisions, init_graph_metrics.after(setup_map)))
             .add_systems(
                 Update,
                 (
@@ -138,7 +257,8 @@ impl Plugin for DivisionPlugin {
                     .after(pick_province)
                     .after(ClockSet),
             )
-            .add_systems(Update, (combat_ui, division_info_ui));
+            .add_systems(Update, (combat_ui, division_info_ui))
+            .add_systems(Update, daily_entrenchment.after(ClockSet));
     }
 }
 
@@ -148,7 +268,6 @@ impl Plugin for DivisionPlugin {
 
 fn spawn_division_entity(commands: &mut Commands, division: Division, center: Vec2) {
     let [r, g, b] = country_color(&division.owner);
-    let (id, owner, province) = (division.id, division.owner.clone(), division.current_province);
 
     // Корень — рамка; внутри тёмная заливка и цветной бейдж страны.
     commands
@@ -180,47 +299,69 @@ fn spawn_division_entity(commands: &mut Commands, division: Division, center: Ve
                 ..default()
             });
         });
-    println!("[ДИВИЗИЯ] #{id} ({owner}) создана в провинции {province}");
 }
 
 fn is_water(map: &ProvinceMap, province: u32) -> bool {
     matches!(map.terrain_of(province), Some("ocean" | "lakes"))
 }
 
-fn spawn_test_divisions(
+/// Спавн дивизий из распарсенного OOB. Id назначаются по порядку в файлах (GER, затем FRA).
+/// Дивизии на море или в провинциях без центра пропускаются.
+fn spawn_oob_divisions(
     mut commands: Commands,
+    oob: Res<OobDivisions>,
     centers: Res<ProvinceCenters>,
-    registry: Res<StateRegistry>,
-    adjacency: Res<ProvinceAdjacency>,
     map: Res<ProvinceMap>,
+    templates: Res<DivisionTemplates>,
 ) {
-    for (id, province, soft_attack, defense) in TEST_DIVISIONS {
-        let Some(center) = centers.centers.get(&province) else {
-            eprintln!("[ПРЕДУПРЕЖДЕНИЕ] нет центра для провинции {province}, дивизия {id} не создана");
+    let base = templates.get_or_base(BASE_TEMPLATE);
+    let base_stats = base.calculate_stats();
+    println!(
+        "[ШАБЛОН] {}: {} бат., личный состав {}, прочность {}, организация {}, атака {}, защита {}, снаряжение {}",
+        base.name,
+        base.battalion_count(),
+        base_stats.total_manpower,
+        base_stats.max_strength,
+        base_stats.max_org,
+        base_stats.soft_attack,
+        base_stats.defense,
+        base_stats.total_required_equipment
+    );
+
+    let mut next_id = 1u32;
+    let mut skipped = 0u32;
+    // Счётчики по странам, порядок вывода детерминирован
+    let mut per_owner: BTreeMap<&str, u32> = BTreeMap::new();
+
+    for entry in &oob.0 {
+        let Some(center) = centers.centers.get(&entry.location) else {
+            skipped += 1;
             continue;
         };
-        let Some(state) = registry.state_of(province) else {
-            eprintln!("[ПРЕДУПРЕЖДЕНИЕ] провинция {province} без стейта, дивизия {id} не создана");
+        if is_water(&map, entry.location) {
+            skipped += 1;
             continue;
-        };
-        let division = Division::new(id, state.owner.clone(), province, soft_attack, defense);
+        }
+        // Шаблон из реестра; незарегистрированные (французские и т.п.) пока считаются базовым.
+        let division = Division::from_template(
+            next_id,
+            entry.name.clone(),
+            entry.owner.clone(),
+            entry.location,
+            entry.template.clone(),
+            templates.get_or_base(&entry.template),
+        );
         spawn_division_entity(&mut commands, division, *center);
+        *per_owner.entry(entry.owner.as_str()).or_default() += 1;
+        next_id += 1;
     }
 
-    // Противник для проверки боя: в первой (по возрастанию id) сухопутной соседке Берлина.
-    let (id, owner, soft_attack, defense) = ENEMY_DIVISION;
-    let neighbor = adjacency
-        .neighbors
-        .get(&ENEMY_NEXT_TO_PROVINCE)
-        .and_then(|set| set.iter().copied().find(|&n| !is_water(&map, n)));
-    match neighbor.and_then(|n| centers.centers.get(&n).map(|c| (n, *c))) {
-        Some((province, center)) => {
-            let division = Division::new(id, owner.to_string(), province, soft_attack, defense);
-            spawn_division_entity(&mut commands, division, center);
-            println!("[ТЕСТ] Вражеская дивизия #{id} ({owner}) стоит в провинции {province} — соседе Берлина");
-        }
-        None => eprintln!("[ПРЕДУПРЕЖДЕНИЕ] не найден сосед Берлина для тестового противника"),
-    }
+    let breakdown: Vec<String> = per_owner.iter().map(|(tag, n)| format!("{tag} {n}")).collect();
+    println!(
+        "[OOB] Заспавнено дивизий: {} ({}), пропущено (море / нет центра): {skipped}",
+        next_id - 1,
+        breakdown.join(", ")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -238,13 +379,29 @@ fn select_division_input(
     if !mouse.just_pressed(MouseButton::Left) || contexts.ctx_mut().wants_pointer_input() {
         return;
     }
-    // При нескольких дивизиях в одной провинции берём с наименьшим id — детерминированно.
     selected.0 = hovered.id.and_then(|province| {
-        divisions
+        // Стек провинции: стоящие дивизии по возрастанию id — детерминированный порядок
+        let mut stack: Vec<(u32, Entity)> = divisions
             .iter()
-            .filter(|(_, d)| d.current_province == province)
-            .min_by_key(|(_, d)| d.id)
-            .map(|(e, _)| e)
+            .filter(|(_, d)| d.current_province == province && d.movement.is_none())
+            .map(|(e, d)| (d.id, e))
+            .collect();
+        stack.sort_unstable();
+
+        if stack.is_empty() {
+            // Остались только идущие в марше (их фишки вне центра): выбираем с наименьшим id
+            return divisions
+                .iter()
+                .filter(|(_, d)| d.current_province == province)
+                .min_by_key(|(_, d)| d.id)
+                .map(|(e, _)| e);
+        }
+        // Циклический выбор: если выбрана дивизия этой провинции — следующая, после последней — первая
+        let next = match selected.0.and_then(|cur| stack.iter().position(|&(_, e)| e == cur)) {
+            Some(i) => (i + 1) % stack.len(),
+            None => 0,
+        };
+        Some(stack[next].1)
     });
 }
 
@@ -337,80 +494,133 @@ pub fn terrain_hours(terrain: Option<&str>) -> u32 {
     }
 }
 
-/// Самое длинное ребро графа (расстояние между центрами соседних провинций, округлено вверх).
-fn max_hop_distance(adjacency: &ProvinceAdjacency, centers: &ProvinceCenters) -> u32 {
-    let mut max = 0;
-    for (&a, set) in &adjacency.neighbors {
-        let Some(pa) = center_i(centers, a) else { continue };
-        for &b in set.range(a + 1..) {
-            // каждое ребро учитываем один раз (b > a)
-            if let Some(pb) = center_i(centers, b) {
-                max = max.max(dist_ceil(pa, pb));
+/// Предрассчитанные параметры графа провинций. Считаются один раз после построения графа смежности
+/// (`init_graph_metrics`), поэтому поиск пути не обходит весь граф при каждом вызове.
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct GraphMetrics {
+    /// Самое длинное ребро графа: расстояние между центрами соседних провинций, округлено вверх.
+    /// Нужно эвристике A*.
+    pub max_hop_px: u32,
+    /// Наибольший id провинции в графе: размер плотных массивов поиска.
+    pub max_province_id: u32,
+}
+
+impl GraphMetrics {
+    pub fn compute(adjacency: &ProvinceAdjacency, centers: &ProvinceCenters) -> Self {
+        let mut max_hop_px = 0;
+        let mut max_province_id = 0;
+        for (&a, set) in &adjacency.neighbors {
+            max_province_id = max_province_id.max(a);
+            if let Some(&last) = set.iter().next_back() {
+                max_province_id = max_province_id.max(last);
+            }
+            let Some(pa) = center_i(centers, a) else { continue };
+            for &b in set.range(a + 1..) {
+                // каждое ребро учитываем один раз (b > a)
+                if let Some(pb) = center_i(centers, b) {
+                    max_hop_px = max_hop_px.max(dist_ceil(pa, pb));
+                }
             }
         }
+        Self { max_hop_px, max_province_id }
     }
-    max
 }
+
+/// Один раз при старте, сразу после построения графа смежности в `setup_map`.
+fn init_graph_metrics(mut commands: Commands, adjacency: Res<ProvinceAdjacency>, centers: Res<ProvinceCenters>) {
+    let metrics = GraphMetrics::compute(&adjacency, &centers);
+    println!(
+        "[ГРАФ] Самое длинное ребро: {} px, максимальный id провинции: {}",
+        metrics.max_hop_px, metrics.max_province_id
+    );
+    commands.insert_resource(metrics);
+}
+
+/// Начальная ёмкость очереди A*: поиск через всю карту посещает тысячи вершин.
+const OPEN_CAPACITY: usize = 2048;
+/// Отсутствие значения в плотных массивах поиска.
+const NONE: u32 = u32::MAX;
 
 /// A* от `start` к `goal` по `ProvinceAdjacency`; только суша. Возвращает путь включая обе точки.
 /// Детерминизм: соседи идут по возрастанию id (BTreeSet), очередь — `BinaryHeap` с ключом
-/// (f, id узла, g), все карты — `BTreeMap`; никаких хэш-коллекций и `f32` в расчёте.
-/// Отличие от заданной сигнатуры: добавлен `map` — из него берётся тип местности (вода).
+/// (f, id узла, g); оценки и предки лежат в плотных массивах по id провинции (без хэш-коллекций
+/// и без `f32` в расчёте). Массивы и очередь выделяются заранее, а длина самого длинного ребра
+/// берётся из предрассчитанных `GraphMetrics`.
+/// Отличие от заданной сигнатуры: добавлены `map` (тип местности, вода) и `metrics`.
+///
+/// Суверенитет: провинция проходима, только если её контроллер — `owner` или `enemy_target`.
+/// Нейтральные страны и провинции без контроллера — стена. Стартовая провинция не проверяется
+/// (дивизия может стоять где угодно), а цель обязана быть проходимой.
+#[allow(clippy::too_many_arguments)]
 pub fn find_path_a_star(
     start: u32,
     goal: u32,
     adjacency: &ProvinceAdjacency,
     centers: &ProvinceCenters,
     map: &ProvinceMap,
+    controllers: &ProvinceControllers,
+    metrics: &GraphMetrics,
+    owner: &str,
+    enemy_target: Option<&str>,
 ) -> Option<Vec<u32>> {
+    let is_passable = |province: u32| {
+        controllers
+            .0
+            .get(&province)
+            .is_some_and(|c| c.as_str() == owner || enemy_target == Some(c.as_str()))
+    };
     if start == goal {
         return Some(vec![start]);
     }
-    if is_water(map, goal) {
+    if is_water(map, goal) || !is_passable(goal) {
+        return None;
+    }
+    let size = metrics.max_province_id as usize + 1;
+    if start as usize >= size || goal as usize >= size {
         return None;
     }
     let goal_pos = center_i(centers, goal)?;
-    center_i(centers, start)?;
+    let start_pos = center_i(centers, start)?;
 
-    let mut open: BinaryHeap<Reverse<(u32, u32, u32)>> = BinaryHeap::new(); // (f, node, g)
-    let mut g_score: BTreeMap<u32, u32> = BTreeMap::new();
-    let mut came_from: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut open: BinaryHeap<Reverse<(u32, u32, u32)>> = BinaryHeap::with_capacity(OPEN_CAPACITY); // (f, node, g)
+    let mut g_score = vec![NONE; size];
+    let mut came_from = vec![NONE; size];
 
     // Эвристика в часах: до цели нужно минимум dist / max_hop переходов, каждый стоит >= MIN_STEP_HOURS.
     // Округление вниз, max_hop вверх — оценка никогда не завышает.
-    let max_hop = u64::from(max_hop_distance(adjacency, centers).max(1));
+    let max_hop = u64::from(metrics.max_hop_px.max(1));
     let heuristic = |pos: (i64, i64)| -> u32 {
         (u64::from(MIN_STEP_HOURS) * u64::from(dist_floor(pos, goal_pos)) / max_hop) as u32
     };
 
-    g_score.insert(start, 0);
-    open.push(Reverse((heuristic(center_i(centers, start)?), start, 0)));
+    g_score[start as usize] = 0;
+    open.push(Reverse((heuristic(start_pos), start, 0)));
 
     while let Some(Reverse((_, node, g))) = open.pop() {
-        if g_score.get(&node).is_some_and(|&best| g > best) {
+        if g > g_score[node as usize] {
             continue; // устаревшая запись
         }
         if node == goal {
             let mut path = vec![goal];
             let mut cur = goal;
-            while let Some(&prev) = came_from.get(&cur) {
-                path.push(prev);
-                cur = prev;
+            while came_from[cur as usize] != NONE {
+                cur = came_from[cur as usize];
+                path.push(cur);
             }
             path.reverse();
             return Some(path);
         }
         let Some(neighbors) = adjacency.neighbors.get(&node) else { continue };
         for &n in neighbors {
-            if is_water(map, n) {
+            if n as usize >= size || is_water(map, n) || !is_passable(n) {
                 continue;
             }
             let Some(n_pos) = center_i(centers, n) else { continue };
             // Стоимость шага — время перехода в целевую провинцию с учётом местности (часы).
             let tentative = g.saturating_add(terrain_hours(map.terrain_of(n)));
-            if g_score.get(&n).is_none_or(|&best| tentative < best) {
-                g_score.insert(n, tentative);
-                came_from.insert(n, node);
+            if tentative < g_score[n as usize] {
+                g_score[n as usize] = tentative;
+                came_from[n as usize] = node;
                 open.push(Reverse((tentative.saturating_add(heuristic(n_pos)), n, tentative)));
             }
         }
@@ -431,9 +641,11 @@ fn apply_orders(
     adjacency: Res<ProvinceAdjacency>,
     centers: Res<ProvinceCenters>,
     map: Res<ProvinceMap>,
+    controllers: Res<ProvinceControllers>,
+    metrics: Res<GraphMetrics>,
 ) {
     for order in events.read() {
-        if combats.iter().any(|c| c.attacker == order.division || c.defender == order.division) {
+        if combats.iter().any(|c| c.involves(order.division)) {
             println!("[ПРИКАЗ] Дивизия в бою — приказ отклонён");
             continue;
         }
@@ -441,9 +653,25 @@ fn apply_orders(
 
         // Если дивизия уже в пути, новый маршрут строится от точки, куда она сейчас идёт.
         let start = division.movement.map_or(division.current_province, |m| m.to);
-        match find_path_a_star(start, order.target, &adjacency, &centers, &map) {
+        // Цель приказа определяет «противника»: путь идёт по своей территории и по территории
+        // страны, контролирующей целевую провинцию; чужие нейтральные страны — стена.
+        let enemy_target = controllers.0.get(&order.target).map(String::as_str);
+        match find_path_a_star(
+            start,
+            order.target,
+            &adjacency,
+            &centers,
+            &map,
+            &controllers,
+            &metrics,
+            &division.owner,
+            enemy_target,
+        ) {
             Some(path) => {
                 division.path = path.into_iter().skip(1).collect(); // без стартовой точки
+                if !division.path.is_empty() {
+                    division.entrenchment = 0; // приказ на марш мгновенно сбрасывает окопанность
+                }
                 println!(
                     "[ПУТЬ] Дивизия #{}: {} -> {} ({} шагов)",
                     division.id,
@@ -474,13 +702,20 @@ fn advance_marches(
     mut ticks: EventReader<HourTick>,
     mut commands: Commands,
     mut divisions: Query<(Entity, &mut Division)>,
-    combats: Query<&ActiveCombat>,
+    mut combats: Query<&mut ActiveCombat>,
     adjacency: Res<ProvinceAdjacency>,
     map: Res<ProvinceMap>,
+    mut controllers: ResMut<ProvinceControllers>,
+    mut controller_changed: EventWriter<ProvinceControllerChanged>,
 ) {
     for _ in ticks.read() {
         // Дивизии в бою (участвуют в уже существующих боях или созданных на этом тике).
-        let mut busy: HashSet<Entity> = combats.iter().flat_map(|c| [c.attacker, c.defender]).collect();
+        let mut busy: HashSet<Entity> =
+            combats.iter().flat_map(|c| c.attackers.iter().chain(c.defenders.iter()).copied()).collect();
+        // Участники боёв, существовавших на начало тика (нужны, чтобы не втянуть их в новый бой)
+        let engaged = busy.clone();
+        // Атакующие, дошедшие до вражеской провинции на этом тике: провинция -> атакующие (по id)
+        let mut pending: BTreeMap<u32, Vec<Entity>> = BTreeMap::new();
 
         // Детерминированный порядок обхода — по id дивизии.
         let mut order: Vec<(u32, Entity)> = divisions.iter().map(|(e, d)| (d.id, e)).collect();
@@ -512,32 +747,15 @@ fn advance_marches(
             }
 
             // Дошли до границы: ищем вражескую дивизию, стоящую в целевой провинции.
-            let enemies = snapshots.iter().filter(|s| s.province == m.to && s.owner != division.owner && s.stationary);
-            let mut free_enemy = None;
-            let mut any_enemy = false;
-            for s in enemies {
-                any_enemy = true;
-                if !busy.contains(&s.entity) {
-                    free_enemy = Some(s.entity);
-                    break;
-                }
-            }
-
-            if let Some(defender) = free_enemy {
-                busy.insert(entity);
-                busy.insert(defender);
-                commands.spawn(ActiveCombat {
-                    province_id: m.to,
-                    attacker: entity,
-                    defender,
-                    combat_progress: 0,
-                    elapsed_hours: 0,
-                });
-                println!("[БОЙ] Дивизия #{} атакует провинцию {}", division.id, m.to);
-                continue; // маршрут приостановлен до исхода боя
-            }
+            let any_enemy = snapshots
+                .iter()
+                .any(|s| s.province == m.to && s.owner != division.owner && s.stationary);
             if any_enemy {
-                continue; // враг есть, но занят другим боем — ждём следующего тика
+                // Вступаем в бой за провинцию (в конце тика): присоединяемся к идущему или начинаем новый.
+                // До исхода боя дивизия стоит на границе с hours_left == 0, маршрут приостановлен.
+                busy.insert(entity);
+                pending.entry(m.to).or_default().push(entity);
+                continue;
             }
             division.current_province = m.to;
             division.movement = None;
@@ -546,6 +764,15 @@ fn advance_marches(
                 s.stationary = true;
             }
             println!("[МАРШ] Дивизия #{} прибыла в провинцию {}", division.id, m.to);
+
+            // Бескровная оккупация: сюда попадаем только если врага в провинции нет (иначе выше начался бой).
+            // Контроль меняется на том же часовом тике, что и завершение шага.
+            if controllers.0.get(&m.to).is_some_and(|c| *c != division.owner) {
+                controllers.0.insert(m.to, division.owner.clone());
+                println!("[МАРШ-ОККУПАЦИЯ] Провинция #{} занята {} без боя", m.to, division.owner);
+                controller_changed
+                    .send(ProvinceControllerChanged { province_id: m.to, new_controller: division.owner.clone() });
+            }
             }
 
             // Дивизия свободна: берём следующую точку маршрута и начинаем переход.
@@ -558,6 +785,7 @@ fn advance_marches(
                 if reachable {
                     // Время шага зависит от местности целевой провинции
                     let hours = terrain_hours(map.terrain_of(next));
+                    division.entrenchment = 0; // начало шага марша (в т.ч. по приказу фронта / ИИ)
                     division.movement = Some(MovementProgress {
                         from: division.current_province,
                         to: next,
@@ -572,13 +800,62 @@ fn advance_marches(
                 }
             }
         }
+
+        // Вступление в бой. Защитники нового боя — все стоящие в провинции вражеские дивизии,
+        // ещё не втянутые в другие бои; «лишние» сверх ширины фронта попадут в резерв в `resolve_combats`.
+        for (province, attackers) in pending {
+            let Some(owner) = snapshots.iter().find(|s| s.entity == attackers[0]).map(|s| s.owner.clone()) else {
+                continue;
+            };
+            if let Some(mut combat) =
+                combats.iter_mut().find(|c| c.province_id == province && c.attacker_owner == owner)
+            {
+                for attacker in attackers {
+                    if !combat.attackers.contains(&attacker) {
+                        combat.attackers.push(attacker);
+                    }
+                }
+                continue;
+            }
+            let defenders: Vec<Entity> = snapshots
+                .iter()
+                .filter(|s| s.province == province && s.owner != owner && s.stationary && !engaged.contains(&s.entity))
+                .map(|s| s.entity)
+                .collect();
+            let Some(defender_owner) = defenders
+                .first()
+                .and_then(|d| snapshots.iter().find(|s| s.entity == *d))
+                .map(|s| s.owner.clone())
+            else {
+                continue; // все защитники уже заняты другими боями — атакующие повторят попытку на следующем тике
+            };
+            println!(
+                "[БОЙ] Атака на провинцию {province}: атакующих {}, защитников {}",
+                attackers.len(),
+                defenders.len()
+            );
+            commands.spawn(ActiveCombat {
+                province_id: province,
+                attacker_owner: owner,
+                defender_owner,
+                attackers,
+                defenders,
+                max_width: BASE_COMBAT_WIDTH,
+                combat_progress: 0,
+                elapsed_hours: 0,
+            });
+        }
     }
 }
 
-/// Урон организации от `att` по `def` за час (целые числа).
-fn org_damage(att: &Division, def: &Division) -> u32 {
-    let base = att.soft_attack * 10 * att.current_strength / att.max_strength.max(1);
-    (base / (10 + def.defense / 2)).max(1)
+/// Часовая интенсивность удара `att` по `def` в bp от организации цели (целые числа).
+/// Атака и защита пропорциональны укомплектованности (current_strength / max_strength).
+fn combat_bp(att: &Division, def: &Division) -> u32 {
+    let attack = att.soft_attack * att.current_strength / att.max_strength.max(1);
+    let base_defense = def.defense * def.current_strength / def.max_strength.max(1);
+    // Окопанность: +2% защиты за пункт (у наступающих она всегда 0 — марш её сбрасывает)
+    let defense = base_defense * (100 + def.entrenchment.min(MAX_ENTRENCHMENT) * 2) / 100;
+    (COMBAT_INTENSITY_BP * attack / (attack + defense).max(1)).max(1)
 }
 
 /// Детерминированный хэш (splitmix64) — «случайность» без зависимости от кадров и платформы.
@@ -596,8 +873,107 @@ enum Outcome {
     AttackerLoses,
 }
 
-/// Бой на каждом часовом тике: стороны одновременно наносят урон организации и прочности.
-/// Побеждает сторона, чья организация осталась > 0; при одновременном обнулении выигрывает защитник.
+/// Дивизии стороны: (id, сущность, ширина, состояние), по возрастанию id.
+fn side_info(divisions: &Query<(Entity, &mut Division)>, list: &[Entity]) -> Vec<(u32, Entity, u32, CombatState)> {
+    let mut info: Vec<_> = list
+        .iter()
+        .filter_map(|&e| divisions.get(e).ok().map(|(_, d)| (d.id, e, d.combat_width, d.combat_state)))
+        .collect();
+    info.sort_unstable_by_key(|&(id, ..)| id);
+    info
+}
+
+fn set_combat_state(divisions: &mut Query<(Entity, &mut Division)>, entity: Entity, state: CombatState) {
+    if let Ok((_, mut d)) = divisions.get_mut(entity) {
+        d.combat_state = state;
+    }
+}
+
+/// Кто где стоит: (владелец, провинция) всех живых дивизий — для проверки безопасности отступления.
+fn occupancy_snapshot(divisions: &Query<(Entity, &mut Division)>, despawned: &HashSet<Entity>) -> Vec<(String, u32)> {
+    divisions
+        .iter()
+        .filter(|(e, _)| !despawned.contains(e))
+        .map(|(_, d)| (d.owner.clone(), d.current_province))
+        .collect()
+}
+
+/// Куда можно отступить: смежная суша под контролем своей страны, где нет чужих дивизий.
+/// Порядок кандидатов — по возрастанию id (BTreeSet), поэтому выбор детерминирован.
+fn safe_retreat_provinces(
+    province: u32,
+    owner: &str,
+    adjacency: &ProvinceAdjacency,
+    map: &ProvinceMap,
+    controllers: &ProvinceControllers,
+    occupancy: &[(String, u32)],
+) -> Vec<u32> {
+    adjacency
+        .neighbors
+        .get(&province)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|&n| !is_water(map, n) && controllers.0.get(&n).is_some_and(|c| c == owner))
+        .filter(|&n| !occupancy.iter().any(|(o, p)| *p == n && o != owner))
+        .collect()
+}
+
+/// Отступление дивизий в одну из `candidates` либо капитуляция в котле, если безопасных провинций нет.
+/// `units` — (id, сущность); `seed` — источник детерминированного выбора.
+#[allow(clippy::too_many_arguments)]
+fn retreat_or_capitulate(
+    units: &[(u32, Entity)],
+    province: u32,
+    candidates: &[u32],
+    seed: u64,
+    commands: &mut Commands,
+    divisions: &mut Query<(Entity, &mut Division)>,
+    despawned: &mut HashSet<Entity>,
+    selected: &mut SelectedDivision,
+) {
+    let Some(&(first_id, _)) = units.first() else { return };
+    if candidates.is_empty() {
+        // Котёл: безопасной соседней провинции нет — дивизии капитулируют
+        for &(_, e) in units {
+            // Каждый корень удаляется ровно один раз; дубли отсекаются набором
+            if !despawned.insert(e) {
+                continue;
+            }
+            if let Ok((_, d)) = divisions.get(e) {
+                println!("[КОТЕЛ] Дивизия {} окружена и капитулировала!", d.name);
+            }
+            // despawn_recursive сам удаляет дочерние спрайты (рамка, бейдж)
+            commands.entity(e).despawn_recursive();
+            if selected.0 == Some(e) {
+                selected.0 = None;
+            }
+        }
+        return;
+    }
+    // Все отступают в одну провинцию, выбранную детерминированно
+    let idx = (det_rand(province as u64, first_id as u64, seed) % candidates.len() as u64) as usize;
+    let retreat = candidates[idx];
+    for &(_, e) in units {
+        if let Ok((_, mut d)) = divisions.get_mut(e) {
+            d.current_province = retreat;
+            d.entrenchment = 0; // отступление сбрасывает окопанность
+            d.movement = None;
+            d.path.clear();
+            d.combat_state = CombatState::None;
+        }
+    }
+    println!("[БОЙ] Отступило дивизий: {} из провинции {province} в провинцию {retreat}", units.len());
+}
+
+/// Бой на каждом часовом тике (целые числа, порядок по провинции и id):
+/// 1. к защите присоединяется весь гарнизон провинции; пересчитывается лимит ширины;
+/// 2. новые участники занимают линию, пока хватает ширины, остальные уходят в резерв;
+/// 3. дивизии линии бьют друг друга по кругу (резерв урон не наносит и не получает);
+/// 4. дивизии линии с нулевой организацией выходят из боя и отступают поодиночке;
+/// 5. резерв с шансом 2..=5% в час занимает освободившуюся ширину;
+/// 6. сторона без дивизий на линии проигрывает бой: защита отступает, атакующий занимает провинцию.
+#[allow(clippy::too_many_arguments)]
 fn resolve_combats(
     mut ticks: EventReader<HourTick>,
     mut commands: Commands,
@@ -606,133 +982,288 @@ fn resolve_combats(
     mut selected: ResMut<SelectedDivision>,
     adjacency: Res<ProvinceAdjacency>,
     map: Res<ProvinceMap>,
-    registry: Res<StateRegistry>,
+    mut controllers: ResMut<ProvinceControllers>,
+    mut controller_changed: EventWriter<ProvinceControllerChanged>,
 ) {
     let mut finished: HashSet<Entity> = HashSet::new();
+    // Дивизии, на которые уже отдан despawn в этом вызове. `commands` применяются позже, поэтому
+    // запросы ещё видят такие сущности — без этого набора их можно снести (и обработать) повторно.
+    let mut despawned: HashSet<Entity> = HashSet::new();
 
     for _ in ticks.read() {
-        // Детерминированный порядок: по провинции, затем по id атакующего.
-        let mut list: Vec<(u32, u32, Entity)> = Vec::new();
-        for (ce, c) in combats.iter() {
-            if finished.contains(&ce) {
-                continue;
-            }
-            match (divisions.get(c.attacker), divisions.get(c.defender)) {
-                (Ok((_, a)), Ok(_)) => list.push((c.province_id, a.id, ce)),
-                _ => {
-                    // Одна из сторон исчезла — бой снимается, оставшийся атакующий повторит попытку на границе.
-                    commands.entity(ce).despawn();
-                    finished.insert(ce);
-                }
-            }
-        }
+        // Детерминированный порядок: по провинции и владельцу атаки
+        let mut list: Vec<(u32, String, Entity)> = combats
+            .iter()
+            .filter(|(ce, _)| !finished.contains(ce))
+            .map(|(ce, c)| (c.province_id, c.attacker_owner.clone(), ce))
+            .collect();
         list.sort_unstable();
 
         for (_, _, ce) in list {
-            let Ok((_, c)) = combats.get(ce) else { continue };
-            let (province, att_e, def_e) = (c.province_id, c.attacker, c.defender);
+            if finished.contains(&ce) {
+                continue;
+            }
+            let Ok((_, existing)) = combats.get(ce) else { continue };
+            let mut state = existing.clone();
+            let province = state.province_id;
 
-            let (progress, outcome) = {
-                let Ok([(_, mut a), (_, mut d)]) = divisions.get_many_mut([att_e, def_e]) else {
-                    commands.entity(ce).despawn();
-                    finished.insert(ce);
-                    continue;
-                };
-                let to_def = org_damage(&a, &d);
-                let to_att = org_damage(&d, &a);
-                d.current_org = d.current_org.saturating_sub(to_def);
-                d.current_strength = d.current_strength.saturating_sub((to_def / 5).max(1));
-                a.current_org = a.current_org.saturating_sub(to_att);
-                a.current_strength = a.current_strength.saturating_sub((to_att / 5).max(1));
+            // 0. Исчезнувшие дивизии (капитуляция, котёл) выбывают из боя
+            state.attackers.retain(|e| !despawned.contains(e) && divisions.get(*e).is_ok());
+            state.defenders.retain(|e| !despawned.contains(e) && divisions.get(*e).is_ok());
 
-                let progress = ((d.max_org - d.current_org) * 100 / d.max_org.max(1)).min(100);
-                let outcome = if a.current_org == 0 {
-                    Outcome::AttackerLoses
-                } else if d.current_org == 0 {
-                    Outcome::AttackerWins
-                } else {
-                    Outcome::Continue
-                };
-                (progress, outcome)
-            };
+            // 1. Весь гарнизон провинции (стоящие дивизии защитника, не занятые другими боями) вступает в бой
+            let engaged: HashSet<Entity> = combats
+                .iter()
+                .filter(|(other, _)| *other != ce)
+                .flat_map(|(_, c)| c.attackers.iter().chain(c.defenders.iter()).copied())
+                .collect();
+            let mut joiners: Vec<(u32, Entity)> = divisions
+                .iter()
+                .filter(|(e, d)| {
+                    !despawned.contains(e)
+                        && d.owner == state.defender_owner
+                        && d.current_province == province
+                        && d.movement.is_none()
+                        && !engaged.contains(e)
+                        && !state.defenders.contains(e)
+                        && !state.attackers.contains(e)
+                })
+                .map(|(e, d)| (d.id, e))
+                .collect();
+            joiners.sort_unstable();
+            state.defenders.extend(joiners.into_iter().map(|(_, e)| e));
 
-            let elapsed = match combats.get_mut(ce) {
-                Ok((_, mut c)) => {
-                    c.combat_progress = progress;
-                    c.elapsed_hours += 1;
-                    c.elapsed_hours
+            // Одна из сторон исчезла — бой снимается, оставшиеся атакующие повторят попытку на границе
+            if state.attackers.is_empty() || state.defenders.is_empty() {
+                for &e in state.attackers.iter().chain(state.defenders.iter()) {
+                    set_combat_state(&mut divisions, e, CombatState::None);
                 }
-                Err(_) => continue,
+                commands.entity(ce).despawn();
+                finished.insert(ce);
+                continue;
+            }
+
+            // 2. Лимит ширины: база + бонус за каждое уникальное направление атаки сверх первого
+            let directions: BTreeSet<u32> = state
+                .attackers
+                .iter()
+                .filter_map(|&e| divisions.get(e).ok().and_then(|(_, d)| d.movement.map(|m| m.from)))
+                .collect();
+            state.max_width = BASE_COMBAT_WIDTH + FLANK_WIDTH_BONUS * (directions.len() as u32).saturating_sub(1);
+
+            // 3. Новые участники: на линию, пока вмещаются, иначе в резерв
+            for side in [state.attackers.clone(), state.defenders.clone()] {
+                let info = side_info(&divisions, &side);
+                let mut used: u32 =
+                    info.iter().filter(|i| i.3 == CombatState::Active).map(|i| i.2).sum();
+                for &(_, e, width, st) in &info {
+                    if st != CombatState::None {
+                        continue;
+                    }
+                    let fits = used == 0 || used + width <= state.max_width;
+                    if fits {
+                        used += width;
+                    }
+                    set_combat_state(&mut divisions, e, if fits { CombatState::Active } else { CombatState::Reserve });
+                }
+            }
+
+            // 4. Урон: дивизии линии бьют по кругу (k-я атака -> k mod N-я дивизия линии противника)
+            let snapshot = |divisions: &Query<(Entity, &mut Division)>, side: &[Entity]| -> Vec<(Entity, Division)> {
+                side_info(divisions, side)
+                    .into_iter()
+                    .filter(|i| i.3 == CombatState::Active)
+                    .filter_map(|(_, e, ..)| divisions.get(e).ok().map(|(_, d)| (e, d.clone())))
+                    .collect()
+            };
+            let att_line = snapshot(&divisions, &state.attackers);
+            let def_line = snapshot(&divisions, &state.defenders);
+            if !att_line.is_empty() && !def_line.is_empty() {
+                // Все удары считаются по значениям до боя, затем применяются
+                let mut hits: Vec<(Entity, u32, u32)> = Vec::new();
+                for (k, (_, striker)) in att_line.iter().enumerate() {
+                    let (target_e, target) = &def_line[k % def_line.len()];
+                    let bp = combat_bp(striker, target);
+                    hits.push((*target_e, (target.max_org * bp / 10).max(1), (target.max_strength * bp / 50_000).max(1)));
+                }
+                for (k, (_, striker)) in def_line.iter().enumerate() {
+                    let (target_e, target) = &att_line[k % att_line.len()];
+                    let bp = combat_bp(striker, target);
+                    hits.push((*target_e, (target.max_org * bp / 10).max(1), (target.max_strength * bp / 50_000).max(1)));
+                }
+                for (target, org_milli, strength) in hits {
+                    if let Ok((_, mut t)) = divisions.get_mut(target) {
+                        t.lose_org_milli(org_milli);
+                        t.lose_strength(strength);
+                    }
+                }
+            }
+
+            // Прогресс: доля потерянной организации всех защитников (линия и резерв)
+            let (mut total_max, mut total_cur) = (0u64, 0u64);
+            for &e in &state.defenders {
+                if let Ok((_, d)) = divisions.get(e) {
+                    total_max += u64::from(d.max_org) * 1000;
+                    total_cur += u64::from(d.org_milli());
+                }
+            }
+            state.combat_progress =
+                if total_max == 0 { 0 } else { ((total_max - total_cur.min(total_max)) * 100 / total_max) as u32 };
+            state.elapsed_hours += 1;
+
+            // 5. Дивизии линии с нулевой организацией выходят из боя и освобождают ширину
+            for attacker_side in [true, false] {
+                let list = if attacker_side { state.attackers.clone() } else { state.defenders.clone() };
+                for (id, e, _, st) in side_info(&divisions, &list) {
+                    let broken = st == CombatState::Active
+                        && divisions.get(e).is_ok_and(|(_, d)| d.current_org == 0);
+                    if !broken {
+                        continue;
+                    }
+                    set_combat_state(&mut divisions, e, CombatState::None);
+                    if attacker_side {
+                        state.attackers.retain(|&x| x != e);
+                        if let Ok((_, mut a)) = divisions.get_mut(e) {
+                            a.movement = None; // откат в провинцию отправления
+                            a.path.clear();
+                        }
+                        println!("[БОЙ] Дивизия #{id} выбита с линии атаки на провинцию {province}");
+                    } else {
+                        state.defenders.retain(|&x| x != e);
+                        let occupancy = occupancy_snapshot(&divisions, &despawned);
+                        let candidates = safe_retreat_provinces(
+                            province, &state.defender_owner, &adjacency, &map, &controllers, &occupancy,
+                        );
+                        retreat_or_capitulate(
+                            &[(id, e)],
+                            province,
+                            &candidates,
+                            u64::from(state.elapsed_hours),
+                            &mut commands,
+                            &mut divisions,
+                            &mut despawned,
+                            &mut selected,
+                        );
+                    }
+                }
+            }
+
+            // 6. Резерв: детерминированный бросок 2..=5% в час на освободившуюся ширину
+            for side in [state.attackers.clone(), state.defenders.clone()] {
+                let info = side_info(&divisions, &side);
+                let mut used: u32 =
+                    info.iter().filter(|i| i.3 == CombatState::Active).map(|i| i.2).sum();
+                for &(id, e, width, st) in &info {
+                    if st != CombatState::Reserve || used + width > state.max_width {
+                        continue;
+                    }
+                    let chance = u64::from(RESERVE_MIN_CHANCE_PCT + id % 4);
+                    let roll = det_rand(province as u64, id as u64, u64::from(state.elapsed_hours)) % 100;
+                    if roll < chance {
+                        used += width;
+                        set_combat_state(&mut divisions, e, CombatState::Active);
+                        println!("[БОЙ] Дивизия #{id} из резерва вступила в бой за провинцию {province}");
+                    }
+                }
+            }
+
+            // 7. Итог: сторона без дивизий на линии проигрывает
+            let line_count = |divisions: &Query<(Entity, &mut Division)>, side: &[Entity]| {
+                side_info(divisions, side).iter().filter(|i| i.3 == CombatState::Active).count()
+            };
+            let (att_active, def_active) =
+                (line_count(&divisions, &state.attackers), line_count(&divisions, &state.defenders));
+            let outcome = match (att_active > 0, def_active > 0) {
+                (true, true) => Outcome::Continue,
+                (true, false) => Outcome::AttackerWins,
+                (false, true) => Outcome::AttackerLoses,
+                (false, false) => {
+                    // Обе линии выбиты одновременно: у кого осталось больше прочности, при равенстве — жребий по хэшу
+                    let strength = |side: &[Entity]| -> u32 {
+                        side.iter().filter_map(|&e| divisions.get(e).ok()).map(|(_, d)| d.current_strength).sum()
+                    };
+                    let (a, d) = (strength(&state.attackers), strength(&state.defenders));
+                    if a != d {
+                        if a > d { Outcome::AttackerWins } else { Outcome::AttackerLoses }
+                    } else if det_rand(province as u64, u64::from(state.elapsed_hours), 0x7137) & 1 == 0 {
+                        Outcome::AttackerWins
+                    } else {
+                        Outcome::AttackerLoses
+                    }
+                }
             };
 
             match outcome {
-                Outcome::Continue => {}
-                Outcome::AttackerLoses => {
-                    // Атакующий откатывается в провинцию отправления (current_province не менялся).
-                    if let Ok((_, mut a)) = divisions.get_mut(att_e) {
-                        a.movement = None;
-                        a.path.clear(); // атака отбита — маршрут отменён
-                        println!("[БОЙ] Атака на провинцию {province} отбита, дивизия #{} отступила", a.id);
+                Outcome::Continue => {
+                    if let Ok((_, mut c)) = combats.get_mut(ce) {
+                        *c = state;
                     }
+                }
+                Outcome::AttackerLoses => {
+                    // Атака отбита: все атакующие откатываются в провинции отправления
+                    for &e in &state.attackers {
+                        if let Ok((_, mut a)) = divisions.get_mut(e) {
+                            a.movement = None;
+                            a.path.clear();
+                            a.combat_state = CombatState::None;
+                        }
+                    }
+                    for &e in &state.defenders {
+                        set_combat_state(&mut divisions, e, CombatState::None);
+                    }
+                    println!("[БОЙ] Атака на провинцию {province} отбита");
                     commands.entity(ce).despawn();
                     finished.insert(ce);
                 }
                 Outcome::AttackerWins => {
-                    // Снимок расположения всех дивизий для выбора пути отступления.
-                    let occupancy: Vec<(Entity, String, u32)> =
-                        divisions.iter().map(|(e, d)| (e, d.owner.clone(), d.current_province)).collect();
-                    let (def_owner, def_province, def_id) = match divisions.get(def_e) {
-                        Ok((_, d)) => (d.owner.clone(), d.current_province, d.id),
-                        Err(_) => continue,
-                    };
-                    let att_from = divisions.get(att_e).ok().and_then(|(_, a)| a.movement.map(|m| m.from));
-
-                    // Доступные: суша, не откуда пришёл атакующий, без дивизий противника защитника.
-                    // Порядок — по возрастанию id (BTreeSet), поэтому выбор детерминирован.
-                    let available: Vec<u32> = adjacency
-                        .neighbors
-                        .get(&def_province)
-                        .map(|set| {
-                            set.iter()
-                                .copied()
-                                .filter(|&n| Some(n) != att_from && !is_water(&map, n))
-                                .filter(|&n| {
-                                    !occupancy.iter().any(|(e, o, p)| *p == n && *e != def_e && *o != def_owner)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    // Предпочтительно суверенные провинции (того же владельца, что и защитник);
-                    // если таких нет — любая доступная.
-                    let sovereign: Vec<u32> = available
+                    // Оборона прорвана: отступает (или гибнет в котле) весь гарнизон, включая резерв
+                    let mut retreating: Vec<(u32, Entity)> = divisions
                         .iter()
-                        .copied()
-                        .filter(|&n| registry.state_of(n).is_some_and(|s| s.owner == def_owner))
+                        .filter(|(e, d)| {
+                            !despawned.contains(e)
+                                && d.owner == state.defender_owner
+                                && d.current_province == province
+                                && d.movement.is_none()
+                        })
+                        .map(|(e, d)| (d.id, e))
                         .collect();
-                    let candidates = if sovereign.is_empty() { available } else { sovereign };
-
-                    if candidates.is_empty() {
-                        println!("[БОЙ] Дивизия #{def_id} разгромлена: отступать некуда");
-                        commands.entity(def_e).despawn_recursive();
-                        if selected.0 == Some(def_e) {
-                            selected.0 = None;
-                        }
-                    } else {
-                        let idx = (det_rand(province as u64, def_id as u64, elapsed as u64) % candidates.len() as u64)
-                            as usize;
-                        let retreat = candidates[idx];
-                        if let Ok((_, mut d)) = divisions.get_mut(def_e) {
-                            d.current_province = retreat;
-                            d.movement = None;
-                            d.path.clear();
-                        }
-                        println!("[БОЙ] Дивизия #{def_id} отступила из {province} в провинцию {retreat}");
+                    retreating.sort_unstable();
+                    let occupancy = occupancy_snapshot(&divisions, &despawned);
+                    let candidates = safe_retreat_provinces(
+                        province, &state.defender_owner, &adjacency, &map, &controllers, &occupancy,
+                    );
+                    retreat_or_capitulate(
+                        &retreating,
+                        province,
+                        &candidates,
+                        u64::from(state.elapsed_hours),
+                        &mut commands,
+                        &mut divisions,
+                        &mut despawned,
+                        &mut selected,
+                    );
+                    for &e in &state.defenders {
+                        set_combat_state(&mut divisions, e, CombatState::None);
                     }
 
-                    if let Ok((_, mut a)) = divisions.get_mut(att_e) {
-                        a.current_province = province;
-                        a.movement = None;
-                        println!("[БОЙ] Дивизия #{} заняла провинцию {province}", a.id);
+                    // Все атакующие (линия и резерв) занимают провинцию
+                    for &e in &state.attackers {
+                        if let Ok((_, mut a)) = divisions.get_mut(e) {
+                            a.current_province = province;
+                            a.movement = None;
+                            a.combat_state = CombatState::None;
+                        }
+                    }
+                    println!("[БОЙ] Провинцию {province} заняли дивизий: {}", state.attackers.len());
+
+                    // Контроль переходит к нападающему на этом же часовом тике
+                    if controllers.0.get(&province) != Some(&state.attacker_owner) {
+                        controllers.0.insert(province, state.attacker_owner.clone());
+                        println!("[ОККУПАЦИЯ] Провинция #{province} перешла под контроль {}", state.attacker_owner);
+                        controller_changed.send(ProvinceControllerChanged {
+                            province_id: province,
+                            new_controller: state.attacker_owner.clone(),
+                        });
                     }
                     commands.entity(ce).despawn();
                     finished.insert(ce);
@@ -751,9 +1282,19 @@ fn resolve_combats(
 fn update_division_positions(
     time: Res<Time>,
     centers: Res<ProvinceCenters>,
+    cameras: Query<&OrthographicProjection, With<MainCamera>>,
+    mut stationary: Local<Vec<(u32, u32)>>,
     mut query: Query<(&Division, &mut Transform)>,
 ) {
     let smooth = (VISUAL_SMOOTHING * time.delta_seconds()).min(1.0);
+    let zoom = cameras.get_single().map_or(1.0, |p| p.scale);
+
+    // Стоящие дивизии (провинция, id) в отсортированном виде: слот в стеке = номер среди дивизий
+    // той же провинции. Сдвиг только визуальный, на симуляцию не влияет.
+    stationary.clear();
+    stationary.extend(query.iter().filter(|(d, _)| d.movement.is_none()).map(|(d, _)| (d.current_province, d.id)));
+    stationary.sort_unstable();
+
     for (division, mut transform) in &mut query {
         let target = match division.movement {
             Some(m) => {
@@ -768,7 +1309,13 @@ fn update_division_positions(
                 a.lerp(*b, done)
             }
             None => match centers.centers.get(&division.current_province) {
-                Some(c) => *c,
+                Some(c) => {
+                    let key = (division.current_province, division.id);
+                    let first = stationary.partition_point(|&(p, _)| p < division.current_province);
+                    let slot = stationary.binary_search(&key).map_or(0, |pos| pos - first);
+                    // Шаг сдвига задан в экранных пикселях, поэтому масштабируется вместе с зумом
+                    *c + STACK_STEP_PX * (slot as f32) * zoom
+                }
                 None => continue,
             },
         };
@@ -806,7 +1353,34 @@ fn update_selection_visual(selected: Res<SelectedDivision>, mut query: Query<(En
 // UI (bevy_egui)
 // ---------------------------------------------------------------------------
 
-/// Маркер боя над провинцией: круглый бейдж с процентом и тонкие полоски организации сторон.
+/// Сводка по стороне боя для интерфейса.
+struct SideStats {
+    /// Занятая ширина фронта (дивизии на линии).
+    used_width: u32,
+    /// Дивизий в резерве.
+    reserves: u32,
+    /// Организация дивизий на линии: сумма текущей / сумма максимальной.
+    org: u32,
+    org_max: u32,
+}
+
+fn side_stats(divisions: &Query<&Division>, list: &[Entity]) -> SideStats {
+    let mut stats = SideStats { used_width: 0, reserves: 0, org: 0, org_max: 0 };
+    for d in list.iter().filter_map(|&e| divisions.get(e).ok()) {
+        match d.combat_state {
+            CombatState::Active => {
+                stats.used_width += d.combat_width;
+                stats.org += d.current_org;
+                stats.org_max += d.max_org;
+            }
+            CombatState::Reserve => stats.reserves += 1,
+            CombatState::None => {}
+        }
+    }
+    stats
+}
+
+/// Маркер боя над провинцией: круглый бейдж с процентом, организация линии, ширина фронта и резерв.
 fn combat_ui(
     mut contexts: EguiContexts,
     combats: Query<(Entity, &ActiveCombat)>,
@@ -820,9 +1394,8 @@ fn combat_ui(
     for (ce, combat) in &combats {
         let Some(center) = centers.centers.get(&combat.province_id) else { continue };
         let Some(screen) = camera.world_to_viewport(cam_tf, center.extend(0.0)) else { continue };
-        let (Ok(att), Ok(def)) = (divisions.get(combat.attacker), divisions.get(combat.defender)) else {
-            continue;
-        };
+        let att = side_stats(&divisions, &combat.attackers);
+        let def = side_stats(&divisions, &combat.defenders);
 
         egui::Area::new(egui::Id::new(("combat_plate", ce)))
             .fixed_pos(egui::pos2(screen.x - 28.0, screen.y - 70.0))
@@ -842,13 +1415,24 @@ fn combat_ui(
                     egui::FontId::proportional(13.0),
                     egui::Color32::WHITE,
                 );
-                // Организация: атакующий (синий) и защитник (красный)
-                for (d, color) in [(att, egui::Color32::from_rgb(70, 160, 220)), (def, egui::Color32::from_rgb(220, 90, 70))] {
+                // Организация линии: атакующие (синий) и защитники (красный), ширина фронта и резерв
+                let sides = [
+                    ("АТК", &att, egui::Color32::from_rgb(70, 160, 220)),
+                    ("ЗАЩ", &def, egui::Color32::from_rgb(220, 90, 70)),
+                ];
+                for (tag, side, color) in sides {
                     ui.add(
-                        egui::ProgressBar::new(d.current_org as f32 / d.max_org.max(1) as f32)
+                        egui::ProgressBar::new(side.org as f32 / side.org_max.max(1) as f32)
                             .desired_width(56.0)
                             .desired_height(5.0)
                             .fill(color),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{tag} Ширина фронта: {}/{} | В резерве: {} див.",
+                            side.used_width, combat.max_width, side.reserves
+                        ))
+                        .small(),
                     );
                 }
             });
@@ -867,7 +1451,9 @@ fn division_info_ui(
     let Ok(d) = divisions.get(entity) else { return };
     let ctx = contexts.ctx_mut();
 
-    let status = match combats.iter().find(|c| c.attacker == entity || c.defender == entity) {
+    let combat = combats.iter().find(|c| c.involves(entity));
+    let status = match combat {
+        Some(c) if d.combat_state == CombatState::Reserve => format!("В резерве боя ({}%)", c.combat_progress),
         Some(c) => format!("В бою ({}%)", c.combat_progress),
         None => match d.movement {
             Some(m) if m.hours_left > 0 => format!("На марше (осталось {} ч.)", m.hours_left),
@@ -883,12 +1469,49 @@ fn division_info_ui(
         .collapsible(false)
         .frame(frame)
         .show(ctx, |ui| {
-            ui.label(format!("Дивизия #{} ({})", d.id, d.owner));
+            ui.label(format!("Дивизия: \"{}\" [{}]", d.name, d.owner));
+            // Позиция в стеке провинции (клик по провинции переключает дивизии по кругу)
+            let mut stack: Vec<u32> = divisions
+                .iter()
+                .filter(|o| o.current_province == d.current_province && o.movement.is_none())
+                .map(|o| o.id)
+                .collect();
+            stack.sort_unstable();
+            if let Some(i) = stack.iter().position(|&id| id == d.id).filter(|_| d.movement.is_none()) {
+                ui.label(format!("Дивизия {} из {} в провинции #{}", i + 1, stack.len(), d.current_province));
+            }
+            ui.label(format!("ID: {}", d.id));
             ui.label(format!("Провинция: {}", d.current_province));
             ui.label(format!("Организация: {}/{}", d.current_org, d.max_org));
-            ui.label(format!("Прочность: {}/{}", d.current_strength, d.max_strength));
+            ui.label(format!(
+                "Укомплектованность: {}/{} (Потери: {})",
+                d.current_strength, d.max_strength, d.losses
+            ));
             ui.label(format!("Атака: {} | Защита: {}", d.soft_attack, d.defense));
+            ui.label(format!(
+                "Окопанность: {}/{MAX_ENTRENCHMENT} (+{}% защиты)",
+                d.entrenchment,
+                d.entrenchment * 2
+            ));
+            ui.label(format!(
+                "Шаблон: \"{}\" ({} батальонов) | Личный состав: {} чел. | Снаряжение: {}/{} шт.",
+                d.template_name,
+                d.battalion_count,
+                d.current_manpower(),
+                d.current_equipment(),
+                d.required_equipment
+            ));
             ui.label(format!("Состояние: {status}"));
+            ui.label(format!("Боевая ширина дивизии: {}", d.combat_width));
+            if let Some(c) = combat {
+                // Ширина фронта и резерв той стороны, за которую воюет дивизия
+                let own_side = if c.attackers.contains(&entity) { &c.attackers } else { &c.defenders };
+                let side = side_stats(&divisions, own_side);
+                ui.label(format!(
+                    "Ширина фронта: {}/{} | В резерве: {} див.",
+                    side.used_width, c.max_width, side.reserves
+                ));
+            }
             if let Some(m) = d.movement {
                 ui.label(format!(
                     "Шаг: {} -> {} ({}) | Осталось: {}/{} ч",
@@ -913,4 +1536,161 @@ fn division_info_ui(
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spawn_division(
+        app: &mut App,
+        id: u32,
+        owner: &str,
+        province: u32,
+        movement: Option<MovementProgress>,
+        attack_multiplier: u32,
+    ) -> Entity {
+        let templates = DivisionTemplates::default();
+        let mut d = Division::from_template(
+            id,
+            format!("Div {id}"),
+            owner.to_string(),
+            province,
+            BASE_TEMPLATE.to_string(),
+            templates.get_or_base(BASE_TEMPLATE),
+        );
+        d.movement = movement;
+        d.soft_attack *= attack_multiplier;
+        app.world_mut().spawn(d).id()
+    }
+
+    /// Мини-карта: 1 (GER) – 2 (FRA, спорная) – 3 (FRA, тыл); 4 (GER) – второе направление атаки на 2.
+    /// Атакуют `attackers` дивизий (id 1..), обороняют `defenders` дивизий (id 101..).
+    /// `flank_from` — откуда идёт каждая атакующая дивизия.
+    fn scenario(attackers: &[u32], defenders: u32, attack_multiplier: u32) -> (App, Vec<Entity>, Vec<Entity>) {
+        let mut app = App::new();
+        let neighbors = BTreeMap::from([
+            (1, BTreeSet::from([2])),
+            (2, BTreeSet::from([1, 3, 4])),
+            (3, BTreeSet::from([2])),
+            (4, BTreeSet::from([2])),
+        ]);
+        let controllers = ProvinceControllers(BTreeMap::from([
+            (1, "GER".to_string()),
+            (2, "FRA".to_string()),
+            (3, "FRA".to_string()),
+            (4, "GER".to_string()),
+        ]));
+        app.add_event::<HourTick>()
+            .add_event::<ProvinceControllerChanged>()
+            .init_resource::<SelectedDivision>()
+            .insert_resource(ProvinceMap::empty_for_test())
+            .insert_resource(ProvinceAdjacency { neighbors })
+            .insert_resource(controllers)
+            .add_systems(Update, resolve_combats);
+
+        let att: Vec<Entity> = attackers
+            .iter()
+            .enumerate()
+            .map(|(i, &from)| {
+                let m = MovementProgress { from, to: 2, hours_left: 0, total_hours: 24 };
+                spawn_division(&mut app, i as u32 + 1, "GER", from, Some(m), attack_multiplier)
+            })
+            .collect();
+        let def: Vec<Entity> =
+            (0..defenders).map(|i| spawn_division(&mut app, 101 + i, "FRA", 2, None, 1)).collect();
+
+        app.world_mut().spawn(ActiveCombat {
+            province_id: 2,
+            attacker_owner: "GER".to_string(),
+            defender_owner: "FRA".to_string(),
+            attackers: att.clone(),
+            defenders: def.clone(),
+            max_width: BASE_COMBAT_WIDTH,
+            combat_progress: 0,
+            elapsed_hours: 0,
+        });
+        (app, att, def)
+    }
+
+    fn tick(app: &mut App) {
+        app.world_mut().send_event(HourTick);
+        app.update();
+    }
+
+    fn state_counts(app: &mut App, list: &[Entity]) -> (usize, usize) {
+        let world = app.world();
+        let states: Vec<CombatState> = list.iter().filter_map(|&e| world.get::<Division>(e)).map(|d| d.combat_state).collect();
+        (
+            states.iter().filter(|&&s| s == CombatState::Active).count(),
+            states.iter().filter(|&&s| s == CombatState::Reserve).count(),
+        )
+    }
+
+    #[test]
+    fn width_limit_splits_line_and_reserve() {
+        // 6 атакующих и 5 защитников по 18 ширины против лимита 80: на линии по 4, остальные в резерве
+        let (mut app, att, def) = scenario(&[1; 6], 5, 1);
+        tick(&mut app);
+        assert_eq!(state_counts(&mut app, &att), (4, 2));
+        assert_eq!(state_counts(&mut app, &def), (4, 1));
+        let combat = app.world_mut().query::<&ActiveCombat>().single(app.world()).clone();
+        assert_eq!(combat.max_width, 80);
+    }
+
+    #[test]
+    fn flank_direction_adds_width() {
+        // Атака из двух разных провинций (1 и 4): лимит 80 + 40 = 120, все 6 + 5 дивизий помещаются на линию
+        let (mut app, att, def) = scenario(&[1, 1, 1, 4, 4, 4], 5, 1);
+        tick(&mut app);
+        assert_eq!(state_counts(&mut app, &att), (6, 0));
+        assert_eq!(state_counts(&mut app, &def), (5, 0));
+        let combat = app.world_mut().query::<&ActiveCombat>().single(app.world()).clone();
+        assert_eq!(combat.max_width, 120);
+    }
+
+    #[test]
+    fn breakthrough_occupies_province_and_defenders_retreat() {
+        // Сильные атакующие выбивают линию защиты: резерв не успевает, бой проигран обороной
+        let (mut app, att, def) = scenario(&[1; 6], 5, 20);
+        let mut ticks = 0;
+        while app.world_mut().query::<&ActiveCombat>().iter(app.world()).count() > 0 {
+            tick(&mut app);
+            ticks += 1;
+            assert!(ticks < 500, "бой не закончился");
+        }
+        let world = app.world();
+        let controllers = world.resource::<ProvinceControllers>();
+        assert_eq!(controllers.0.get(&2).map(String::as_str), Some("GER"));
+        for &e in &att {
+            let d = world.get::<Division>(e).expect("атакующие живы");
+            assert_eq!((d.current_province, d.combat_state), (2, CombatState::None));
+            assert!(d.movement.is_none());
+        }
+        for &e in &def {
+            // защитники отступили в тыловую провинцию 3
+            let d = world.get::<Division>(e).expect("защитники отступили, а не погибли");
+            assert_eq!((d.current_province, d.combat_state), (3, CombatState::None));
+        }
+        println!("бой закончился за {ticks} ч.");
+    }
+
+    #[test]
+    fn attack_repelled_when_line_breaks() {
+        // Слабые атакующие против сильной обороны: линия атаки выбита, провинция остаётся за защитой
+        let (mut app, att, _def) = scenario(&[1; 2], 5, 1);
+        let mut ticks = 0;
+        while app.world_mut().query::<&ActiveCombat>().iter(app.world()).count() > 0 {
+            tick(&mut app);
+            ticks += 1;
+            assert!(ticks < 500, "бой не закончился");
+        }
+        let world = app.world();
+        assert_eq!(world.resource::<ProvinceControllers>().0.get(&2).map(String::as_str), Some("FRA"));
+        for &e in &att {
+            let d = world.get::<Division>(e).expect("атакующие отступили, а не погибли");
+            assert_eq!((d.current_province, d.combat_state), (1, CombatState::None));
+            assert!(d.movement.is_none());
+        }
+    }
 }

@@ -9,10 +9,13 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::clock::{ClockSet, DailyTickEvent};
+use crate::division::Division;
 use crate::map::StateRegistry;
 
 /// Стартовый запас винтовок на складе.
 const START_INFANTRY_EQUIPMENT: i32 = 5000;
+/// Максимум единиц прочности, запрашиваемых одной дивизией в сутки (1 единица = 1 винтовка).
+const REINFORCE_PER_DIVISION_PER_DAY: u32 = 50;
 /// Винтовок в сутки с одного военного завода.
 const RIFLES_PER_FACTORY_PER_DAY: i32 = 5;
 const DEFAULT_PLAYER_COUNTRY: &str = "GER";
@@ -28,6 +31,8 @@ pub struct CountryEconomy {
     pub infantry_equipment_stockpile: i32,
     /// Винтовок в сутки (пересчитывается из `military_factories`).
     pub daily_production: i32,
+    /// Винтовок, реально потраченных на пополнение дивизий в последние сутки.
+    pub reinforce_cost: i32,
 }
 
 impl CountryEconomy {
@@ -37,6 +42,7 @@ impl CountryEconomy {
             military_factories,
             infantry_equipment_stockpile: START_INFANTRY_EQUIPMENT,
             daily_production: 0,
+            reinforce_cost: 0,
         };
         eco.recalc_daily_production();
         eco
@@ -67,7 +73,11 @@ impl Plugin for EconomyPlugin {
         app.init_resource::<Economies>()
             .insert_resource(PlayerCountry(DEFAULT_PLAYER_COUNTRY.to_string()))
             .add_systems(Startup, init_economies)
-            .add_systems(Update, (daily_production.after(ClockSet), economy_bar));
+            // Суточный порядок: сначала производство на склад, затем пополнение дивизий со склада
+            .add_systems(
+                Update,
+                (daily_production.after(ClockSet), daily_reinforcement.after(daily_production), economy_bar),
+            );
     }
 }
 
@@ -102,6 +112,94 @@ fn daily_production(mut events: EventReader<DailyTickEvent>, mut economies: ResM
     }
 }
 
+/// Суточное пополнение: дивизии с неполной прочностью запрашивают до 50 единиц, склад тратит
+/// столько же винтовок. При нехватке запас делится пропорционально запросам (целочисленно,
+/// остаток раздаётся по одному в порядке id). Всё детерминировано: страны и дивизии — по порядку.
+fn daily_reinforcement(
+    mut events: EventReader<DailyTickEvent>,
+    mut economies: ResMut<Economies>,
+    mut divisions: Query<(Entity, &mut Division)>,
+) {
+    for _ in events.read() {
+        for eco in economies.0.values_mut() {
+            eco.reinforce_cost = 0;
+        }
+
+        // Запросы по владельцам: (id дивизии, сущность, запрошено снаряжения, запрошено прочности).
+        // Стоимость пополнения берётся из шаблона: снаряжения на единицу прочности =
+        // total_required_equipment / max_strength (для пехоты 1:1), округление вверх.
+        let mut requests: BTreeMap<String, Vec<(u32, Entity, u32, u32)>> = BTreeMap::new();
+        for (entity, d) in divisions.iter() {
+            let deficit = d.max_strength.saturating_sub(d.current_strength);
+            if deficit > 0 {
+                let strength_request = deficit.min(REINFORCE_PER_DIVISION_PER_DAY);
+                let equipment_request = (u64::from(strength_request) * u64::from(d.required_equipment))
+                    .div_ceil(u64::from(d.max_strength.max(1))) as u32;
+                requests
+                    .entry(d.owner.clone())
+                    .or_default()
+                    .push((d.id, entity, equipment_request, strength_request));
+            }
+        }
+
+        for (tag, mut list) in requests {
+            let Some(eco) = economies.0.get_mut(&tag) else { continue };
+            list.sort_unstable_by_key(|&(id, ..)| id);
+
+            let available = u64::try_from(eco.infantry_equipment_stockpile.max(0)).unwrap_or(0);
+            let total: u64 = list.iter().map(|&(_, _, r, _)| u64::from(r)).sum();
+
+            let grants: Vec<u32> = if total <= available {
+                list.iter().map(|&(_, _, r, _)| r).collect()
+            } else {
+                // Нехватка: доля = запрос * склад / сумма запросов (с округлением вниз)
+                let mut g: Vec<u32> =
+                    list.iter().map(|&(_, _, r, _)| (u64::from(r) * available / total) as u32).collect();
+                let mut rest = available - g.iter().map(|&x| u64::from(x)).sum::<u64>();
+                for (grant, &(_, _, r, _)) in g.iter_mut().zip(&list) {
+                    if rest == 0 {
+                        break;
+                    }
+                    if *grant < r {
+                        *grant += 1;
+                        rest -= 1;
+                    }
+                }
+                g
+            };
+
+            let mut spent = 0u64;
+            for (&(_, entity, request_eq, strength_request), &grant) in list.iter().zip(&grants) {
+                // Прирост прочности пропорционален выданной доле снаряжения
+                let gain = if request_eq == 0 || grant >= request_eq {
+                    strength_request
+                } else {
+                    (u64::from(grant) * u64::from(strength_request) / u64::from(request_eq)) as u32
+                };
+                if gain == 0 {
+                    continue;
+                }
+                if let Ok((_, mut d)) = divisions.get_mut(entity) {
+                    d.current_strength = (d.current_strength + gain).min(d.max_strength);
+                    spent += u64::from(grant);
+                }
+            }
+
+            let spent_i32 = i32::try_from(spent).unwrap_or(i32::MAX);
+            eco.infantry_equipment_stockpile = eco.infantry_equipment_stockpile.saturating_sub(spent_i32);
+            eco.reinforce_cost = spent_i32;
+            if spent > 0 {
+                let note = if total > available { " (нехватка винтовок)" } else { "" };
+                println!(
+                    "[СНАБЖЕНИЕ] {tag}: пополнено дивизий: {}, винтовок: {spent}, остаток на складе: {}{note}",
+                    grants.iter().filter(|&&g| g > 0).count(),
+                    eco.infantry_equipment_stockpile
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
@@ -119,12 +217,13 @@ fn economy_bar(mut contexts: EguiContexts, economies: Res<Economies>, player: Re
         .show(ctx, |ui| match economies.0.get(&player.0) {
             Some(eco) => {
                 ui.label(format!(
-                    "[{}] 🏭 Фабрики: {} | 🔨 Военные заводы: {} | 📦 Винтовки: {} (+{}/день)",
+                    "[{}] 🏭 Фабрики: {} | 🔨 Военные заводы: {} | 📦 Винтовки: {} (+{} / -{} день)",
                     player.0,
                     eco.civilian_factories,
                     eco.military_factories,
                     eco.infantry_equipment_stockpile,
-                    eco.daily_production
+                    eco.daily_production,
+                    eco.reinforce_cost
                 ));
             }
             None => {

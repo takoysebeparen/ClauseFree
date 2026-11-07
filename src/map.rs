@@ -1,12 +1,15 @@
 //! Карта провинций: загрузка данных HOI4, парсинг стейтов, выбор провинции курсором.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bevy::prelude::*;
+use bevy::asset::load_internal_asset;
 use bevy::render::render_asset::RenderAssetUsages;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::render::render_resource::{AsBindGroup, Extent3d, Shader, ShaderRef, TextureDimension, TextureFormat};
+use bevy::sprite::{Material2d, Material2dPlugin, MaterialMesh2dBundle, Mesh2dHandle};
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts};
 use image::RgbaImage;
@@ -64,6 +67,12 @@ impl ProvinceMap {
     pub fn province_at_pixel(&self, x: u32, y: u32) -> Option<&ProvinceInfo> {
         let px = self.image.get_pixel_checked(x, y)?;
         self.by_color.get(&[px[0], px[1], px[2]])
+    }
+
+    /// Пустая карта для модульных тестов: вся суша, цветов и местности нет.
+    #[cfg(test)]
+    pub fn empty_for_test() -> Self {
+        Self { image: RgbaImage::new(1, 1), by_color: HashMap::new(), terrain_by_id: HashMap::new() }
     }
 
     pub fn terrain_of(&self, province_id: u32) -> Option<&str> {
@@ -143,6 +152,18 @@ pub enum PlayerCommand {
     SelectProvince(u32),
 }
 
+/// Кто фактически контролирует провинцию: id провинции -> тег страны.
+/// На старте совпадает с владельцем стейта; меняется при захвате (`ProvinceControllerChanged`).
+#[derive(Resource, Default)]
+pub struct ProvinceControllers(pub BTreeMap<u32, String>);
+
+/// Контроль над провинцией перешёл к другой стране.
+#[derive(Event, Debug, Clone)]
+pub struct ProvinceControllerChanged {
+    pub province_id: u32,
+    pub new_controller: String,
+}
+
 /// Граф смежности провинций (BTree — строгий детерминизм под мультиплеер).
 #[derive(Resource, Default)]
 pub struct ProvinceAdjacency {
@@ -156,6 +177,8 @@ pub struct StateDef {
     pub name: String,
     pub owner: String,
     pub provinces: Vec<u32>,
+    /// `victory_points = { провинция очки }` на старте: (id провинции, VP).
+    pub victory_points: Vec<(u32, u32)>,
     /// `industrial_complex` — гражданские фабрики стейта.
     pub civilian_factories: u32,
     /// `arms_factory` — военные заводы стейта.
@@ -218,6 +241,21 @@ impl Plugin for MapPlugin {
         let centers = province_map.compute_centers();
         println!("[УСПЕХ] Центров провинций вычислено: {}", centers.centers.len());
 
+        // Order of Battle 1936 (GER, FRA): читается на лету, спавн — в division.rs
+        app.insert_resource(crate::oob::load_oob(&self.root));
+
+        // Стартовые контроллеры = владельцы стейтов
+        let controllers = ProvinceControllers(
+            registry.province_to_state.iter().map(|(&province, state)| (province, state.owner.clone())).collect(),
+        );
+
+        // Шейдер карты вшит в бинарник; материал рисует карту по палитре контроллеров
+        load_internal_asset!(app, POLITICAL_SHADER, "political.wgsl", Shader::from_wgsl);
+        app.add_plugins(Material2dPlugin::<PoliticalMaterial>::default())
+            .add_event::<ProvinceControllerChanged>()
+            .insert_resource(controllers)
+            .add_systems(Update, repaint_changed_provinces);
+
         app.insert_resource(centers)
             .insert_resource(province_map)
             .insert_resource(registry)
@@ -241,9 +279,6 @@ impl Plugin for MapPlugin {
 
 /// Цвет воды / морских и нейтральных зон.
 const WATER_COLOR: [u8; 3] = [20, 40, 70];
-
-/// Граница государств и береговая линия.
-const COUNTRY_BORDER_COLOR: [u8; 3] = [25, 25, 25];
 
 /// Базовые цвета ключевых стран (теги HOI4).
 fn known_country_color(tag: &str) -> Option<[u8; 3]> {
@@ -294,120 +329,94 @@ pub fn country_color(tag: &str) -> [u8; 3] {
     known_country_color(tag).unwrap_or_else(|| hashed_country_color(tag))
 }
 
-/// Строит RGBA-буфер политической карты того же размера, что и provinces.bmp.
-fn build_political_texture(map: &ProvinceMap, registry: &StateRegistry) -> (Vec<u8>, ProvinceAdjacency) {
-    // Индекс страны: 0 = вода/нейтральная зона, 1.. = страны. Цвета — в `fills`.
-    let mut fills: Vec<[u8; 3]> = vec![WATER_COLOR];
-    let mut tag_to_idx: HashMap<&str, u16> = HashMap::new();
-    // Цвет провинции в bmp -> индекс страны-владельца (один раз на провинцию, не на пиксель).
-    let mut color_to_owner: HashMap<[u8; 3], u16> = HashMap::with_capacity(map.by_color.len());
-    for (rgb, info) in &map.by_color {
-        let idx = match registry.state_of(info.id) {
-            Some(state) => *tag_to_idx.entry(state.owner.as_str()).or_insert_with(|| {
-                fills.push(country_color(&state.owner));
-                (fills.len() - 1) as u16
-            }),
-            None => 0,
-        };
-        color_to_owner.insert(*rgb, idx);
-    }
-    // Затемнённый цвет для границ провинций внутри страны (color * 0.75).
-    let shaded: Vec<[u8; 3]> = fills
-        .iter()
-        .map(|c| [(c[0] as u16 * 3 / 4) as u8, (c[1] as u16 * 3 / 4) as u8, (c[2] as u16 * 3 / 4) as u8])
-        .collect();
+// ---------------------------------------------------------------------------
+// Рендер политической карты на GPU: текстура id провинций + палитра контроллеров
+// ---------------------------------------------------------------------------
 
+/// Ширина палитры в текселях; должна совпадать с `PALETTE_WIDTH` в `political.wgsl`.
+const PALETTE_WIDTH: usize = 256;
+/// Хэндл встроенного шейдера (см. `load_internal_asset!` в `MapPlugin::build`).
+const POLITICAL_SHADER: Handle<Shader> = Handle::weak_from_u128(0x7a3c_91e4_5b20_4f6d_8c17_d2e0_a94b_6f31);
+
+/// Материал карты. Цвета, затемнение границ провинций и тёмные границы государств считает шейдер
+/// по двум текстурам: id провинции на пиксель (статична) и палитра «id -> цвет контроллера».
+/// Смена контроля меняет один тексель палитры, карта целиком не перерисовывается.
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+pub struct PoliticalMaterial {
+    #[texture(0)]
+    pub ids: Handle<Image>,
+    #[texture(1)]
+    pub palette: Handle<Image>,
+}
+
+impl Material2d for PoliticalMaterial {
+    fn fragment_shader() -> ShaderRef {
+        ShaderRef::Handle(POLITICAL_SHADER)
+    }
+}
+
+/// Хэндлы ресурсов рендера карты для точечных обновлений.
+#[derive(Resource)]
+pub struct MapPaint {
+    palette: Handle<Image>,
+    material: Handle<PoliticalMaterial>,
+}
+
+/// Цвет контроллера в палитре. Альфа 255 — суша, 0 — вода / без стейта (границы не рисуются).
+fn palette_texel(controller: Option<&str>) -> [u8; 4] {
+    match controller {
+        Some(tag) => {
+            let [r, g, b] = country_color(tag);
+            [r, g, b, 255]
+        }
+        None => [WATER_COLOR[0], WATER_COLOR[1], WATER_COLOR[2], 0],
+    }
+}
+
+/// Строит текстуру id провинций (R, G = младший / старший байт id) и граф смежности за один обход.
+fn build_id_texture_and_adjacency(map: &ProvinceMap) -> (Vec<u8>, ProvinceAdjacency) {
     let w = map.width() as usize;
     let h = map.height() as usize;
     let raw = map.image.as_raw();
 
-    // Проход 1: плоский массив владельцев (по 2 байта на пиксель).
-    let mut owner = vec![0u16; w * h];
-    let mut last_key = [0u8; 3];
-    let mut last_val = 0u16;
-    let mut have_last = false;
-    for (src, o) in raw.chunks_exact(4).zip(owner.iter_mut()) {
-        let key = [src[0], src[1], src[2]];
-        if !have_last || key != last_key {
-            last_val = color_to_owner.get(&key).copied().unwrap_or(0);
-            last_key = key;
-            have_last = true;
-        }
-        *o = last_val;
-    }
+    let color_to_id: HashMap<[u8; 3], u32> = map.by_color.iter().map(|(rgb, info)| (*rgb, info.id)).collect();
 
-    // Проход 2: заливка + границы. Соседи читаются напрямую из плоских буферов.
-    let mut out = vec![255u8; raw.len()];
+    let mut ids = vec![0u8; raw.len()];
     // Уникальные рёбра (меньший id, больший id); порядок вставки не влияет на результат.
     let mut edges: HashSet<(u32, u32)> = HashSet::new();
     let mut last_pair = ([0u8; 3], [0u8; 3]); // кэш: подряд идущие одинаковые стыки
+    let mut last_key = [0u8; 3];
+    let mut last_id = 0u32;
+    let mut have_last = false;
+
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
+            let key_here = [raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2]];
+
+            if !have_last || key_here != last_key {
+                last_id = color_to_id.get(&key_here).copied().unwrap_or(0);
+                last_key = key_here;
+                have_last = true;
+            }
+            ids[i * 4] = (last_id & 0xFF) as u8;
+            ids[i * 4 + 1] = ((last_id >> 8) & 0xFF) as u8;
+            ids[i * 4 + 3] = 255;
 
             // Смежность: только горизонтальные/вертикальные стыки (правый и нижний сосед
             // покрывают все пары без дублей; диагонали не учитываются).
-            let key_here = [raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2]];
             for n in [(x + 1 < w).then(|| i + 1), (y + 1 < h).then(|| i + w)].into_iter().flatten() {
                 let key_n = [raw[n * 4], raw[n * 4 + 1], raw[n * 4 + 2]];
                 if key_n == key_here || (key_here, key_n) == last_pair {
                     continue;
                 }
                 last_pair = (key_here, key_n);
-                if let (Some(a), Some(b)) = (map.by_color.get(&key_here), map.by_color.get(&key_n)) {
-                    if a.id != b.id {
-                        edges.insert((a.id.min(b.id), a.id.max(b.id)));
+                if let (Some(&a), Some(&b)) = (color_to_id.get(&key_here), color_to_id.get(&key_n)) {
+                    if a != b {
+                        edges.insert((a.min(b), a.max(b)));
                     }
                 }
             }
-
-            let own = owner[i];
-            let dst = &mut out[i * 4..i * 4 + 3];
-
-            if own == 0 {
-                dst.copy_from_slice(&WATER_COLOR); // в море границы не рисуем
-                continue;
-            }
-
-            // Соседи: слева, справа, сверху, снизу (за краем карты соседей нет).
-            let mut neighbors = [usize::MAX; 4];
-            if x > 0 {
-                neighbors[0] = i - 1;
-            }
-            if x + 1 < w {
-                neighbors[1] = i + 1;
-            }
-            if y > 0 {
-                neighbors[2] = i - w;
-            }
-            if y + 1 < h {
-                neighbors[3] = i + w;
-            }
-
-            let key = &raw[i * 4..i * 4 + 3];
-            let mut country_border = false;
-            let mut province_border = false;
-            for &n in &neighbors {
-                if n == usize::MAX {
-                    continue;
-                }
-                if owner[n] != own {
-                    country_border = true;
-                    break; // высший приоритет, дальше смотреть незачем
-                }
-                if &raw[n * 4..n * 4 + 3] != key {
-                    province_border = true;
-                }
-            }
-
-            let color = if country_border {
-                COUNTRY_BORDER_COLOR
-            } else if province_border {
-                shaded[own as usize]
-            } else {
-                fills[own as usize]
-            };
-            dst.copy_from_slice(&color);
         }
     }
 
@@ -422,37 +431,86 @@ fn build_political_texture(map: &ProvinceMap, registry: &StateRegistry) -> (Vec<
         adjacency.neighbors.len(),
         edges.len()
     );
-    (out, adjacency)
+    (ids, adjacency)
 }
 
 pub fn setup_map(
     mut commands: Commands,
     map: Res<ProvinceMap>,
-    registry: Res<StateRegistry>,
+    controllers: Res<ProvinceControllers>,
     mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<PoliticalMaterial>>,
 ) {
-    let (political, adjacency) = build_political_texture(&map, &registry);
+    let (ids, adjacency) = build_id_texture_and_adjacency(&map);
     commands.insert_resource(adjacency);
-    println!("[УСПЕХ] Политическая карта сгенерирована: {}x{}", map.width(), map.height());
 
-    // Оригинальный provinces.bmp остаётся в RAM (ProvinceMap) для определения провинции под курсором.
-    let bevy_image = Image::new(
-        Extent3d {
-            width: map.width(),
-            height: map.height(),
-            depth_or_array_layers: 1,
-        },
+    // Палитра: тексель (id % 256, id / 256) = цвет контроллера провинции.
+    let max_id = map.by_color.values().map(|p| p.id).max().unwrap_or(0) as usize;
+    let rows = max_id / PALETTE_WIDTH + 1;
+    let mut palette = Vec::with_capacity(PALETTE_WIDTH * rows * 4);
+    for _ in 0..PALETTE_WIDTH * rows {
+        palette.extend_from_slice(&palette_texel(None));
+    }
+    for (&id, tag) in &controllers.0 {
+        let off = id as usize * 4;
+        if let Some(px) = palette.get_mut(off..off + 4) {
+            px.copy_from_slice(&palette_texel(Some(tag)));
+        }
+    }
+
+    // id провинций — точные байты (без sRGB), хранится только на GPU; палитра — sRGB, как раньше карта.
+    let ids_image = Image::new(
+        Extent3d { width: map.width(), height: map.height(), depth_or_array_layers: 1 },
         TextureDimension::D2,
-        political,
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
+        ids,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
     );
+    let palette_image = Image::new(
+        Extent3d { width: PALETTE_WIDTH as u32, height: rows as u32, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        palette,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(), // данные остаются в RAM для точечных правок
+    );
+    let palette_handle = images.add(palette_image);
+    let material = materials.add(PoliticalMaterial { ids: images.add(ids_image), palette: palette_handle.clone() });
+    commands.insert_resource(MapPaint { palette: palette_handle, material: material.clone() });
 
-    // Спрайт по центру (0,0), anchor по умолчанию Center, масштаб 1:1.
-    commands.spawn(SpriteBundle {
-        texture: images.add(bevy_image),
+    // Меш-прямоугольник по центру (0,0), масштаб 1:1. Оригинальный provinces.bmp остаётся в RAM
+    // (ProvinceMap) для определения провинции под курсором.
+    commands.spawn(MaterialMesh2dBundle {
+        mesh: Mesh2dHandle(meshes.add(Rectangle::new(map.width() as f32, map.height() as f32))),
+        material,
         ..default()
     });
+    println!("[УСПЕХ] Карта на GPU: {}x{}, палитра {} цветов", map.width(), map.height(), PALETTE_WIDTH * rows);
+}
+
+/// Контроль провинции сменился: правим один тексель палитры, остальные данные карты не трогаем.
+fn repaint_changed_provinces(
+    mut events: EventReader<ProvinceControllerChanged>,
+    paint: Option<Res<MapPaint>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<PoliticalMaterial>>,
+) {
+    let changes: Vec<ProvinceControllerChanged> = events.read().cloned().collect();
+    let Some(paint) = paint else { return };
+    if changes.is_empty() {
+        return;
+    }
+    if let Some(image) = images.get_mut(&paint.palette) {
+        for change in &changes {
+            let off = change.province_id as usize * 4;
+            if let Some(px) = image.data.get_mut(off..off + 4) {
+                px.copy_from_slice(&palette_texel(Some(&change.new_controller)));
+            }
+        }
+    }
+    // В Bevy 0.14 перезагруженная текстура не пересоздаёт bind group материала сама:
+    // помечаем материал изменённым, чтобы он подхватил новую палитру.
+    let _ = materials.get_mut(&paint.material);
 }
 
 // ---------------------------------------------------------------------------
@@ -461,7 +519,7 @@ pub fn setup_map(
 
 /// Разбивает текст Paradox-script на токены: слова, `{`, `}`, `=`, строки в кавычках.
 /// Комментарии (`# ...`) отбрасываются. Кавычки с значения снимаются.
-fn tokenize(text: &str) -> Vec<String> {
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     for line in text.lines() {
         let mut chars = line.chars();
@@ -509,6 +567,7 @@ fn parse_state(text: &str) -> Option<StateDef> {
     let mut provinces = Vec::new();
     let mut civilian_factories = None;
     let mut military_factories = None;
+    let mut victory_points: Vec<(u32, u32)> = Vec::new();
     let mut depth = 0usize;
 
     let mut i = 0;
@@ -539,6 +598,24 @@ fn parse_state(text: &str) -> Option<StateDef> {
                         ("arms_factory", 3) if military_factories.is_none() => {
                             military_factories = value.and_then(|t| t.parse::<u32>().ok());
                         }
+                        // history { victory_points = { 6521 50 } }: ключ на глубине 2, внутри «провинция очки»
+                        // (датированные блоки глубже и не учитываются — берём состояние на 1936 год)
+                        ("victory_points", 2) => {
+                            if tokens.get(i + 2).map(String::as_str) == Some("{") {
+                                let mut j = i + 3;
+                                let mut numbers = Vec::new();
+                                while j < tokens.len() && tokens[j] != "}" {
+                                    if let Ok(n) = tokens[j].parse::<u32>() {
+                                        numbers.push(n);
+                                    }
+                                    j += 1;
+                                }
+                                if let [province, points, ..] = numbers[..] {
+                                    victory_points.push((province, points));
+                                }
+                                i = j; // остановились на закрывающей `}`
+                            }
+                        }
                         ("provinces", 1) if provinces.is_empty() => {
                             if tokens.get(i + 2).map(String::as_str) == Some("{") {
                                 let mut j = i + 3;
@@ -567,6 +644,7 @@ fn parse_state(text: &str) -> Option<StateDef> {
         provinces,
         civilian_factories: civilian_factories.unwrap_or(0),
         military_factories: military_factories.unwrap_or(0),
+        victory_points,
     })
 }
 
@@ -761,6 +839,7 @@ fn ui_state_panel(
     map: Res<ProvinceMap>,
     states: Res<StateRegistry>,
     adjacency: Res<ProvinceAdjacency>,
+    controllers: Res<ProvinceControllers>,
 ) {
     let Some(id) = selected.id else { return };
     let ctx = contexts.ctx_mut();
@@ -781,12 +860,14 @@ fn ui_state_panel(
             match state {
                 Some(s) => {
                     ui.label(format!("Стейт: {} ({})", s.id, s.name));
+                    // Контроллер может отличаться от владельца (оккупация)
+                    let controller = controllers.0.get(&id).unwrap_or(&s.owner);
                     ui.horizontal(|ui| {
                         ui.label("Контролирует:");
-                        let [r, g, b] = country_color(&s.owner);
+                        let [r, g, b] = country_color(controller);
                         let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                         ui.painter().rect_filled(rect, 3.0, egui::Color32::from_rgb(r, g, b));
-                        ui.label(&s.owner);
+                        ui.label(format!("{controller} (Владелец: {})", s.owner));
                     });
                 }
                 None => {
