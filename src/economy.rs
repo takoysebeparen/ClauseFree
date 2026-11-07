@@ -448,7 +448,7 @@ mod tests {
         }
         let registry = crate::map::load_all_states(&root.join("history").join("states")).expect("стейты");
         let map = crate::map::load_province_map(root).expect("карта");
-        let (_, adjacency) = crate::map::build_id_texture_and_adjacency(&map);
+        let (_, adjacency, _) = crate::map::build_id_texture_and_adjacency(&map);
         let controllers = ProvinceControllers(
             registry.province_to_state.iter().map(|(&p, s)| (p, s.owner.clone())).collect(),
         );

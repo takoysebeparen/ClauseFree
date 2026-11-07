@@ -28,6 +28,11 @@ pub struct ProvinceInfo {
     pub terrain: String,
 }
 
+/// Сколько пикселей границы должны касаться реки, чтобы пара провинций считалась разделённой рекой.
+/// Реки HOI4 идут вдоль границ, а одиночное касание — это река, лишь пересекающая границу. Замер на игре 1936:
+/// >=1 пикс. — 9012 границ, >=2 — 6710, >=3 — 5461, >=5 — 4744, >=10 — 3242; порог 3 отсекает случайные касания.
+const MIN_RIVER_CONTACT_PIXELS: u32 = 3;
+
 /// Карта провинций в оперативной памяти: пиксели + таблицы lookup.
 /// Только чтение после старта, поэтому детерминизм не страдает
 /// (HashMap используется исключительно для lookup, без итерации).
@@ -37,6 +42,20 @@ pub struct ProvinceMap {
     by_color: HashMap<[u8; 3], ProvinceInfo>,
     /// id провинции -> местность (для вывода по id).
     terrain_by_id: HashMap<u32, String>,
+    /// Маска речных пикселей из `map/rivers.bmp` (тот же размер, что и карта провинций); `None`, если файла нет.
+    river_mask: Option<Vec<bool>>,
+}
+
+/// Пары смежных провинций (меньший id, больший id), между которыми проходит река:
+/// атака через такую границу — форсирование реки. Строится вместе с графом смежности.
+#[derive(Resource, Default, Debug)]
+pub struct ProvinceRivers(pub BTreeSet<(u32, u32)>);
+
+impl ProvinceRivers {
+    /// Есть ли река между провинциями `a` и `b`.
+    pub fn crosses(&self, a: u32, b: u32) -> bool {
+        self.0.contains(&(a.min(b), a.max(b)))
+    }
 }
 
 impl ProvinceMap {
@@ -73,13 +92,13 @@ impl ProvinceMap {
     #[cfg(test)]
     pub fn with_terrain_for_test(terrain: &[(u32, &str)]) -> Self {
         let terrain_by_id = terrain.iter().map(|&(id, t)| (id, t.to_string())).collect();
-        Self { image: RgbaImage::new(1, 1), by_color: HashMap::new(), terrain_by_id }
+        Self { image: RgbaImage::new(1, 1), by_color: HashMap::new(), terrain_by_id, river_mask: None }
     }
 
     /// Пустая карта для модульных тестов: вся суша, цветов и местности нет.
     #[cfg(test)]
     pub fn empty_for_test() -> Self {
-        Self { image: RgbaImage::new(1, 1), by_color: HashMap::new(), terrain_by_id: HashMap::new() }
+        Self { image: RgbaImage::new(1, 1), by_color: HashMap::new(), terrain_by_id: HashMap::new(), river_mask: None }
     }
 
     pub fn terrain_of(&self, province_id: u32) -> Option<&str> {
@@ -269,6 +288,7 @@ impl Plugin for MapPlugin {
             .init_resource::<HoveredProvince>()
             .init_resource::<SelectedProvince>()
             .init_resource::<ProvinceAdjacency>()
+            .init_resource::<ProvinceRivers>()
             .add_event::<PlayerCommand>()
             .add_systems(Startup, setup_map)
             .add_systems(
@@ -381,7 +401,7 @@ fn palette_texel(controller: Option<&str>) -> [u8; 4] {
 }
 
 /// Строит текстуру id провинций (R, G = младший / старший байт id) и граф смежности за один обход.
-pub(crate) fn build_id_texture_and_adjacency(map: &ProvinceMap) -> (Vec<u8>, ProvinceAdjacency) {
+pub(crate) fn build_id_texture_and_adjacency(map: &ProvinceMap) -> (Vec<u8>, ProvinceAdjacency, ProvinceRivers) {
     let w = map.width() as usize;
     let h = map.height() as usize;
     let raw = map.image.as_raw();
@@ -391,6 +411,8 @@ pub(crate) fn build_id_texture_and_adjacency(map: &ProvinceMap) -> (Vec<u8>, Pro
     let mut ids = vec![0u8; raw.len()];
     // Уникальные рёбра (меньший id, больший id); порядок вставки не влияет на результат.
     let mut edges: HashSet<(u32, u32)> = HashSet::new();
+    // Рёбра, на стыке которых есть речной пиксель (по любую сторону границы)
+    let mut river_contacts: BTreeMap<(u32, u32), u32> = BTreeMap::new();
     let mut last_pair = ([0u8; 3], [0u8; 3]); // кэш: подряд идущие одинаковые стыки
     let mut last_key = [0u8; 3];
     let mut last_id = 0u32;
@@ -414,7 +436,18 @@ pub(crate) fn build_id_texture_and_adjacency(map: &ProvinceMap) -> (Vec<u8>, Pro
             // покрывают все пары без дублей; диагонали не учитываются).
             for n in [(x + 1 < w).then(|| i + 1), (y + 1 < h).then(|| i + w)].into_iter().flatten() {
                 let key_n = [raw[n * 4], raw[n * 4 + 1], raw[n * 4 + 2]];
-                if key_n == key_here || (key_here, key_n) == last_pair {
+                if key_n == key_here {
+                    continue;
+                }
+                // Река на границе провинций: пиксель реки по любую сторону стыка (проверка до кэша пар)
+                if map.river_mask.as_ref().is_some_and(|mask| mask[i] || mask[n]) {
+                    if let (Some(&a), Some(&b)) = (color_to_id.get(&key_here), color_to_id.get(&key_n)) {
+                        if a != b {
+                            *river_contacts.entry((a.min(b), a.max(b))).or_default() += 1;
+                        }
+                    }
+                }
+                if (key_here, key_n) == last_pair {
                     continue;
                 }
                 last_pair = (key_here, key_n);
@@ -438,7 +471,10 @@ pub(crate) fn build_id_texture_and_adjacency(map: &ProvinceMap) -> (Vec<u8>, Pro
         adjacency.neighbors.len(),
         edges.len()
     );
-    (ids, adjacency)
+    let at_least = |n: u32| river_contacts.values().filter(|&&c| c >= n).count();
+    println!("[РЕКИ] Границ с рекой: >=1 пикс. {}, >=2 {}, >=3 {}, >=5 {}, >=10 {}", at_least(1), at_least(2), at_least(3), at_least(5), at_least(10));
+    let river_edges = river_contacts.into_iter().filter(|&(_, c)| c >= MIN_RIVER_CONTACT_PIXELS).map(|(pair, _)| pair).collect();
+    (ids, adjacency, ProvinceRivers(river_edges))
 }
 
 pub fn setup_map(
@@ -449,8 +485,9 @@ pub fn setup_map(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<PoliticalMaterial>>,
 ) {
-    let (ids, adjacency) = build_id_texture_and_adjacency(&map);
+    let (ids, adjacency, rivers) = build_id_texture_and_adjacency(&map);
     commands.insert_resource(adjacency);
+    commands.insert_resource(rivers);
 
     // Палитра: тексель (id % 256, id / 256) = цвет контроллера провинции.
     let max_id = map.by_color.values().map(|p| p.id).max().unwrap_or(0) as usize;
@@ -757,7 +794,20 @@ pub(crate) fn load_province_map(root: &Path) -> Result<ProvinceMap, String> {
         image.height(),
         by_color.len()
     );
-    Ok(ProvinceMap { image, by_color, terrain_by_id })
+    let river_mask = load_river_mask(root, image.width(), image.height());
+    Ok(ProvinceMap { image, by_color, terrain_by_id, river_mask })
+}
+
+/// `map/rivers.bmp` -> маска речных пикселей. В файле реки нарисованы цветами палитры (индексы 0..=11),
+/// а фоном служат серый (122,122,122) и белый (255,255,255). Нет файла или размер не совпал — рек нет.
+fn load_river_mask(root: &Path, width: u32, height: u32) -> Option<Vec<bool>> {
+    let bytes = std::fs::read(root.join("map").join("rivers.bmp")).ok()?;
+    let rivers = image::load_from_memory(&bytes).ok()?.to_rgb8();
+    if rivers.width() != width || rivers.height() != height {
+        eprintln!("[ПРЕДУПРЕЖДЕНИЕ] rivers.bmp другого размера, реки не учитываются");
+        return None;
+    }
+    Some(rivers.pixels().map(|p| p.0 != [122, 122, 122] && p.0 != [255, 255, 255]).collect())
 }
 
 // ---------------------------------------------------------------------------

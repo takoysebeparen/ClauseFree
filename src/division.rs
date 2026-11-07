@@ -20,7 +20,7 @@ use crate::oob::OobDivisions;
 use crate::units::{DivisionTemplate, DivisionTemplates, BASE_TEMPLATE, INFANTRY_SPEED_KPH};
 use crate::map::{
     country_color, pick_province, setup_map, HoveredProvince, ProvinceAdjacency, ProvinceCenters, ProvinceControllerChanged,
-    ProvinceControllers, ProvinceMap,
+    ProvinceControllers, ProvinceMap, ProvinceRivers,
 };
 
 /// Интенсивность боя: доля организации цели, снимаемая за час, в сотых долях процента (bp),
@@ -952,10 +952,64 @@ fn advance_marches(
     }
 }
 
+/// Штраф к атаке при форсировании реки (между провинцией атакующего и обороняемой есть река), %.
+pub const RIVER_PENALTY_PCT: u32 = 30;
+/// Твёрдость, выше которой часть считается бронированной (для штрафов горам и болоту).
+const ARMORED_HARDNESS_PCT: u32 = 50;
+
+/// Боевые модификаторы местности обороняемой провинции (проценты).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerrainModifiers {
+    /// Бонус к эффективной защите обороняющихся.
+    pub defense_bonus: u32,
+    /// Штраф к атаке наступающих.
+    pub attack_penalty: u32,
+    /// Дополнительный штраф к атаке наступающих бронированных частей (`hardness > 50`).
+    pub armored_attack_penalty: u32,
+}
+
+/// Модификаторы по типу местности (названия из `definition.csv`). Остальные типы — без модификаторов.
+pub fn terrain_modifiers(terrain: Option<&str>) -> TerrainModifiers {
+    let (defense_bonus, attack_penalty, armored_attack_penalty) = match terrain {
+        Some("forest") => (20, 10, 0),
+        Some("hills") => (25, 15, 0),
+        Some("mountain") => (50, 30, 20),
+        Some("marsh") => (20, 25, 30),
+        Some("urban") => (30, 20, 0),
+        _ => (0, 0, 0), // plains и прочие типы
+    };
+    TerrainModifiers { defense_bonus, attack_penalty, armored_attack_penalty }
+}
+
+/// Условия конкретного удара: штраф атаки бьющего и бонус защиты цели, %.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HitContext {
+    pub attack_penalty: u32,
+    pub defense_bonus: u32,
+}
+
+impl HitContext {
+    /// Без модификаторов (удары обороняющихся и тесты без рельефа).
+    pub const NONE: HitContext = HitContext { attack_penalty: 0, defense_bonus: 0 };
+
+    /// Удар наступающей дивизии: штраф рельефа (бронированным — повышенный) и реки, защитникам — бонус рельефа.
+    pub fn for_attack(terrain: &TerrainModifiers, striker: &Division, over_river: bool) -> Self {
+        let armored = if striker.hardness > ARMORED_HARDNESS_PCT { terrain.armored_attack_penalty } else { 0 };
+        let river = if over_river { RIVER_PENALTY_PCT } else { 0 };
+        HitContext { attack_penalty: terrain.attack_penalty + armored + river, defense_bonus: terrain.defense_bonus }
+    }
+}
+
+/// Интенсивность удара без модификаторов рельефа (обороняющиеся и сценарии без местности).
+fn combat_bp(att: &Division, def: &Division, planning: u32) -> u32 {
+    combat_bp_ctx(att, def, planning, HitContext::NONE)
+}
+
 /// Часовая интенсивность удара `att` по `def` в bp от организации цели (целые числа).
 /// Атака и защита пропорциональны укомплектованности (current_strength / max_strength).
 /// `planning` — бонус планирования атакующего в процентах: `attack * (100 + planning) / 100`.
-fn combat_bp(att: &Division, def: &Division, planning: u32) -> u32 {
+/// `ctx` — рельеф и река: `attack * (100 - штраф) / 100`, `defense * (100 + бонус) / 100`.
+fn combat_bp_ctx(att: &Division, def: &Division, planning: u32, ctx: HitContext) -> u32 {
     let base_attack = att.soft_attack * att.current_strength / att.max_strength.max(1);
     let mut attack = base_attack * (100 + planning.min(MAX_PLANNING)) / 100;
     // Навык командира фронта: +2% к атаке за уровень; сверх лимита командира — вдвое слабее
@@ -967,6 +1021,9 @@ fn combat_bp(att: &Division, def: &Division, planning: u32) -> u32 {
         attack = attack * UNSUPPLIED_STAT_PCT / 100; // отрезан от снабжения: -33%
     }
 
+    // Рельеф обороняемой провинции и переправа через реку режут атаку наступающих
+    attack = attack * (100 - ctx.attack_penalty.min(100)) / 100;
+
     let base_defense = def.defense * def.current_strength / def.max_strength.max(1);
     // Окопанность: +2% защиты за пункт (у наступающих она всегда 0 — марш её сбрасывает)
     let mut defense = base_defense * (100 + def.entrenchment.min(MAX_ENTRENCHMENT) * 2) / 100;
@@ -977,6 +1034,7 @@ fn combat_bp(att: &Division, def: &Division, planning: u32) -> u32 {
     if !def.is_supplied {
         defense = defense * UNSUPPLIED_STAT_PCT / 100; // отрезан от снабжения: -33%
     }
+    defense = defense * (100 + ctx.defense_bonus) / 100; // бонус рельефа обороняющимся
     (COMBAT_INTENSITY_BP * attack / (attack + defense).max(1)).max(1)
 }
 
@@ -1122,6 +1180,7 @@ fn resolve_combats(
     mut selected: ResMut<SelectedDivision>,
     adjacency: Res<ProvinceAdjacency>,
     map: Res<ProvinceMap>,
+    rivers: Res<ProvinceRivers>,
     mut controllers: ResMut<ProvinceControllers>,
     mut controller_changed: EventWriter<ProvinceControllerChanged>,
 ) {
@@ -1221,10 +1280,14 @@ fn resolve_combats(
             if !att_line.is_empty() && !def_line.is_empty() {
                 // Все удары считаются по значениям до боя, затем применяются
                 let mut hits: Vec<(Entity, u32, u32)> = Vec::new();
+                let terrain = terrain_modifiers(map.terrain_of(province));
                 for (k, (_, striker)) in att_line.iter().enumerate() {
                     let (target_e, target) = &def_line[k % def_line.len()];
+                    // Река между провинцией отправления этой дивизии и обороняемой — форсирование
+                    let over_river = striker.movement.is_some_and(|m| rivers.crosses(m.from, province));
+                    let ctx = HitContext::for_attack(&terrain, striker, over_river);
                     // Наступающая дивизия получает бонус планирования к атаке
-                    let bp = combat_bp(striker, target, striker.planning);
+                    let bp = combat_bp_ctx(striker, target, striker.planning, ctx);
                     // Броня меняет урон и по организации, и по прочности
                     let org_milli = apply_armor_rule(target.max_org * bp / 10, striker, target).max(1);
                     let strength = apply_armor_rule(target.max_strength * bp / 50_000, striker, target).max(1);
@@ -1527,12 +1590,28 @@ fn side_stats(divisions: &Query<&Division>, list: &[Entity]) -> SideStats {
     stats
 }
 
+/// Строка модификаторов боя: `Местность: forest (Защ: +20%, Атк: -10%)`.
+/// В штраф атаки входит форсирование реки (-30%), о котором напоминает пометка `[река]`.
+fn terrain_label(terrain: Option<&str>, river_crossing: bool) -> String {
+    let mods = terrain_modifiers(terrain);
+    let river = if river_crossing { RIVER_PENALTY_PCT } else { 0 };
+    format!(
+        "Местность: {} (Защ: +{}%, Атк: -{}%){}",
+        terrain.unwrap_or("unknown"),
+        mods.defense_bonus,
+        mods.attack_penalty + river,
+        if river_crossing { " [река]" } else { "" }
+    )
+}
+
 /// Маркер боя над провинцией: круглый бейдж с процентом, организация линии, ширина фронта и резерв.
 fn combat_ui(
     mut contexts: EguiContexts,
     combats: Query<(Entity, &ActiveCombat)>,
     divisions: Query<&Division>,
     centers: Res<ProvinceCenters>,
+    map: Res<ProvinceMap>,
+    rivers: Res<ProvinceRivers>,
     cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
 ) {
     let Ok((camera, cam_tf)) = cameras.get_single() else { return };
@@ -1543,6 +1622,13 @@ fn combat_ui(
         let Some(screen) = camera.world_to_viewport(cam_tf, center.extend(0.0)) else { continue };
         let att = side_stats(&divisions, &combat.attackers);
         let def = side_stats(&divisions, &combat.defenders);
+        // Рельеф обороняемой провинции и форсирование реки хотя бы одной атакующей дивизией
+        let crossing = combat
+            .attackers
+            .iter()
+            .filter_map(|&e| divisions.get(e).ok())
+            .any(|d| d.movement.is_some_and(|m| rivers.crosses(m.from, combat.province_id)));
+        let terrain_text = terrain_label(map.terrain_of(combat.province_id), crossing);
 
         egui::Area::new(egui::Id::new(("combat_plate", ce)))
             .fixed_pos(egui::pos2(screen.x - 28.0, screen.y - 70.0))
@@ -1562,6 +1648,7 @@ fn combat_ui(
                     egui::FontId::proportional(13.0),
                     egui::Color32::WHITE,
                 );
+                ui.label(egui::RichText::new(&terrain_text).small());
                 // Организация линии: атакующие (синий) и защитники (красный), ширина фронта и резерв
                 let sides = [
                     ("АТК", &att, egui::Color32::from_rgb(70, 160, 220)),
@@ -1755,6 +1842,7 @@ mod tests {
             .add_event::<ProvinceControllerChanged>()
             .init_resource::<SelectedDivision>()
             .insert_resource(ProvinceMap::empty_for_test())
+            .init_resource::<ProvinceRivers>()
             .insert_resource(ProvinceAdjacency { neighbors })
             .insert_resource(controllers)
             .add_systems(Update, resolve_combats);
@@ -1960,6 +2048,28 @@ mod tests {
         assert!(run(false) > run(true), "защитники теряют меньше организации, когда атакующие отрезаны");
     }
     #[test]
+    fn terrain_and_river_protect_defenders_in_combat() {
+        // org защитников после 5 часов боя: чем лучше оборона, тем меньше потери
+        let run = |terrain: &str, river: bool| {
+            let (mut app, _att, def) = scenario(&[1; 4], 4, 1);
+            app.insert_resource(ProvinceMap::with_terrain_for_test(&[(2, terrain)]));
+            if river {
+                app.insert_resource(ProvinceRivers(BTreeSet::from([(1, 2)])));
+            }
+            for _ in 0..5 {
+                tick(&mut app);
+            }
+            totals(&app, &def).0
+        };
+        let plains = run("plains", false);
+        let forest = run("forest", false);
+        let mountain = run("mountain", false);
+        let mountain_river = run("mountain", true);
+        assert!(forest > plains, "лес защищает: потери меньше, чем на равнине");
+        assert!(mountain > forest, "горы защищают сильнее леса");
+        assert!(mountain_river > mountain, "форсирование реки ослабляет атаку ещё сильнее");
+    }
+    #[test]
     fn planning_scales_effective_attack() {
         let templates = DivisionTemplates::default();
         let make = |id| {
@@ -2151,5 +2261,95 @@ mod supply_tests {
         assert_eq!(division(&app, starving).current_strength, 1, "прочность не падает ниже 1");
         assert_eq!(division(&app, starving).attrition_days, 3);
         assert_eq!(division(&app, marching).current_org, 10, "на марше организация не восстанавливается");
+    }
+}
+
+#[cfg(test)]
+mod terrain_tests {
+    use super::*;
+
+    fn division(template: &str) -> Division {
+        let templates = DivisionTemplates::default();
+        Division::from_template(1, "d".into(), "GER".into(), 1, template.to_string(), templates.get_or_base(template))
+    }
+
+    #[test]
+    fn terrain_table_matches_the_rules() {
+        let m = |t| terrain_modifiers(Some(t));
+        // (бонус защиты, штраф атаки, доп. штраф бронированным)
+        let parts = |t: TerrainModifiers| (t.defense_bonus, t.attack_penalty, t.armored_attack_penalty);
+        assert_eq!(parts(m("plains")), (0, 0, 0));
+        assert_eq!(parts(m("forest")), (20, 10, 0));
+        assert_eq!(parts(m("hills")), (25, 15, 0));
+        assert_eq!(parts(m("mountain")), (50, 30, 20));
+        assert_eq!(parts(m("marsh")), (20, 25, 30));
+        assert_eq!(parts(m("urban")), (30, 20, 0));
+        // прочие типы и неизвестная местность — без модификаторов
+        assert_eq!(parts(m("desert")), (0, 0, 0));
+        assert_eq!(parts(terrain_modifiers(None)), (0, 0, 0));
+    }
+
+    #[test]
+    fn armored_units_pay_extra_in_mountains_and_marsh() {
+        let infantry = division(BASE_TEMPLATE); // твёрдость 0
+        let panzer = division("Panzer-Division"); // твёрдость 55 > 50
+        assert!(panzer.hardness > 50 && infantry.hardness <= 50);
+        let mountain = terrain_modifiers(Some("mountain"));
+        let marsh = terrain_modifiers(Some("marsh"));
+        assert_eq!(HitContext::for_attack(&mountain, &infantry, false).attack_penalty, 30);
+        assert_eq!(HitContext::for_attack(&mountain, &panzer, false).attack_penalty, 50);
+        assert_eq!(HitContext::for_attack(&marsh, &infantry, false).attack_penalty, 25);
+        assert_eq!(HitContext::for_attack(&marsh, &panzer, false).attack_penalty, 55);
+        // лес броню не штрафует; защитный бонус всегда берётся из рельефа
+        let forest = terrain_modifiers(Some("forest"));
+        assert_eq!(HitContext::for_attack(&forest, &panzer, false), HitContext { attack_penalty: 10, defense_bonus: 20 });
+        // река добавляет -30% поверх рельефа
+        assert_eq!(HitContext::for_attack(&mountain, &panzer, true).attack_penalty, 80);
+    }
+
+    #[test]
+    fn terrain_and_river_scale_attack_and_defense() {
+        let (attacker, defender) = (division(BASE_TEMPLATE), division(BASE_TEMPLATE));
+        // база: атака 90, защита 225 -> 800 * 90 / 315 = 228
+        assert_eq!(combat_bp_ctx(&attacker, &defender, 0, HitContext::NONE), 228);
+        // лес: атака 90 * 90 / 100 = 81, защита 225 * 120 / 100 = 270 -> 800 * 81 / 351 = 184
+        let forest = HitContext { attack_penalty: 10, defense_bonus: 20 };
+        assert_eq!(combat_bp_ctx(&attacker, &defender, 0, forest), 184);
+        // горы: атака 63, защита 337 -> 800 * 63 / 400 = 126
+        let mountain = HitContext { attack_penalty: 30, defense_bonus: 50 };
+        assert_eq!(combat_bp_ctx(&attacker, &defender, 0, mountain), 126);
+        // только река: атака 63, защита 225 -> 800 * 63 / 288 = 175
+        let river = HitContext { attack_penalty: RIVER_PENALTY_PCT, defense_bonus: 0 };
+        assert_eq!(combat_bp_ctx(&attacker, &defender, 0, river), 175);
+        // штрафы свыше 100% не уводят атаку в отрицательные значения (остаётся минимальный урон)
+        let absurd = HitContext { attack_penalty: 250, defense_bonus: 0 };
+        assert_eq!(combat_bp_ctx(&attacker, &defender, 0, absurd), 1);
+    }
+
+    #[test]
+    fn combat_label_shows_terrain_modifiers() {
+        assert_eq!(terrain_label(Some("forest"), false), "Местность: forest (Защ: +20%, Атк: -10%)");
+        assert_eq!(terrain_label(Some("plains"), false), "Местность: plains (Защ: +0%, Атк: -0%)");
+        assert_eq!(terrain_label(Some("hills"), true), "Местность: hills (Защ: +25%, Атк: -45%) [река]");
+        assert_eq!(terrain_label(None, false), "Местность: unknown (Защ: +0%, Атк: -0%)");
+    }
+
+    /// Реки из `map/rivers.bmp` на реальных данных (пропускается без игры).
+    #[test]
+    fn real_data_river_borders() {
+        use std::path::Path;
+        let root = Path::new("D:\\SteamLibrary\\steamapps\\common\\Hearts of Iron IV");
+        if !root.exists() {
+            return;
+        }
+        let map = crate::map::load_province_map(root).expect("карта");
+        let (_, adjacency, rivers) = crate::map::build_id_texture_and_adjacency(&map);
+        let edges: usize = adjacency.neighbors.values().map(|s| s.len()).sum::<usize>() / 2;
+        println!("границ с рекой: {} из {edges}", rivers.0.len());
+        assert!(rivers.0.len() > 100, "реки должны находиться на сотнях границ");
+        assert!(rivers.0.len() < edges / 2, "река не может быть почти на каждой границе");
+        // каждая речная граница — реальная пара соседей
+        assert!(rivers.0.iter().all(|&(a, b)| adjacency.neighbors.get(&a).is_some_and(|s| s.contains(&b))));
+        assert!(rivers.crosses(rivers.0.iter().next().unwrap().1, rivers.0.iter().next().unwrap().0));
     }
 }
