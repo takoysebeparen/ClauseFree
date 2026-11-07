@@ -15,7 +15,7 @@ use bevy_egui::{egui, EguiContexts};
 use crate::camera::MainCamera;
 use crate::clock::{ClockSet, DailyTickEvent, HourTick};
 use crate::oob::OobDivisions;
-use crate::units::{DivisionTemplate, DivisionTemplates, BASE_TEMPLATE};
+use crate::units::{DivisionTemplate, DivisionTemplates, BASE_TEMPLATE, INFANTRY_SPEED_KPH};
 use crate::map::{
     country_color, pick_province, setup_map, HoveredProvince, ProvinceAdjacency, ProvinceCenters, ProvinceControllerChanged,
     ProvinceControllers, ProvinceMap,
@@ -92,6 +92,12 @@ pub struct Division {
     pub combat_width: u32,
     /// Роль в текущем бою: вне боя, на активной линии или в резерве.
     pub combat_state: CombatState,
+    /// Скорость дивизии (км/ч × 10) — по самому медленному батальону.
+    pub max_speed: u32,
+    pub armor: u32,
+    pub piercing: u32,
+    /// Твердость, %.
+    pub hardness: u32,
 }
 
 /// Положение дивизии в бою. Резерв не наносит и не получает урон.
@@ -166,6 +172,10 @@ impl Division {
             entrenchment: 0,
             combat_width: stats.combat_width,
             combat_state: CombatState::None,
+            max_speed: stats.max_speed,
+            armor: stats.armor,
+            piercing: stats.piercing,
+            hardness: stats.hardness,
         }
     }
 }
@@ -494,6 +504,17 @@ pub fn terrain_hours(terrain: Option<&str>) -> u32 {
     }
 }
 
+/// Часы, нужные на проход `base_hours` (время для пехоты) дивизии со скоростью `speed` (км/ч × 10).
+/// Масштаб обратно пропорционален скорости: 8.0 км/ч вдвое быстрее эталона 4.0. Округление вверх, минимум 1.
+pub fn scale_hours(base_hours: u32, speed: u32) -> u32 {
+    (u64::from(base_hours) * u64::from(INFANTRY_SPEED_KPH)).div_ceil(u64::from(speed.max(1))).max(1) as u32
+}
+
+/// Время перехода в провинцию с данной местностью для дивизии со скоростью `speed`.
+pub fn march_hours(terrain: Option<&str>, speed: u32) -> u32 {
+    scale_hours(terrain_hours(terrain), speed)
+}
+
 /// Предрассчитанные параметры графа провинций. Считаются один раз после построения графа смежности
 /// (`init_graph_metrics`), поэтому поиск пути не обходит весь граф при каждом вызове.
 #[derive(Resource, Debug, Clone, Copy)]
@@ -562,6 +583,7 @@ pub fn find_path_a_star(
     metrics: &GraphMetrics,
     owner: &str,
     enemy_target: Option<&str>,
+    speed: u32,
 ) -> Option<Vec<u32>> {
     let is_passable = |province: u32| {
         controllers
@@ -589,9 +611,9 @@ pub fn find_path_a_star(
     // Эвристика в часах: до цели нужно минимум dist / max_hop переходов, каждый стоит >= MIN_STEP_HOURS.
     // Округление вниз, max_hop вверх — оценка никогда не завышает.
     let max_hop = u64::from(metrics.max_hop_px.max(1));
-    let heuristic = |pos: (i64, i64)| -> u32 {
-        (u64::from(MIN_STEP_HOURS) * u64::from(dist_floor(pos, goal_pos)) / max_hop) as u32
-    };
+    // Быстрые дивизии проходят шаг быстрее, поэтому и нижняя граница шага масштабируется скоростью.
+    let min_step = u64::from(scale_hours(MIN_STEP_HOURS, speed));
+    let heuristic = |pos: (i64, i64)| -> u32 { (min_step * u64::from(dist_floor(pos, goal_pos)) / max_hop) as u32 };
 
     g_score[start as usize] = 0;
     open.push(Reverse((heuristic(start_pos), start, 0)));
@@ -617,7 +639,7 @@ pub fn find_path_a_star(
             }
             let Some(n_pos) = center_i(centers, n) else { continue };
             // Стоимость шага — время перехода в целевую провинцию с учётом местности (часы).
-            let tentative = g.saturating_add(terrain_hours(map.terrain_of(n)));
+            let tentative = g.saturating_add(march_hours(map.terrain_of(n), speed));
             if tentative < g_score[n as usize] {
                 g_score[n as usize] = tentative;
                 came_from[n as usize] = node;
@@ -666,6 +688,7 @@ fn apply_orders(
             &metrics,
             &division.owner,
             enemy_target,
+            division.max_speed,
         ) {
             Some(path) => {
                 division.path = path.into_iter().skip(1).collect(); // без стартовой точки
@@ -784,7 +807,7 @@ fn advance_marches(
                     .is_some_and(|set| set.contains(&next));
                 if reachable {
                     // Время шага зависит от местности целевой провинции
-                    let hours = terrain_hours(map.terrain_of(next));
+                    let hours = march_hours(map.terrain_of(next), division.max_speed);
                     division.entrenchment = 0; // начало шага марша (в т.ч. по приказу фронта / ИИ)
                     division.movement = Some(MovementProgress {
                         from: division.current_province,
@@ -856,6 +879,24 @@ fn combat_bp(att: &Division, def: &Division) -> u32 {
     // Окопанность: +2% защиты за пункт (у наступающих она всегда 0 — марш её сбрасывает)
     let defense = base_defense * (100 + def.entrenchment.min(MAX_ENTRENCHMENT) * 2) / 100;
     (COMBAT_INTENSITY_BP * attack / (attack + defense).max(1)).max(1)
+}
+
+/// Правило брони для удара `striker` по `target` (целые числа):
+/// - цель бронирована сильнее, чем пробитие бьющего (`armor(target) > piercing(striker)`) —
+///   урон вдвое меньше: пехота не пробивает броню;
+/// - бьющий бронирован сильнее, чем пробитие цели (`armor(striker) > piercing(target)`) —
+///   урон на 50% больше: безнаказанный расстрел с позиций.
+/// Для пары «A атакует B» это ровно условие `armor(B) > piercing(A)`: удар A по B режется вдвое,
+/// ответный удар B по A усиливается; правило симметрично и работает, если бронирован атакующий.
+fn apply_armor_rule(damage: u32, striker: &Division, target: &Division) -> u32 {
+    let mut damage = damage;
+    if target.armor > striker.piercing {
+        damage /= 2;
+    }
+    if striker.armor > target.piercing {
+        damage = damage * 150 / 100;
+    }
+    damage
 }
 
 /// Детерминированный хэш (splitmix64) — «случайность» без зависимости от кадров и платформы.
@@ -1084,12 +1125,18 @@ fn resolve_combats(
                 for (k, (_, striker)) in att_line.iter().enumerate() {
                     let (target_e, target) = &def_line[k % def_line.len()];
                     let bp = combat_bp(striker, target);
-                    hits.push((*target_e, (target.max_org * bp / 10).max(1), (target.max_strength * bp / 50_000).max(1)));
+                    // Броня меняет урон и по организации, и по прочности
+                    let org_milli = apply_armor_rule(target.max_org * bp / 10, striker, target).max(1);
+                    let strength = apply_armor_rule(target.max_strength * bp / 50_000, striker, target).max(1);
+                    hits.push((*target_e, org_milli, strength));
                 }
                 for (k, (_, striker)) in def_line.iter().enumerate() {
                     let (target_e, target) = &att_line[k % att_line.len()];
                     let bp = combat_bp(striker, target);
-                    hits.push((*target_e, (target.max_org * bp / 10).max(1), (target.max_strength * bp / 50_000).max(1)));
+                    // Броня меняет урон и по организации, и по прочности
+                    let org_milli = apply_armor_rule(target.max_org * bp / 10, striker, target).max(1);
+                    let strength = apply_armor_rule(target.max_strength * bp / 50_000, striker, target).max(1);
+                    hits.push((*target_e, org_milli, strength));
                 }
                 for (target, org_milli, strength) in hits {
                     if let Ok((_, mut t)) = divisions.get_mut(target) {
@@ -1503,6 +1550,14 @@ fn division_info_ui(
             ));
             ui.label(format!("Состояние: {status}"));
             ui.label(format!("Боевая ширина дивизии: {}", d.combat_width));
+            ui.label(format!(
+                "Скорость: {}.{} км/ч | Броня: {} | Пробитие: {} | Твердость: {}%",
+                d.max_speed / 10,
+                d.max_speed % 10,
+                d.armor,
+                d.piercing,
+                d.hardness
+            ));
             if let Some(c) = combat {
                 // Ширина фронта и резерв той стороны, за которую воюет дивизия
                 let own_side = if c.attackers.contains(&entity) { &c.attackers } else { &c.defenders };
@@ -1675,6 +1730,34 @@ mod tests {
         println!("бой закончился за {ticks} ч.");
     }
 
+    /// Суммарная организация и прочность дивизий.
+    fn totals(app: &App, list: &[Entity]) -> (u32, u32) {
+        list.iter()
+            .filter_map(|&e| app.world().get::<Division>(e))
+            .fold((0, 0), |(org, st), d| (org + d.org_milli(), st + d.current_strength))
+    }
+
+    #[test]
+    fn armored_defenders_take_less_and_deal_more_in_combat() {
+        let run = |armored: bool| {
+            let (mut app, att, def) = scenario(&[1; 4], 4, 1);
+            if armored {
+                for &e in &def {
+                    let mut d = app.world_mut().get_mut::<Division>(e).unwrap();
+                    (d.armor, d.piercing) = (11, 16); // как у танковой дивизии: пехота (пробитие 4) не пробивает
+                }
+            }
+            for _ in 0..5 {
+                tick(&mut app);
+            }
+            (totals(&app, &att), totals(&app, &def))
+        };
+        let ((att_plain, _), (def_plain, _)) = run(false);
+        let ((att_armored, _), (def_armored, _)) = run(true);
+        assert!(def_armored > def_plain, "бронированные защитники теряют меньше организации");
+        assert!(att_armored < att_plain, "атакующие теряют больше из-за непробиваемой брони");
+    }
+
     #[test]
     fn attack_repelled_when_line_breaks() {
         // Слабые атакующие против сильной обороны: линия атаки выбита, провинция остаётся за защитой
@@ -1692,5 +1775,59 @@ mod tests {
             assert_eq!((d.current_province, d.combat_state), (1, CombatState::None));
             assert!(d.movement.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod armor_and_speed_tests {
+    use super::*;
+
+    fn division(template: &str) -> Division {
+        let templates = DivisionTemplates::default();
+        Division::from_template(1, "d".into(), "GER".into(), 1, template.to_string(), templates.get_or_base(template))
+    }
+
+    #[test]
+    fn armor_halves_damage_and_amplifies_return_fire() {
+        let infantry = division(BASE_TEMPLATE); // броня 0, пробитие 4
+        let panzer = division("Panzer-Division"); // броня 11, пробитие 16
+        // пехота не пробивает броню (11 > 4): её удар по танкам вдвое слабее
+        assert_eq!(apply_armor_rule(1000, &infantry, &panzer), 500);
+        // танки отвечают на 50% сильнее (11 > 4)
+        assert_eq!(apply_armor_rule(1000, &panzer, &infantry), 1500);
+        // пехота против пехоты и танки против танков (11 < 16) — без изменений
+        assert_eq!(apply_armor_rule(1000, &infantry, &infantry), 1000);
+        assert_eq!(apply_armor_rule(1000, &panzer, &panzer), 1000);
+    }
+
+    #[test]
+    fn armor_rule_applies_when_both_sides_resist() {
+        // Сильная броня у обеих сторон и слабое пробитие: урон и режется, и усиливается (1000 / 2 * 1.5 = 750)
+        let mut a = division(BASE_TEMPLATE);
+        let mut b = division(BASE_TEMPLATE);
+        (a.armor, a.piercing) = (50, 10);
+        (b.armor, b.piercing) = (50, 10);
+        assert_eq!(apply_armor_rule(1000, &a, &b), 750);
+    }
+
+    #[test]
+    fn march_time_scales_with_speed() {
+        // Равнина 24 ч у пехоты (4.0 км/ч); танки 8.0 — вдвое быстрее, моторизация 12.0 — втрое
+        assert_eq!(march_hours(Some("plains"), 40), 24);
+        assert_eq!(march_hours(Some("plains"), 80), 12);
+        assert_eq!(march_hours(Some("plains"), 120), 8);
+        // Горы 60 ч -> 30 ч у танков; лес 36 ч -> 12 ч у мотопехоты
+        assert_eq!(march_hours(Some("mountain"), 80), 30);
+        assert_eq!(march_hours(Some("forest"), 120), 12);
+        // Округление вверх (42 * 40 / 120 = 14), нулевая скорость не ломает деление
+        assert_eq!(march_hours(Some("marsh"), 120), 14);
+        assert!(march_hours(Some("plains"), 0) >= 24);
+    }
+
+    #[test]
+    fn division_speed_comes_from_template() {
+        assert_eq!(division(BASE_TEMPLATE).max_speed, 40);
+        assert_eq!(division("Infanterie-Division (mot.)").max_speed, 120);
+        assert_eq!(division("Panzer-Division").max_speed, 80);
     }
 }
