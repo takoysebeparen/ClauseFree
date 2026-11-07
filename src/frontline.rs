@@ -4,12 +4,14 @@
 //! `OrderMove` (маршрут строит A* в `division.rs`). Порядок везде детерминирован: провинции —
 //! по возрастанию id (`BTreeMap`), дивизии — по возрастанию id.
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashSet};
 
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::clock::{ClockSet, DailyTickEvent};
+use crate::command::Commander;
 use crate::division::{
     ActiveCombat, Division, OrderMove, MAX_PLANNING, PLANNING_DECAY_PER_DAY, PLANNING_GAIN_PER_DAY,
 };
@@ -32,6 +34,8 @@ pub struct Frontline {
     pub provinces: Vec<u32>,
     /// Дивизии, назначенные на участки; i-я дивизия стоит на `provinces[i % provinces.len()]`.
     pub assigned_divisions: Vec<Entity>,
+    /// Командующий фронтом (сущность с `Commander`). Дивизии сверх его лимита воюют вдвое хуже.
+    pub commander: Option<Entity>,
 }
 
 /// Команда: общее наступление по фронту.
@@ -115,15 +119,17 @@ impl Plugin for FrontlinePlugin {
 /// Новое значение планирования за сутки (целые числа):
 /// - дивизия не назначена на фронт (снята или фронт удалён) — сброс в 0;
 /// - в бою или на марше (в том числе при наличии маршрута) — расход `PLANNING_DECAY_PER_DAY`;
-/// - стоит на пограничной провинции рубежа — прирост `PLANNING_GAIN_PER_DAY` до `MAX_PLANNING`;
+/// - стоит на пограничной провинции рубежа — прирост `PLANNING_GAIN_PER_DAY` до `MAX_PLANNING`
+///   (вдвое меньше, если дивизия сверх лимита командира);
 /// - назначена, но ещё в тылу — без изменений.
-fn next_planning(current: u32, assigned: bool, busy: bool, on_border: bool) -> u32 {
+fn next_planning(current: u32, assigned: bool, busy: bool, on_border: bool, over_limit: bool) -> u32 {
     if !assigned {
         0
     } else if busy {
         current.saturating_sub(PLANNING_DECAY_PER_DAY)
     } else if on_border {
-        (current + PLANNING_GAIN_PER_DAY).min(MAX_PLANNING)
+        let gain = if over_limit { PLANNING_GAIN_PER_DAY * 50 / 100 } else { PLANNING_GAIN_PER_DAY };
+        (current + gain).min(MAX_PLANNING)
     } else {
         current
     }
@@ -141,7 +147,7 @@ fn daily_planning(
             let front = frontlines.iter().find(|f| f.owner == d.owner && f.assigned_divisions.contains(&entity));
             let busy = d.movement.is_some() || !d.path.is_empty() || combats.iter().any(|c| c.involves(entity));
             let on_border = front.is_some_and(|f| f.provinces.binary_search(&d.current_province).is_ok());
-            let next = next_planning(d.planning, front.is_some(), busy, on_border);
+            let next = next_planning(d.planning, front.is_some(), busy, on_border, d.over_command_limit);
             if next != d.planning {
                 d.planning = next;
             }
@@ -292,6 +298,8 @@ fn execute_frontline_attacks(
 /// Строит `Frontline` для пары стран и отправляет свободные дивизии `owner` на рубеж.
 /// Возвращает фронт и число дивизий, отправленных на марш, либо причину отказа.
 /// Общая логика для команды игрока (`CreateFrontline`) и для ИИ.
+/// Фронту автоматически назначается лучший свободный командир страны.
+#[allow(clippy::too_many_arguments)]
 pub fn build_frontline(
     owner: &str,
     enemy: &str,
@@ -299,6 +307,8 @@ pub fn build_frontline(
     adjacency: &ProvinceAdjacency,
     divisions: &Query<(Entity, &Division)>,
     combats: &Query<&ActiveCombat>,
+    commanders: &Query<(Entity, &Commander)>,
+    frontlines: &Query<(Entity, &Frontline)>,
     orders: &mut EventWriter<OrderMove>,
 ) -> Result<(Frontline, usize), &'static str> {
     let provinces = get_border_provinces(owner, enemy, controllers, adjacency);
@@ -327,9 +337,30 @@ pub fn build_frontline(
         enemy: enemy.to_string(),
         provinces,
         assigned_divisions: Vec::new(),
+        commander: choose_commander(owner, enemy, commanders, frontlines),
     };
     let sent = assign_divisions_to_frontline(&mut frontline, &free, orders);
     Ok((frontline, sent))
+}
+
+/// Лучший свободный командир страны: по сумме навыков, при равенстве — с меньшим `id`.
+/// Заняты командиры других фронтов; командир фронта той же пары (который будет заменён) доступен.
+pub fn choose_commander(
+    owner: &str,
+    enemy: &str,
+    commanders: &Query<(Entity, &Commander)>,
+    frontlines: &Query<(Entity, &Frontline)>,
+) -> Option<Entity> {
+    let taken: HashSet<Entity> = frontlines
+        .iter()
+        .filter(|(_, f)| !(f.owner == owner && f.enemy == enemy))
+        .filter_map(|(_, f)| f.commander)
+        .collect();
+    commanders
+        .iter()
+        .filter(|(e, c)| c.owner == owner && !taken.contains(e))
+        .max_by_key(|(_, c)| (c.attack_skill + c.defense_skill, Reverse(c.id)))
+        .map(|(e, _)| e)
 }
 
 /// Обработка команды `CreateFrontline`: граница, создание `Frontline`, назначение дивизий.
@@ -342,9 +373,10 @@ fn create_frontlines(
     adjacency: Res<ProvinceAdjacency>,
     divisions: Query<(Entity, &Division)>,
     combats: Query<&ActiveCombat>,
+    commanders: Query<(Entity, &Commander)>,
     mut orders: EventWriter<OrderMove>,
 ) {
-    let mut replaced: std::collections::HashSet<Entity> = std::collections::HashSet::new();
+    let mut replaced: HashSet<Entity> = HashSet::new();
     for event in events.read() {
         let (frontline, sent) = match build_frontline(
             &event.owner,
@@ -353,6 +385,8 @@ fn create_frontlines(
             &adjacency,
             &divisions,
             &combats,
+            &commanders,
+            &existing,
             &mut orders,
         ) {
             Ok(built) => built,
@@ -398,6 +432,7 @@ fn frontline_panel(
     frontlines: Query<(Entity, &Frontline)>,
     divisions: Query<(Entity, &Division)>,
     combats: Query<&ActiveCombat>,
+    commanders: Query<&Commander>,
     mut commands_out: EventWriter<CreateFrontline>,
     mut attack_out: EventWriter<ExecuteFrontlineAttack>,
 ) {
@@ -444,6 +479,22 @@ fn frontline_panel(
                     f.provinces.len(),
                     f.assigned_divisions.len()
                 ));
+                match f.commander.and_then(|e| commanders.get(e).ok()) {
+                    Some(c) => {
+                        ui.label(format!(
+                            "Командующий: {} (Ранг: {}, Атк: {}, Защ: {}) | Состав: {}/{} див.",
+                            c.name,
+                            c.rank.title(),
+                            c.attack_skill,
+                            c.defense_skill,
+                            f.assigned_divisions.len(),
+                            c.rank.division_capacity()
+                        ));
+                    }
+                    None => {
+                        ui.label("Командующий: не назначен");
+                    }
+                }
                 // Средний план наступления армии фронта (проценты от максимума — целочисленно)
                 ui.label(format!(
                     "Готовность наступления: {avg}/{MAX_PLANNING} ({}%)",
@@ -458,21 +509,25 @@ mod tests {
     use super::*;
     use crate::division::MovementProgress;
     use crate::units::{DivisionTemplates, BASE_TEMPLATE};
+    use std::collections::BTreeMap;
 
     #[test]
     fn next_planning_rules() {
         // на рубеже: +2 до потолка 30
-        assert_eq!(next_planning(0, true, false, true), 2);
-        assert_eq!(next_planning(29, true, false, true), 30);
-        assert_eq!(next_planning(30, true, false, true), 30);
+        assert_eq!(next_planning(0, true, false, true, false), 2);
+        assert_eq!(next_planning(29, true, false, true, false), 30);
+        assert_eq!(next_planning(30, true, false, true, false), 30);
         // в бою / на марше: -3, не ниже нуля (даже на рубеже)
-        assert_eq!(next_planning(30, true, true, true), 27);
-        assert_eq!(next_planning(2, true, true, false), 0);
+        assert_eq!(next_planning(30, true, true, true, false), 27);
+        assert_eq!(next_planning(2, true, true, false, false), 0);
         // назначена, но в тылу: без изменений
-        assert_eq!(next_planning(10, true, false, false), 10);
+        assert_eq!(next_planning(10, true, false, false, false), 10);
+        // сверх лимита командира: прирост вдвое меньше (+1), расход прежний
+        assert_eq!(next_planning(0, true, false, true, true), 1);
+        assert_eq!(next_planning(30, true, true, true, true), 27);
         // снята с фронта: сброс
-        assert_eq!(next_planning(30, false, false, true), 0);
-        assert_eq!(next_planning(12, false, true, false), 0);
+        assert_eq!(next_planning(30, false, false, true, false), 0);
+        assert_eq!(next_planning(12, false, true, false, false), 0);
     }
 
     fn spawn_division(app: &mut App, id: u32, province: u32) -> Entity {
@@ -488,6 +543,87 @@ mod tests {
         app.world_mut().spawn(d).id()
     }
 
+    fn spawn_owned(app: &mut App, id: u32, owner: &str, province: u32) -> Entity {
+        let templates = DivisionTemplates::default();
+        let d = Division::from_template(
+            id,
+            format!("Div {id}"),
+            owner.to_string(),
+            province,
+            BASE_TEMPLATE.to_string(),
+            templates.get_or_base(BASE_TEMPLATE),
+        );
+        app.world_mut().spawn(d).id()
+    }
+
+    fn spawn_commander(app: &mut App, id: u32, owner: &str, name: &str, attack: u32, defense: u32) {
+        app.world_mut().spawn(Commander {
+            id,
+            name: name.to_string(),
+            owner: owner.to_string(),
+            rank: crate::command::CommanderRank::General,
+            attack_skill: attack,
+            defense_skill: defense,
+            assigned_divisions: Vec::new(),
+        });
+    }
+
+    fn create(app: &mut App, owner: &str, enemy: &str) {
+        app.world_mut().send_event(CreateFrontline { owner: owner.into(), enemy: enemy.into() });
+        app.update(); // обработка команды и применение spawn
+    }
+
+    /// Имя командира фронта пары (owner, enemy).
+    fn front_commander(app: &mut App, owner: &str, enemy: &str) -> Option<String> {
+        let world = app.world_mut();
+        let commander = world
+            .query::<&Frontline>()
+            .iter(world)
+            .find(|f| f.owner == owner && f.enemy == enemy)
+            .and_then(|f| f.commander)?;
+        world.get::<Commander>(commander).map(|c| c.name.clone())
+    }
+
+    #[test]
+    fn frontline_gets_best_free_general_of_its_nation() {
+        let mut app = App::new();
+        // 1 (GER) граничит с 2 (FRA) и 3 (ITA); у каждой стороны есть дивизия
+        let neighbors = BTreeMap::from([
+            (1, std::collections::BTreeSet::from([2, 3])),
+            (2, std::collections::BTreeSet::from([1])),
+            (3, std::collections::BTreeSet::from([1])),
+        ]);
+        let controllers = ProvinceControllers(BTreeMap::from([
+            (1, "GER".to_string()),
+            (2, "FRA".to_string()),
+            (3, "ITA".to_string()),
+        ]));
+        app.add_event::<CreateFrontline>()
+            .add_event::<OrderMove>()
+            .insert_resource(ProvinceAdjacency { neighbors })
+            .insert_resource(controllers)
+            .add_systems(Update, create_frontlines);
+
+        spawn_commander(&mut app, 0, "GER", "Роммель", 4, 2);
+        spawn_commander(&mut app, 1, "GER", "Гудериан", 4, 1);
+        spawn_commander(&mut app, 2, "FRA", "Гамелен", 1, 3);
+        spawn_commander(&mut app, 3, "FRA", "де Голль", 3, 2);
+        spawn_owned(&mut app, 1, "GER", 1);
+        spawn_owned(&mut app, 2, "FRA", 2);
+
+        // лучший по сумме навыков: Роммель (6) против Гудериана (5)
+        create(&mut app, "GER", "FRA");
+        assert_eq!(front_commander(&mut app, "GER", "FRA").as_deref(), Some("Роммель"));
+        // Роммель занят — на второй фронт Германии идёт Гудериан
+        create(&mut app, "GER", "ITA");
+        assert_eq!(front_commander(&mut app, "GER", "ITA").as_deref(), Some("Гудериан"));
+        // Франция: де Голль (5) лучше Гамелена (4)
+        create(&mut app, "FRA", "GER");
+        assert_eq!(front_commander(&mut app, "FRA", "GER").as_deref(), Some("де Голль"));
+        // Пересоздание фронта той же пары снова берёт своего командира (а не оставляет без командира)
+        create(&mut app, "GER", "FRA");
+        assert_eq!(front_commander(&mut app, "GER", "FRA").as_deref(), Some("Роммель"));
+    }
     fn day(app: &mut App) {
         app.world_mut().send_event(DailyTickEvent { day: 1, month: 1, year: 1936 });
         app.update();
@@ -514,6 +650,7 @@ mod tests {
                 enemy: "FRA".into(),
                 provinces: vec![5, 6],
                 assigned_divisions: vec![on_border, in_rear],
+                commander: None,
             })
             .id();
 

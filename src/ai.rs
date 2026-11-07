@@ -5,8 +5,9 @@
 
 use bevy::prelude::*;
 
+use crate::command::Commander;
 use crate::division::{ActiveCombat, Division, OrderMove};
-use crate::frontline::build_frontline;
+use crate::frontline::{build_frontline, Frontline};
 use crate::map::{ProvinceAdjacency, ProvinceControllers};
 
 const AI_OWNER: &str = "FRA";
@@ -20,7 +21,9 @@ impl Plugin for AiPlugin {
     }
 }
 
-/// Граница FRA против GER -> `Frontline` -> свободные дивизии Франции по круговому алгоритму на рубеж.
+/// Граница FRA против GER -> `Frontline` с лучшим свободным французским командиром ->
+/// свободные дивизии Франции по круговому алгоритму на рубеж.
+#[allow(clippy::too_many_arguments)]
 fn ai_deploy_defense(
     mut done: Local<bool>,
     mut commands: Commands,
@@ -28,15 +31,27 @@ fn ai_deploy_defense(
     adjacency: Res<ProvinceAdjacency>,
     divisions: Query<(Entity, &Division)>,
     combats: Query<&ActiveCombat>,
+    commanders: Query<(Entity, &Commander)>,
+    frontlines: Query<(Entity, &Frontline)>,
     mut orders: EventWriter<OrderMove>,
 ) {
-    // Ждём, пока стартовые данные появятся в мире
-    if *done || adjacency.neighbors.is_empty() || divisions.is_empty() {
+    // Ждём, пока стартовые данные появятся в мире (командиры тоже создаются в Startup)
+    if *done || adjacency.neighbors.is_empty() || divisions.is_empty() || commanders.is_empty() {
         return;
     }
     *done = true;
 
-    match build_frontline(AI_OWNER, AI_ENEMY, &controllers, &adjacency, &divisions, &combats, &mut orders) {
+    match build_frontline(
+        AI_OWNER,
+        AI_ENEMY,
+        &controllers,
+        &adjacency,
+        &divisions,
+        &combats,
+        &commanders,
+        &frontlines,
+        &mut orders,
+    ) {
         Ok((frontline, sent)) => {
             println!(
                 "[ИИ {AI_OWNER}] Развернут оборонительный рубеж против {AI_ENEMY}: {sent} дивизий вышли на границу"

@@ -1,6 +1,7 @@
 mod ai;
 mod camera;
 mod clock;
+mod command;
 mod division;
 mod economy;
 mod frontline;
@@ -19,6 +20,7 @@ use bevy_egui::EguiPlugin;
 use ai::AiPlugin;
 use camera::CameraPlugin;
 use clock::ClockPlugin;
+use command::CommandPlugin;
 use division::DivisionPlugin;
 use economy::EconomyPlugin;
 use frontline::FrontlinePlugin;
@@ -50,6 +52,6 @@ fn main() {
                 }),
         )
         .add_plugins(EguiPlugin)
-        .add_plugins((CameraPlugin, MapPlugin { root: PathBuf::from(HOI4_PATH) }, ClockPlugin, DivisionPlugin, EconomyPlugin, FrontlinePlugin, AiPlugin, SurrenderPlugin))
+        .add_plugins((CameraPlugin, MapPlugin { root: PathBuf::from(HOI4_PATH) }, ClockPlugin, DivisionPlugin, EconomyPlugin, FrontlinePlugin, AiPlugin, SurrenderPlugin, CommandPlugin))
         .run();
 }

@@ -14,6 +14,7 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::camera::MainCamera;
 use crate::clock::{ClockSet, DailyTickEvent, HourTick};
+use crate::command::SKILL_BONUS_PCT;
 use crate::oob::OobDivisions;
 use crate::units::{DivisionTemplate, DivisionTemplates, BASE_TEMPLATE, INFANTRY_SPEED_KPH};
 use crate::map::{
@@ -106,6 +107,12 @@ pub struct Division {
     pub hardness: u32,
     /// Планирование 0..=`MAX_PLANNING` (%): копится на рубеже фронта, тратится на марше и в бою.
     pub planning: u32,
+    /// Навыки командира фронта, на который назначена дивизия (+2% за уровень), иначе 0.
+    /// Заполняются `command::update_command_effects`.
+    pub command_attack_skill: u32,
+    pub command_defense_skill: u32,
+    /// Дивизия сверх лимита командира: -50% к получаемому планированию и к боевым параметрам.
+    pub over_command_limit: bool,
 }
 
 /// Положение дивизии в бою. Резерв не наносит и не получает урон.
@@ -185,6 +192,9 @@ impl Division {
             piercing: stats.piercing,
             hardness: stats.hardness,
             planning: 0,
+            command_attack_skill: 0,
+            command_defense_skill: 0,
+            over_command_limit: false,
         }
     }
 }
@@ -251,6 +261,10 @@ fn daily_entrenchment(
 // Плагин
 // ---------------------------------------------------------------------------
 
+/// Боевая цепочка кадра (ввод, приказы, марши, бой). Системы, чьи данные нужны бою, ставятся `.before(CombatSet)`.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CombatSet;
+
 pub struct DivisionPlugin;
 
 impl Plugin for DivisionPlugin {
@@ -274,7 +288,8 @@ impl Plugin for DivisionPlugin {
                 )
                     .chain()
                     .after(pick_province)
-                    .after(ClockSet),
+                    .after(ClockSet)
+                    .in_set(CombatSet),
             )
             .add_systems(Update, (combat_ui, division_info_ui))
             .add_systems(Update, daily_entrenchment.after(ClockSet));
@@ -885,10 +900,20 @@ fn advance_marches(
 /// `planning` — бонус планирования атакующего в процентах: `attack * (100 + planning) / 100`.
 fn combat_bp(att: &Division, def: &Division, planning: u32) -> u32 {
     let base_attack = att.soft_attack * att.current_strength / att.max_strength.max(1);
-    let attack = base_attack * (100 + planning.min(MAX_PLANNING)) / 100;
+    let mut attack = base_attack * (100 + planning.min(MAX_PLANNING)) / 100;
+    // Навык командира фронта: +2% к атаке за уровень; сверх лимита командира — вдвое слабее
+    attack = attack * (100 + att.command_attack_skill * SKILL_BONUS_PCT) / 100;
+    if att.over_command_limit {
+        attack = attack * 50 / 100;
+    }
+
     let base_defense = def.defense * def.current_strength / def.max_strength.max(1);
     // Окопанность: +2% защиты за пункт (у наступающих она всегда 0 — марш её сбрасывает)
-    let defense = base_defense * (100 + def.entrenchment.min(MAX_ENTRENCHMENT) * 2) / 100;
+    let mut defense = base_defense * (100 + def.entrenchment.min(MAX_ENTRENCHMENT) * 2) / 100;
+    defense = defense * (100 + def.command_defense_skill * SKILL_BONUS_PCT) / 100;
+    if def.over_command_limit {
+        defense = defense * 50 / 100;
+    }
     (COMBAT_INTENSITY_BP * attack / (attack + defense).max(1)).max(1)
 }
 
@@ -1792,6 +1817,43 @@ mod tests {
         assert_eq!(att_planned, att_plain, "потери атакующих не зависят от их планирования");
     }
 
+    #[test]
+    fn commander_skills_and_limit_penalty_scale_combat_power() {
+        let templates = DivisionTemplates::default();
+        let make = |id| {
+            Division::from_template(id, "d".into(), "GER".into(), 1, BASE_TEMPLATE.to_string(), templates.get_or_base(BASE_TEMPLATE))
+        };
+        let (mut attacker, mut defender) = (make(1), make(2));
+        // база: атака 90, защита 225 -> 800 * 90 / 315 = 228
+        assert_eq!(combat_bp(&attacker, &defender, 0), 228);
+        // навык атаки 4 (+8%): 90 * 108 / 100 = 97 -> 800 * 97 / 322 = 240
+        attacker.command_attack_skill = 4;
+        assert_eq!(combat_bp(&attacker, &defender, 0), 240);
+        // навык защиты 3 (+6%): 225 * 106 / 100 = 238 -> 800 * 97 / 335 = 231
+        defender.command_defense_skill = 3;
+        assert_eq!(combat_bp(&attacker, &defender, 0), 231);
+        // сверх лимита командира: атака вдвое слабее (97 * 50 / 100 = 48 -> 800 * 48 / 286 = 134)
+        attacker.over_command_limit = true;
+        assert_eq!(combat_bp(&attacker, &defender, 0), 134);
+        // и защита вдвое слабее (238 * 50 / 100 = 119 -> 800 * 48 / 167 = 229)
+        defender.over_command_limit = true;
+        assert_eq!(combat_bp(&attacker, &defender, 0), 229);
+    }
+
+    #[test]
+    fn attack_skill_makes_attackers_hit_harder_in_combat() {
+        let run = |skill: u32| {
+            let (mut app, att, def) = scenario(&[1; 4], 4, 1);
+            for &e in &att {
+                app.world_mut().get_mut::<Division>(e).unwrap().command_attack_skill = skill;
+            }
+            for _ in 0..5 {
+                tick(&mut app);
+            }
+            totals(&app, &def).0
+        };
+        assert!(run(4) < run(0), "командир с навыком атаки наносит больше урона");
+    }
     #[test]
     fn planning_scales_effective_attack() {
         let templates = DivisionTemplates::default();
