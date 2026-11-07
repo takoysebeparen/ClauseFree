@@ -15,6 +15,7 @@ use bevy_egui::{egui, EguiContexts};
 use crate::camera::MainCamera;
 use crate::clock::{ClockSet, DailyTickEvent, HourTick};
 use crate::command::SKILL_BONUS_PCT;
+use crate::economy::{update_supply_network, SupplyNetwork};
 use crate::oob::OobDivisions;
 use crate::units::{DivisionTemplate, DivisionTemplates, BASE_TEMPLATE, INFANTRY_SPEED_KPH};
 use crate::map::{
@@ -29,6 +30,12 @@ const COMBAT_INTENSITY_BP: u32 = 800;
 pub const MAX_ENTRENCHMENT: u32 = 10;
 /// Максимум планирования: +30% к атаке наступающей дивизии.
 pub const MAX_PLANNING: u32 = 30;
+/// Небоевые потери отрезанной дивизии: доля текущей прочности в сутки, %.
+const ATTRITION_STRENGTH_PCT: u32 = 2;
+/// Отрезанная от снабжения дивизия сохраняет столько процентов эффективной атаки и защиты (-33%).
+const UNSUPPLIED_STAT_PCT: u32 = 67;
+/// Отдых: снабжённая дивизия вне боя и марша восстанавливает столько % максимальной организации в сутки.
+const ORG_REGEN_PCT_PER_DAY: u32 = 10;
 /// Прирост планирования в сутки для дивизии на рубеже фронта.
 pub const PLANNING_GAIN_PER_DAY: u32 = 2;
 /// Расход планирования в сутки на марше и в бою.
@@ -113,6 +120,10 @@ pub struct Division {
     pub command_defense_skill: u32,
     /// Дивизия сверх лимита командира: -50% к получаемому планированию и к боевым параметрам.
     pub over_command_limit: bool,
+    /// Снабжается ли дивизия хабом своей нации (проверка раз в сутки).
+    pub is_supplied: bool,
+    /// Сколько суток подряд дивизия отрезана от снабжения.
+    pub attrition_days: u32,
 }
 
 /// Положение дивизии в бою. Резерв не наносит и не получает урон.
@@ -195,6 +206,8 @@ impl Division {
             command_attack_skill: 0,
             command_defense_skill: 0,
             over_command_limit: false,
+            is_supplied: true,
+            attrition_days: 0,
         }
     }
 }
@@ -234,6 +247,49 @@ pub struct SelectedDivision(pub Option<Entity>);
 pub struct OrderMove {
     pub division: Entity,
     pub target: u32,
+}
+
+/// Раз в сутки (00:00), строго после пересчёта сети снабжения (`update_supply_network`):
+/// - дивизия в зоне покрытия хаба своей нации снабжена, счётчик истощения обнуляется; стоящая вне боя
+///   снабжённая дивизия отдыхает и восстанавливает организацию;
+/// - отрезанная дивизия: `is_supplied = false`, +1 день истощения, организация не восстанавливается,
+///   теряется `ATTRITION_STRENGTH_PCT`% текущей прочности (не ниже 1 единицы, минимум потери 1).
+///   Эти небоевые потери не входят в счётчик боевых `losses`.
+fn daily_supply(
+    mut events: EventReader<DailyTickEvent>,
+    network: Res<SupplyNetwork>,
+    mut divisions: Query<(Entity, &mut Division)>,
+    combats: Query<&ActiveCombat>,
+) {
+    for _ in events.read() {
+        let in_combat: HashSet<Entity> =
+            combats.iter().flat_map(|c| c.attackers.iter().chain(c.defenders.iter()).copied()).collect();
+        let (mut cut_off, mut total) = (0u32, 0u32);
+        for (entity, mut d) in &mut divisions {
+            total += 1;
+            if network.supplies(d.current_province, &d.owner) {
+                if !d.is_supplied || d.attrition_days != 0 {
+                    d.is_supplied = true;
+                    d.attrition_days = 0;
+                }
+                if d.movement.is_none() && !in_combat.contains(&entity) && d.current_org < d.max_org {
+                    let regen = (d.max_org * ORG_REGEN_PCT_PER_DAY / 100).max(1);
+                    d.current_org = (d.current_org + regen).min(d.max_org);
+                }
+            } else {
+                cut_off += 1;
+                d.is_supplied = false;
+                d.attrition_days += 1;
+                let loss = (d.current_strength * ATTRITION_STRENGTH_PCT / 100)
+                    .max(1)
+                    .min(d.current_strength.saturating_sub(1));
+                d.current_strength -= loss;
+            }
+        }
+        if cut_off > 0 {
+            println!("[СНАБЖЕНИЕ] Отрезано от снабжения дивизий: {cut_off} из {total}");
+        }
+    }
 }
 
 /// Раз в сутки (00:00): стоящая дивизия, не в бою и без приказа на марш, окапывается на 1 пункт.
@@ -292,7 +348,8 @@ impl Plugin for DivisionPlugin {
                     .in_set(CombatSet),
             )
             .add_systems(Update, (combat_ui, division_info_ui))
-            .add_systems(Update, daily_entrenchment.after(ClockSet));
+            .add_systems(Update, daily_entrenchment.after(ClockSet))
+            .add_systems(Update, daily_supply.after(update_supply_network));
     }
 }
 
@@ -335,7 +392,7 @@ fn spawn_division_entity(commands: &mut Commands, division: Division, center: Ve
         });
 }
 
-fn is_water(map: &ProvinceMap, province: u32) -> bool {
+pub(crate) fn is_water(map: &ProvinceMap, province: u32) -> bool {
     matches!(map.terrain_of(province), Some("ocean" | "lakes"))
 }
 
@@ -906,6 +963,9 @@ fn combat_bp(att: &Division, def: &Division, planning: u32) -> u32 {
     if att.over_command_limit {
         attack = attack * 50 / 100;
     }
+    if !att.is_supplied {
+        attack = attack * UNSUPPLIED_STAT_PCT / 100; // отрезан от снабжения: -33%
+    }
 
     let base_defense = def.defense * def.current_strength / def.max_strength.max(1);
     // Окопанность: +2% защиты за пункт (у наступающих она всегда 0 — марш её сбрасывает)
@@ -913,6 +973,9 @@ fn combat_bp(att: &Division, def: &Division, planning: u32) -> u32 {
     defense = defense * (100 + def.command_defense_skill * SKILL_BONUS_PCT) / 100;
     if def.over_command_limit {
         defense = defense * 50 / 100;
+    }
+    if !def.is_supplied {
+        defense = defense * UNSUPPLIED_STAT_PCT / 100; // отрезан от снабжения: -33%
     }
     (COMBAT_INTENSITY_BP * attack / (attack + defense).max(1)).max(1)
 }
@@ -1587,6 +1650,17 @@ fn division_info_ui(
             ));
             ui.label(format!("Состояние: {status}"));
             ui.label(format!("Боевая ширина дивизии: {}", d.combat_width));
+            if d.is_supplied {
+                ui.label("Снабжение: В норме");
+            } else {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Снабжение: Отрезано (Истощение {} дн., -33% к статам)",
+                        d.attrition_days
+                    ))
+                    .color(egui::Color32::from_rgb(230, 120, 80)),
+                );
+            }
             ui.label(format!(
                 "План наступления: {}/{MAX_PLANNING} (+{}% к атаке)",
                 d.planning, d.planning
@@ -1855,6 +1929,37 @@ mod tests {
         assert!(run(4) < run(0), "командир с навыком атаки наносит больше урона");
     }
     #[test]
+    fn unsupplied_division_loses_a_third_of_attack_and_defense() {
+        let templates = DivisionTemplates::default();
+        let make = |id| {
+            Division::from_template(id, "d".into(), "GER".into(), 1, BASE_TEMPLATE.to_string(), templates.get_or_base(BASE_TEMPLATE))
+        };
+        let (mut attacker, mut defender) = (make(1), make(2));
+        assert_eq!(combat_bp(&attacker, &defender, 0), 228);
+        // отрезанный атакующий: атака 90 * 67 / 100 = 60 -> 800 * 60 / 285 = 168
+        attacker.is_supplied = false;
+        assert_eq!(combat_bp(&attacker, &defender, 0), 168);
+        // отрезанный защитник: защита 225 * 67 / 100 = 150 -> 800 * 90 / 240 = 300
+        attacker.is_supplied = true;
+        defender.is_supplied = false;
+        assert_eq!(combat_bp(&attacker, &defender, 0), 300);
+    }
+
+    #[test]
+    fn cut_off_attackers_deal_less_damage_in_combat() {
+        let run = |supplied: bool| {
+            let (mut app, att, def) = scenario(&[1; 4], 4, 1);
+            for &e in &att {
+                app.world_mut().get_mut::<Division>(e).unwrap().is_supplied = supplied;
+            }
+            for _ in 0..5 {
+                tick(&mut app);
+            }
+            totals(&app, &def).0
+        };
+        assert!(run(false) > run(true), "защитники теряют меньше организации, когда атакующие отрезаны");
+    }
+    #[test]
     fn planning_scales_effective_attack() {
         let templates = DivisionTemplates::default();
         let make = |id| {
@@ -1945,5 +2050,106 @@ mod armor_and_speed_tests {
         assert_eq!(division(BASE_TEMPLATE).max_speed, 40);
         assert_eq!(division("Infanterie-Division (mot.)").max_speed, 120);
         assert_eq!(division("Panzer-Division").max_speed, 80);
+    }
+}
+
+#[cfg(test)]
+mod supply_tests {
+    use super::*;
+
+    fn spawn_division(app: &mut App, id: u32, owner: &str, province: u32) -> Entity {
+        let templates = DivisionTemplates::default();
+        let d = Division::from_template(
+            id,
+            format!("Div {id}"),
+            owner.to_string(),
+            province,
+            BASE_TEMPLATE.to_string(),
+            templates.get_or_base(BASE_TEMPLATE),
+        );
+        app.world_mut().spawn(d).id()
+    }
+
+    fn day(app: &mut App) {
+        app.world_mut().send_event(DailyTickEvent { day: 1, month: 1, year: 1936 });
+        app.update();
+    }
+
+    fn division(app: &App, e: Entity) -> &Division {
+        app.world().get::<Division>(e).expect("дивизия жива")
+    }
+
+    fn network(covered: &[(u32, &str)]) -> SupplyNetwork {
+        SupplyNetwork {
+            hubs: Default::default(),
+            coverage: covered.iter().map(|&(p, o)| (p, o.to_string())).collect(),
+        }
+    }
+
+    #[test]
+    fn new_divisions_start_supplied() {
+        let mut app = App::new();
+        let e = spawn_division(&mut app, 1, "GER", 1);
+        let d = division(&app, e);
+        assert!(d.is_supplied);
+        assert_eq!(d.attrition_days, 0);
+    }
+
+    #[test]
+    fn cut_off_division_suffers_attrition_and_no_org_recovery() {
+        let mut app = App::new();
+        app.add_event::<DailyTickEvent>()
+            .insert_resource(network(&[(1, "GER")]))
+            .add_systems(Update, daily_supply);
+
+        let supplied = spawn_division(&mut app, 1, "GER", 1); // зона германского хаба
+        let cut_off = spawn_division(&mut app, 2, "GER", 9); // вне любой зоны
+        let in_enemy_zone = spawn_division(&mut app, 3, "GER", 2); // зона, но чужого хаба
+        app.world_mut().get_mut::<Division>(supplied).unwrap().current_org = 30;
+        app.world_mut().get_mut::<Division>(cut_off).unwrap().current_org = 30;
+        app.world_mut().resource_mut::<SupplyNetwork>().coverage.insert(2, "FRA".to_string());
+
+        day(&mut app);
+        // снабжённая отдыхает: +10% от 60 = +6 организации
+        let d = division(&app, supplied);
+        assert_eq!((d.is_supplied, d.attrition_days, d.current_org), (true, 0, 36));
+        // отрезанная: 2% от 900 = 18, организация не растёт
+        let d = division(&app, cut_off);
+        assert_eq!((d.is_supplied, d.attrition_days), (false, 1));
+        assert_eq!((d.current_strength, d.current_org), (882, 30));
+        assert_eq!(d.losses, 0, "небоевые потери не засчитываются как боевые");
+        assert!(!division(&app, in_enemy_zone).is_supplied, "чужой хаб свою дивизию не снабжает");
+
+        // второй день: 2% от 882 = 17
+        day(&mut app);
+        let d = division(&app, cut_off);
+        assert_eq!((d.attrition_days, d.current_strength, d.current_org), (2, 865, 30));
+
+        // дивизию подвели под зону хаба: статус и счётчик сбрасываются, организация снова растёт
+        app.world_mut().resource_mut::<SupplyNetwork>().coverage.insert(9, "GER".to_string());
+        day(&mut app);
+        let d = division(&app, cut_off);
+        assert_eq!((d.is_supplied, d.attrition_days, d.current_strength, d.current_org), (true, 0, 865, 36));
+    }
+
+    #[test]
+    fn attrition_never_kills_and_marching_units_do_not_rest() {
+        let mut app = App::new();
+        app.add_event::<DailyTickEvent>().insert_resource(network(&[(1, "GER")])).add_systems(Update, daily_supply);
+
+        let starving = spawn_division(&mut app, 1, "GER", 9);
+        app.world_mut().get_mut::<Division>(starving).unwrap().current_strength = 1;
+        let marching = spawn_division(&mut app, 2, "GER", 1);
+        {
+            let mut d = app.world_mut().get_mut::<Division>(marching).unwrap();
+            d.current_org = 10;
+            d.movement = Some(MovementProgress { from: 1, to: 2, hours_left: 5, total_hours: 24 });
+        }
+        for _ in 0..3 {
+            day(&mut app);
+        }
+        assert_eq!(division(&app, starving).current_strength, 1, "прочность не падает ниже 1");
+        assert_eq!(division(&app, starving).attrition_days, 3);
+        assert_eq!(division(&app, marching).current_org, 10, "на марше организация не восстанавливается");
     }
 }

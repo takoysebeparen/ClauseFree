@@ -69,6 +69,13 @@ impl ProvinceMap {
         self.by_color.get(&[px[0], px[1], px[2]])
     }
 
+    /// Карта для тестов с заданной местностью провинций: (id, terrain); остальные считаются сушей.
+    #[cfg(test)]
+    pub fn with_terrain_for_test(terrain: &[(u32, &str)]) -> Self {
+        let terrain_by_id = terrain.iter().map(|&(id, t)| (id, t.to_string())).collect();
+        Self { image: RgbaImage::new(1, 1), by_color: HashMap::new(), terrain_by_id }
+    }
+
     /// Пустая карта для модульных тестов: вся суша, цветов и местности нет.
     #[cfg(test)]
     pub fn empty_for_test() -> Self {
@@ -374,7 +381,7 @@ fn palette_texel(controller: Option<&str>) -> [u8; 4] {
 }
 
 /// Строит текстуру id провинций (R, G = младший / старший байт id) и граф смежности за один обход.
-fn build_id_texture_and_adjacency(map: &ProvinceMap) -> (Vec<u8>, ProvinceAdjacency) {
+pub(crate) fn build_id_texture_and_adjacency(map: &ProvinceMap) -> (Vec<u8>, ProvinceAdjacency) {
     let w = map.width() as usize;
     let h = map.height() as usize;
     let raw = map.image.as_raw();
@@ -711,7 +718,7 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("не удалось прочитать {:?}: {e}", path))
 }
 
-fn load_province_map(root: &Path) -> Result<ProvinceMap, String> {
+pub(crate) fn load_province_map(root: &Path) -> Result<ProvinceMap, String> {
     // provinces.bmp -> RgbaImage в памяти
     let bmp_bytes = read_bytes(&root.join("map").join("provinces.bmp"))?;
     let image = image::load_from_memory(&bmp_bytes)
