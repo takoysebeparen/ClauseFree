@@ -893,6 +893,7 @@ fn ui_state_panel(
     adjacency: Res<ProvinceAdjacency>,
     controllers: Res<ProvinceControllers>,
     colors: Res<CountryColors>,
+    mut flags: ResMut<crate::flags::FlagTextures>,
 ) {
     let Some(id) = selected.id else { return };
     let Some(ctx) = contexts.try_ctx_mut() else { return };
@@ -917,10 +918,10 @@ fn ui_state_panel(
                     let controller = controllers.0.get(&id).unwrap_or(&s.owner);
                     ui.horizontal(|ui| {
                         ui.label("Контролирует:");
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 3.0, colors.ui_color32(controller));
+                        flags.show(ui, controller, &colors);
                         ui.label(egui::RichText::new(controller).color(colors.ui_color32(controller)).strong());
                         ui.label("(Владелец:");
+                        flags.show(ui, &s.owner, &colors);
                         ui.label(egui::RichText::new(&s.owner).color(colors.ui_color32(&s.owner)).strong());
                         ui.label(")");
                     });

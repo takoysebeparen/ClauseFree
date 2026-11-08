@@ -1606,6 +1606,8 @@ fn trade_panel(
     mut contexts: EguiContexts,
     economies: Res<Economies>,
     player: Res<PlayerCountry>,
+    colors: Res<CountryColors>,
+    mut flags: ResMut<crate::flags::FlagTextures>,
     mut form: Local<TradeForm>,
     mut creates: EventWriter<CreateTradeOrder>,
     mut cancels: EventWriter<CancelTradeOrder>,
@@ -1624,6 +1626,7 @@ fn trade_panel(
             }
             for (index, order) in eco.trade_orders.iter().enumerate() {
                 ui.horizontal(|ui| {
+                    flags.show(ui, &order.seller, &colors);
                     ui.label(trade_order_text(order));
                     if ui.button("Отмена").clicked() {
                         cancels.send(CancelTradeOrder { country: player.0.clone(), order_index: index });
@@ -1642,6 +1645,11 @@ fn trade_panel(
             ui.horizontal(|ui| {
                 ui.label("Продавец:");
                 ui.add(egui::TextEdit::singleline(&mut form.seller).desired_width(48.0));
+                // флаг страны-экспортёра — только для существующей страны
+                let typed = form.seller.trim().to_uppercase();
+                if economies.0.contains_key(&typed) {
+                    flags.show(ui, &typed, &colors);
+                }
             });
             let free = eco.own_available_civilian_factories();
             let seller = form.seller.trim().to_uppercase();
@@ -1678,6 +1686,7 @@ fn economy_bar(
     player: Res<PlayerCountry>,
     experience: Res<ArmyExperience>,
     colors: Res<CountryColors>,
+    mut flags: ResMut<crate::flags::FlagTextures>,
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else { return };
     // Рамка и тег нации — в её настоящем цвете
@@ -1694,6 +1703,7 @@ fn economy_bar(
         .show(ctx, |ui| match economies.0.get(&player.0) {
             Some(eco) => {
                 ui.horizontal(|ui| {
+                    flags.show(ui, &player.0, &colors);
                     ui.label(egui::RichText::new(format!("[{}]", player.0)).color(country_color).strong());
                     ui.label(format!(
                         "🏭 {} | 🔨 Военные заводы: {} | {} | {} | {}",
@@ -1707,6 +1717,7 @@ fn economy_bar(
             }
             None => {
                 ui.horizontal(|ui| {
+                    flags.show(ui, &player.0, &colors);
                     ui.label(egui::RichText::new(format!("[{}]", player.0)).color(country_color).strong());
                     ui.label(format!("нет данных об экономике | {}", army_xp_text(experience.get(&player.0))));
                 });

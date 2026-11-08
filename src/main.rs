@@ -6,6 +6,7 @@ mod colors;
 mod command;
 mod division;
 mod economy;
+mod flags;
 mod frontline;
 mod map;
 mod oob;
@@ -26,6 +27,7 @@ use clock::ClockPlugin;
 use command::CommandPlugin;
 use division::DivisionPlugin;
 use economy::EconomyPlugin;
+use flags::FlagPlugin;
 use frontline::FrontlinePlugin;
 use surrender::SurrenderPlugin;
 use map::MapPlugin;
@@ -55,6 +57,7 @@ fn main() {
                 }),
         )
         .add_plugins(EguiPlugin)
+        .add_plugins(FlagPlugin { root: PathBuf::from(HOI4_PATH) })
         .add_plugins((CameraPlugin, MapPlugin { root: PathBuf::from(HOI4_PATH) }, ClockPlugin, DivisionPlugin, EconomyPlugin, FrontlinePlugin, AiPlugin, SurrenderPlugin, CommandPlugin, AirPlugin))
         .run();
 }

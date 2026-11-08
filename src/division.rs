@@ -1924,6 +1924,7 @@ fn division_info_ui(
     map: Res<ProvinceMap>,
     templates: Res<DivisionTemplates>,
     colors: Res<CountryColors>,
+    mut flags: ResMut<crate::flags::FlagTextures>,
     mut refit_out: EventWriter<RefitDivision>,
 ) {
     let Some(entity) = selected.0 else { return };
@@ -1952,6 +1953,7 @@ fn division_info_ui(
         .frame(frame)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
+                flags.show(ui, &d.owner, &colors);
                 ui.label(format!("Дивизия: \"{}\"", d.name));
                 ui.label(egui::RichText::new(format!("[{}]", d.owner)).color(owner_color).strong());
             });
