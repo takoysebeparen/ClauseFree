@@ -39,7 +39,8 @@ pub struct BattalionDef {
     pub max_strength: u32,
     pub max_org: u32,
     pub soft_attack: u32,
-    /// Жёсткая атака (против техники). Суммируется и показывается в интерфейсе.
+    /// Жёсткая атака (против техники, твёрдость цели высокая). У пехоты минимальна (0), у танков и артиллерии выше.
+    /// Вместе с soft_attack даёт силу удара по формуле (soft * (100 - T) + hard * T) / 100, T — твёрдость цели.
     pub hard_attack: u32,
     pub defense: u32,
     /// Винтовок, необходимых батальону в полном составе.
@@ -102,7 +103,7 @@ impl BattalionDef {
             max_strength: 100,
             max_org: 40,
             soft_attack: 12,
-            hard_attack: 6,
+            hard_attack: 10,
             defense: 10,
             required_equipment: 80,
             combat_width: 2,
@@ -124,7 +125,7 @@ impl BattalionDef {
             max_strength: 100,
             max_org: 40,
             soft_attack: 20,
-            hard_attack: 12,
+            hard_attack: 24,
             defense: 15,
             required_equipment: 100,
             combat_width: 2,
@@ -197,7 +198,7 @@ pub struct DivisionStats {
     pub max_strength: u32,
     pub max_org: u32,
     pub soft_attack: u32,
-    /// Жёсткая атака: сумма по батальонам и ротам обеспечения.
+    /// Жёсткая атака: сумма по батальонам и ротам обеспечения (мягкая и жёсткая хранятся раздельно).
     pub hard_attack: u32,
     pub defense: u32,
     pub total_required_equipment: u32,

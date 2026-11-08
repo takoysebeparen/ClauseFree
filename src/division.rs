@@ -1060,6 +1060,14 @@ impl HitContext {
     }
 }
 
+/// Базовая атака дивизии по цели с твёрдостью 	arget_hardness (0..=100 %):
+/// (soft * (100 - твёрдость) + hard * твёрдость) / 100 — целочисленно, сумма делится один раз (без потери точности).
+/// Дальше к ней применяются укомплектованность, планирование, командиры, рельеф, реки, небо и разведка.
+pub fn blended_attack(att: &Division, target_hardness: u32) -> u32 {
+    let hardness = target_hardness.min(100);
+    (att.soft_attack * (100 - hardness) + att.hard_attack * hardness) / 100
+}
+
 /// Интенсивность удара без модификаторов рельефа и неба (для тестов формулы).
 #[cfg(test)]
 fn combat_bp(att: &Division, def: &Division, planning: u32) -> u32 {
@@ -1071,7 +1079,8 @@ fn combat_bp(att: &Division, def: &Division, planning: u32) -> u32 {
 /// `planning` — бонус планирования атакующего в процентах: `attack * (100 + planning) / 100`.
 /// `ctx` — рельеф и река: `attack * (100 - штраф) / 100`, `defense * (100 + бонус) / 100`.
 fn combat_bp_ctx(att: &Division, def: &Division, planning: u32, ctx: HitContext) -> u32 {
-    let base_attack = att.soft_attack * att.current_strength / att.max_strength.max(1);
+    // Сила удара зависит от твёрдости цели: мягкая атака против живой силы, жёсткая — против техники.
+    let base_attack = blended_attack(att, def.hardness) * att.current_strength / att.max_strength.max(1);
     let mut attack = base_attack * (100 + planning.min(MAX_PLANNING)) / 100;
     // Навык командира фронта: +2% к атаке за уровень; сверх лимита командира — вдвое слабее
     attack = attack * (100 + att.command_attack_skill * SKILL_BONUS_PCT) / 100;
@@ -1690,6 +1699,11 @@ fn recon_text(recon_sum: u32, active: u32) -> String {
     format!("{}.{}", tenths / 10, tenths % 10)
 }
 
+/// Строка атаки в панели дивизии: `Атака: 90 мягк. / 0 твёрд. | Твёрдость: 0%`.
+fn attack_label(d: &Division) -> String {
+    format!("Атака: {} мягк. / {} твёрд. | Твёрдость: {}%", d.soft_attack, d.hard_attack, d.hardness)
+}
+
 /// Строка разведки и неба в окне боя: `Разведка: 3.0 vs 1.0 | Небо: Германия +40`.
 fn recon_air_label(att: &SideStats, def: &SideStats, air_value: i32) -> String {
     format!(
@@ -1841,7 +1855,8 @@ fn division_info_ui(
                 "Укомплектованность: {}/{} (Потери: {})",
                 d.current_strength, d.max_strength, d.losses
             ));
-            ui.label(format!("Атака: {} (жёсткая: {}) | Защита: {}", d.soft_attack, d.hard_attack, d.defense));
+            ui.label(attack_label(d));
+            ui.label(format!("Защита: {}", d.defense));
             ui.label(format!(
                 "Окопанность: {}/{} (+{}% защиты)",
                 d.entrenchment,
@@ -1880,12 +1895,11 @@ fn division_info_ui(
                 d.planning, d.planning
             ));
             ui.label(format!(
-                "Скорость: {}.{} км/ч | Броня: {} | Пробитие: {} | Твердость: {}%",
+                "Скорость: {}.{} км/ч | Броня: {} | Пробитие: {}",
                 d.max_speed / 10,
                 d.max_speed % 10,
                 d.armor,
-                d.piercing,
-                d.hardness
+                d.piercing
             ));
             if let Some(c) = combat {
                 // Ширина фронта и резерв той стороны, за которую воюет дивизия
@@ -2258,6 +2272,32 @@ mod tests {
         assert!(att_french_sky < att_neutral, "под вражеским небом атакующие теряют больше");
         assert!(def_french_sky >= def_neutral, "защитникам не хуже");
     }
+    #[test]
+    fn hardness_of_defenders_changes_how_hard_attackers_hit_in_combat() {
+        // org защитников после 5 часов боя: атакующие с заданными soft/hard против защитников с твёрдостью
+        let run = |soft: u32, hard: u32, defender_hardness: u32| {
+            let (mut app, att, def) = scenario(&[1; 4], 4, 1);
+            for &e in &att {
+                let mut d = app.world_mut().get_mut::<Division>(e).unwrap();
+                (d.soft_attack, d.hard_attack) = (soft, hard);
+            }
+            for &e in &def {
+                app.world_mut().get_mut::<Division>(e).unwrap().hardness = defender_hardness;
+            }
+            for _ in 0..5 {
+                tick(&mut app);
+            }
+            totals(&app, &def).0
+        };
+        let soft_vs_soft = run(90, 0, 0);
+        let soft_vs_armor = run(90, 0, 100);
+        let hard_vs_armor = run(0, 90, 100);
+        let hard_vs_soft = run(0, 90, 0);
+        assert!(soft_vs_armor > soft_vs_soft, "мягкая атака почти не вредит полностью бронированной цели");
+        assert!(hard_vs_armor < soft_vs_armor, "жёсткая атака по технике сильнее мягкой");
+        assert!(hard_vs_soft > soft_vs_soft, "жёсткая атака по живой силе слабее мягкой");
+    }
+
     #[test]
     fn planning_scales_effective_attack() {
         let templates = DivisionTemplates::default();
@@ -2713,5 +2753,120 @@ mod support_tests {
         };
         assert_eq!(line(&division(BASE_TEMPLATE)), "Поддержка: [Сапёры, Арт]");
         assert_eq!(line(&division(PLAIN_INFANTRY_TEMPLATE)), "Поддержка: нет");
+    }
+}
+
+#[cfg(test)]
+mod hardness_tests {
+    use super::*;
+    use crate::units::BattalionDef;
+
+    fn division_of(template: &DivisionTemplate) -> Division {
+        Division::from_template(1, "d".into(), "GER".into(), 1, template.name.clone(), template)
+    }
+
+    fn registered(name: &str) -> Division {
+        let templates = DivisionTemplates::default();
+        Division::from_template(1, "d".into(), "GER".into(), 1, name.to_string(), templates.get_or_base(name))
+    }
+
+    fn custom(name: &str, battalions: Vec<BattalionDef>) -> Division {
+        division_of(&DivisionTemplate { name: name.to_string(), battalions })
+    }
+
+    #[test]
+    fn stats_keep_soft_and_hard_attack_apart() {
+        // пехота: мягкая атака преобладает, жёсткой нет
+        let infantry = registered(PLAIN_INFANTRY_TEMPLATE);
+        assert_eq!((infantry.soft_attack, infantry.hard_attack), (90, 0));
+        // танки: жёсткая атака заметно выше, чем у пехоты (4 лёгких танка по 10 + моторизованные 0)
+        let panzer = registered("Panzer-Division");
+        assert_eq!((panzer.soft_attack, panzer.hard_attack), (68, 40));
+        // артиллерия поддержки: 25 мягкой и 2 жёсткой
+        assert_eq!(registered(BASE_TEMPLATE).hard_attack, 2);
+        // подпись в панели
+        assert_eq!(attack_label(&infantry), "Атака: 90 мягк. / 0 твёрд. | Твёрдость: 0%");
+        assert_eq!(attack_label(&panzer), "Атака: 68 мягк. / 40 твёрд. | Твёрдость: 55%");
+    }
+
+    #[test]
+    fn infantry_against_infantry_uses_full_soft_attack() {
+        let (attacker, target) = (registered(PLAIN_INFANTRY_TEMPLATE), registered(PLAIN_INFANTRY_TEMPLATE));
+        assert_eq!(target.hardness, 0);
+        assert_eq!(blended_attack(&attacker, target.hardness), 90, "100% мягкой атаки");
+        // формула удара даёт прежние 800 * 90 / 315 = 228
+        assert_eq!(combat_bp(&attacker, &target, 0), 228);
+    }
+
+    #[test]
+    fn infantry_against_armor_is_cut_by_target_hardness() {
+        let infantry = registered(PLAIN_INFANTRY_TEMPLATE);
+        let panzer = registered("Panzer-Division");
+        // твёрдость танковой дивизии 55%: (90 * 45 + 0 * 55) / 100 = 40
+        assert_eq!(blended_attack(&infantry, panzer.hardness), 40);
+        // полностью бронированная цель (100%): мягкая атака не работает совсем
+        assert_eq!(blended_attack(&infantry, 100), 0);
+
+        // цель той же защиты 225, но твёрдостью 100: остаётся только минимальный урон (1 bp)
+        let mut tank_like = registered(PLAIN_INFANTRY_TEMPLATE);
+        tank_like.hardness = 100;
+        assert_eq!(combat_bp(&infantry, &tank_like, 0), 1);
+        // при твёрдости 55 удар слабее, чем по живой силе: 800 * 40 / 265 = 120 против 228
+        tank_like.hardness = 55;
+        assert_eq!(combat_bp(&infantry, &tank_like, 0), 120);
+    }
+
+    #[test]
+    fn tanks_and_heavy_artillery_hit_armor_with_hard_attack() {
+        let infantry = registered(PLAIN_INFANTRY_TEMPLATE);
+        // 6 средних танков: мягкая 120, жёсткая 144
+        let tanks = custom("tanks", vec![BattalionDef::medium_tank(); 6]);
+        assert_eq!((tanks.soft_attack, tanks.hard_attack), (120, 144));
+        // по цели с твёрдостью 90: (120 * 10 + 144 * 90) / 100 = 141, а пехота: (90 * 10 + 0) / 100 = 9
+        assert_eq!(blended_attack(&tanks, 90), 141);
+        assert_eq!(blended_attack(&infantry, 90), 9);
+
+        // та же защита 225, твёрдость 90: 800 * 141 / 366 = 308 против 800 * 9 / 234 = 30
+        let mut armored = registered(PLAIN_INFANTRY_TEMPLATE);
+        armored.hardness = 90;
+        assert_eq!(combat_bp(&tanks, &armored, 0), 308);
+        assert_eq!(combat_bp(&infantry, &armored, 0), 30);
+
+        // тяжёлая артиллерия (тестовая рота с жёсткой атакой 40): по бронетехнике сильнее обычной (2)
+        let heavy = BattalionDef { hard_attack: 40, ..BattalionDef::support_artillery() };
+        let mut battalions = vec![BattalionDef::infantry(); 9];
+        battalions.push(heavy);
+        let heavy_division = custom("heavy-arty", battalions);
+        // (115 * 10 + 40 * 90) / 100 = 47 против обычной артиллерии (115 * 10 + 2 * 90) / 100 = 13
+        assert_eq!(blended_attack(&heavy_division, 90), 47);
+        assert_eq!(blended_attack(&registered(BASE_TEMPLATE), 90), 13);
+        // по живой силе (твёрдость 0) обе одинаково используют мягкую атаку 115
+        assert_eq!(blended_attack(&heavy_division, 0), 115);
+    }
+
+    #[test]
+    fn blend_divides_once_and_clamps_hardness() {
+        let mut d = registered(PLAIN_INFANTRY_TEMPLATE);
+        // мягкая 1 и жёсткая 1 при твёрдости 50: (1 * 50 + 1 * 50) / 100 = 1; раздельное деление дало бы 0 + 0
+        (d.soft_attack, d.hard_attack) = (1, 1);
+        assert_eq!(blended_attack(&d, 50), 1);
+        // твёрдость больше 100 не уводит мягкую долю в минус и равна 100
+        (d.soft_attack, d.hard_attack) = (90, 30);
+        assert_eq!(blended_attack(&d, 250), blended_attack(&d, 100));
+        assert_eq!(blended_attack(&d, 100), 30);
+        // нулевая атака и нулевая прочность не вызывают деления на ноль
+        (d.soft_attack, d.hard_attack, d.max_strength) = (0, 0, 0);
+        assert_eq!(combat_bp(&d, &registered(PLAIN_INFANTRY_TEMPLATE), 0), 1);
+    }
+
+    #[test]
+    fn blended_attack_feeds_the_existing_multipliers() {
+        // база берётся из смеси, дальше работают прежние множители: планирование +30% на атаке 40 даёт 52
+        let infantry = registered(PLAIN_INFANTRY_TEMPLATE);
+        let mut armored = registered(PLAIN_INFANTRY_TEMPLATE);
+        armored.hardness = 55;
+        // атака 40: 800 * 40 / 265 = 120; с планированием 30%: 40 * 130 / 100 = 52 -> 800 * 52 / 277 = 150
+        assert_eq!(combat_bp(&infantry, &armored, 0), 120);
+        assert_eq!(combat_bp(&infantry, &armored, 30), 150);
     }
 }
