@@ -53,6 +53,63 @@ const START_LINE_SHARES: [(EquipmentType, u32); 5] = [
     (EquipmentType::MediumTank, 0),
 ];
 
+/// Потолок штрафа к выпуску из-за нехватки сырья, %: линия не падает ниже 10% потенциала.
+pub const MAX_RESOURCE_PENALTY: u32 = 90;
+/// Объём каждого ресурса у стран без заданного пула (фактически неограниченно, штрафов нет).
+pub const ABUNDANT_RESOURCE: u32 = 1_000_000;
+
+// ---------------------------------------------------------------------------
+// Стратегические ресурсы
+// ---------------------------------------------------------------------------
+
+/// Стратегическое сырьё. Пул страны — суточный приток: он не накапливается и не расходуется,
+/// а сравнивается с суточной потребностью заводов.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ResourceType {
+    Steel,
+    Tungsten,
+    Aluminium,
+    Rubber,
+    Oil,
+}
+
+impl ResourceType {
+    /// Все ресурсы в фиксированном порядке (детерминированный обход).
+    pub const ALL: [ResourceType; 5] =
+        [ResourceType::Steel, ResourceType::Tungsten, ResourceType::Aluminium, ResourceType::Rubber, ResourceType::Oil];
+
+    /// Родительный падеж для строки дефицита: «Дефицит Стали».
+    fn genitive(self) -> &'static str {
+        match self {
+            ResourceType::Steel => "Стали",
+            ResourceType::Tungsten => "Вольфрама",
+            ResourceType::Aluminium => "Алюминия",
+            ResourceType::Rubber => "Резины",
+            ResourceType::Oil => "Нефти",
+        }
+    }
+}
+
+/// Стартовый пул GER для тестирования.
+pub fn ger_start_resources() -> BTreeMap<ResourceType, u32> {
+    BTreeMap::from([
+        (ResourceType::Steel, 60),
+        (ResourceType::Aluminium, 20),
+        (ResourceType::Tungsten, 15),
+        (ResourceType::Rubber, 5),
+        (ResourceType::Oil, 10),
+    ])
+}
+
+/// Процент дефицита ресурса: 0 при `available >= required`, иначе `(required - available) * 100 / required`
+/// (целочисленно, округление вниз).
+pub fn deficit_percent(available: u32, required: u32) -> u32 {
+    if required == 0 || available >= required {
+        return 0;
+    }
+    (u64::from(required - available) * 100 / u64::from(required)) as u32
+}
+
 // ---------------------------------------------------------------------------
 // Типы снаряжения
 // ---------------------------------------------------------------------------
@@ -99,6 +156,18 @@ impl EquipmentType {
         }
     }
 
+    /// Расход сырья одним работающим заводом в сутки.
+    pub fn resource_cost(self) -> &'static [(ResourceType, u32)] {
+        use ResourceType::{Aluminium, Oil, Steel, Tungsten};
+        match self {
+            EquipmentType::InfantryEquipment => &[(Steel, 1)],
+            EquipmentType::SupportEquipment => &[(Steel, 1), (Aluminium, 1)],
+            EquipmentType::Artillery => &[(Steel, 2), (Tungsten, 1)],
+            EquipmentType::LightTank => &[(Steel, 2), (Tungsten, 1), (Oil, 1)],
+            EquipmentType::MediumTank => &[(Steel, 3), (Tungsten, 2), (Oil, 1)],
+        }
+    }
+
     /// Стартовый запас каждой страны.
     fn start_stock(self) -> u32 {
         match self {
@@ -138,6 +207,17 @@ impl ProductionLine {
             return 0;
         }
         (working_factories * self.equipment.output_per_factory() * self.efficiency / 100).max(1)
+    }
+
+    /// Выпуск с учётом дефицита сырья: `output * (100 - penalty) / 100`, минимум 1 при назначенных заводах.
+    /// Штраф ограничен `MAX_RESOURCE_PENALTY`.
+    pub fn output_with_penalty(&self, working_factories: u32, penalty: u32) -> u32 {
+        let base = self.output(working_factories);
+        if base == 0 {
+            return 0;
+        }
+        let penalty = penalty.min(MAX_RESOURCE_PENALTY);
+        (base * (100 - penalty) / 100).max(1)
     }
 
     /// Суточный прирост эффективности: +1% до потолка.
@@ -251,6 +331,8 @@ pub struct CountryEconomy {
     pub reinforce_cost: BTreeMap<EquipmentType, u32>,
     /// Очередь стройки военных заводов.
     pub construction: ConstructionQueue,
+    /// Пул стратегического сырья (суточный приток; нет записи — ноль).
+    pub resources: BTreeMap<ResourceType, u32>,
 }
 
 impl CountryEconomy {
@@ -263,9 +345,68 @@ impl CountryEconomy {
             daily_output: BTreeMap::new(),
             reinforce_cost: BTreeMap::new(),
             construction: ConstructionQueue::default(),
+            resources: ResourceType::ALL.iter().map(|&r| (r, ABUNDANT_RESOURCE)).collect(),
         };
         eco.recalc_daily_output();
         eco
+    }
+
+    pub fn resource(&self, resource: ResourceType) -> u32 {
+        self.resources.get(&resource).copied().unwrap_or(0)
+    }
+
+    /// Заменяет пул сырья и пересчитывает выпуск.
+    pub fn set_resources(&mut self, resources: BTreeMap<ResourceType, u32>) {
+        self.resources = resources;
+        self.recalc_daily_output();
+    }
+
+    /// Суточная потребность в сырье: сумма `работающие заводы * норма` по всем линиям.
+    pub fn resource_demand(&self) -> BTreeMap<ResourceType, u32> {
+        let mut demand = BTreeMap::new();
+        for (equipment, working) in self.effective_factories() {
+            for &(resource, per_factory) in equipment.resource_cost() {
+                *demand.entry(resource).or_insert(0u32) += working * per_factory;
+            }
+        }
+        demand
+    }
+
+    /// Сырьё, не занятое заводами: пул минус потребность (не ниже нуля).
+    pub fn resource_free(&self, resource: ResourceType) -> u32 {
+        let required = self.resource_demand().get(&resource).copied().unwrap_or(0);
+        self.resource(resource).saturating_sub(required)
+    }
+
+    /// Дефицит каждого востребованного ресурса, % (только ресурсы с потребностью > 0).
+    pub fn resource_deficits(&self) -> BTreeMap<ResourceType, u32> {
+        self.resource_demand()
+            .into_iter()
+            .map(|(resource, required)| (resource, deficit_percent(self.resource(resource), required)))
+            .collect()
+    }
+
+    /// Самый острый дефицит среди ресурсов типа снаряжения: (ресурс, %). При равенстве — первый по порядку `ResourceType`.
+    fn worst_shortage(&self, equipment: EquipmentType, deficits: &BTreeMap<ResourceType, u32>) -> Option<(ResourceType, u32)> {
+        let mut worst: Option<(ResourceType, u32)> = None;
+        for &(resource, _) in equipment.resource_cost() {
+            let percent = deficits.get(&resource).copied().unwrap_or(0);
+            if percent > worst.map_or(0, |(_, p)| p) {
+                worst = Some((resource, percent));
+            }
+        }
+        worst.map(|(resource, percent)| (resource, percent.min(MAX_RESOURCE_PENALTY)))
+    }
+
+    /// Штраф линии к выпуску, %: максимальный дефицит её ресурсов, не выше `MAX_RESOURCE_PENALTY`.
+    #[cfg(test)]
+    pub fn resource_penalty(&self, equipment: EquipmentType) -> u32 {
+        self.worst_shortage(equipment, &self.resource_deficits()).map_or(0, |(_, p)| p)
+    }
+
+    /// Ресурс с наибольшим дефицитом для линии типа `equipment` и штраф от него (`None`, если сырья хватает).
+    pub fn resource_shortage(&self, equipment: EquipmentType) -> Option<(ResourceType, u32)> {
+        self.worst_shortage(equipment, &self.resource_deficits())
     }
 
     /// Фабрики, занятые товарами народного потребления: 20% гражданских, минимум 1 (если фабрики вообще есть).
@@ -332,9 +473,11 @@ impl CountryEconomy {
 
     /// Суточный выход линий: `заводы * выход завода * эффективность / 100` (минимум 1 при назначенных заводах).
     pub(crate) fn recalc_daily_output(&mut self) {
+        let deficits = self.resource_deficits();
         let mut output = BTreeMap::new();
         for (line, (equipment, working)) in self.production_lines.iter().zip(self.effective_factories()) {
-            *output.entry(equipment).or_insert(0u32) += line.output(working);
+            let penalty = self.worst_shortage(equipment, &deficits).map_or(0, |(_, p)| p);
+            *output.entry(equipment).or_insert(0u32) += line.output_with_penalty(working, penalty);
         }
         self.daily_output = output;
     }
@@ -642,7 +785,11 @@ fn init_economies(registry: Res<StateRegistry>, mut economies: ResMut<Economies>
     for (tag, (civ, mil)) in registry.factories_by_owner() {
         total_civ += u64::from(civ);
         total_mil += u64::from(mil);
-        economies.0.insert(tag, CountryEconomy::new(civ, mil));
+        let mut eco = CountryEconomy::new(civ, mil);
+        if tag == DEFAULT_PLAYER_COUNTRY {
+            eco.set_resources(ger_start_resources());
+        }
+        economies.0.insert(tag, eco);
     }
     println!(
         "[ЭКОНОМИКА] Стран: {}, гражданских фабрик: {total_civ}, военных заводов: {total_mil}",
@@ -1055,6 +1202,27 @@ pub fn efficiency_text(line: &ProductionLine) -> String {
     format!("Эфф: {}% (макс {}%)", line.efficiency, line.max_efficiency)
 }
 
+/// Плашка сырья: `[Ресурсы: ⚙️ 45/60 | 🪨 12 | ✈️ 20 | 🌿 5 | 🛢️ 8]` (сталь: свободно/всего, остальное: свободно).
+pub fn resources_text(eco: &CountryEconomy) -> String {
+    format!(
+        "[Ресурсы: ⚙️ {}/{} | 🪨 {} | ✈️ {} | 🌿 {} | 🛢️ {}]",
+        eco.resource_free(ResourceType::Steel),
+        eco.resource(ResourceType::Steel),
+        eco.resource_free(ResourceType::Tungsten),
+        eco.resource_free(ResourceType::Aluminium),
+        eco.resource_free(ResourceType::Rubber),
+        eco.resource_free(ResourceType::Oil)
+    )
+}
+
+/// Статус сырья линии: `Сырьё: 100%` или `Дефицит Стали: -45% к выпуску`.
+pub fn resource_status_text(eco: &CountryEconomy, equipment: EquipmentType) -> String {
+    match eco.resource_shortage(equipment) {
+        Some((resource, percent)) => format!("Дефицит {}: -{percent}% к выпуску", resource.genitive()),
+        None => "Сырьё: 100%".to_string(),
+    }
+}
+
 /// Верхняя плашка: фабрики и склад страны игрока.
 fn economy_bar(
     mut contexts: EguiContexts,
@@ -1080,9 +1248,10 @@ fn economy_bar(
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(format!("[{}]", player.0)).color(country_color).strong());
                     ui.label(format!(
-                        "🏭 {} | 🔨 Военные заводы: {} | {} | {}",
+                        "🏭 {} | 🔨 Военные заводы: {} | {} | {} | {}",
                         civilian_text(eco),
                         eco.military_factories,
+                        resources_text(eco),
                         stockpile_text(eco),
                         army_xp_text(experience.get(&player.0))
                     ));
@@ -1130,6 +1299,7 @@ fn production_panel(
                     // эффективность линии, если она существует; смена типа сбрасывает её до 10%
                     if let Some(line) = eco.production_lines.iter().find(|l| l.equipment == equipment) {
                         ui.label(efficiency_text(line));
+                        ui.label(resource_status_text(eco, equipment));
                         ui.menu_button("тип", |ui| {
                             for target in EquipmentType::ALL {
                                 let taken = eco.production_lines.iter().any(|l| l.equipment == target && l.assigned_factories > 0);
@@ -2427,5 +2597,159 @@ mod conversion_tests {
         assert_eq!(projects.len(), 2);
         assert_eq!((projects[0].building_type, projects[0].state_id, projects[0].cost), (BuildingType::CivToMilConversion, 1, 4000));
         assert_eq!((projects[1].building_type, projects[1].state_id, projects[1].cost), (BuildingType::MilToCivConversion, 1, 4000));
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    use EquipmentType::*;
+    use ResourceType::*;
+
+    /// 100 заводов: линии 50 / 10 / 15 / 25 / 0 (пехота, оснащение, орудия, лёгкие танки, средние).
+    fn ger() -> CountryEconomy {
+        let mut eco = CountryEconomy::new(0, 100);
+        eco.set_resources(ger_start_resources());
+        eco
+    }
+
+    #[test]
+    fn start_pool_of_germany_matches_the_spec() {
+        let pool = ger_start_resources();
+        assert_eq!(
+            pool.into_iter().collect::<Vec<_>>(),
+            vec![(Steel, 60), (Tungsten, 15), (Aluminium, 20), (Rubber, 5), (Oil, 10)]
+        );
+    }
+
+    #[test]
+    fn cost_table_is_per_factory_per_day() {
+        assert_eq!(InfantryEquipment.resource_cost(), &[(Steel, 1)]);
+        assert_eq!(SupportEquipment.resource_cost(), &[(Steel, 1), (Aluminium, 1)]);
+        assert_eq!(Artillery.resource_cost(), &[(Steel, 2), (Tungsten, 1)]);
+        assert_eq!(LightTank.resource_cost(), &[(Steel, 2), (Tungsten, 1), (Oil, 1)]);
+        assert_eq!(MediumTank.resource_cost(), &[(Steel, 3), (Tungsten, 2), (Oil, 1)]);
+    }
+
+    #[test]
+    fn demand_sums_assigned_factories_times_cost() {
+        let eco = ger();
+        let demand = eco.resource_demand();
+        assert_eq!(demand.get(&Steel), Some(&140), "50*1 + 10*1 + 15*2 + 25*2");
+        assert_eq!(demand.get(&Tungsten), Some(&40), "15*1 + 25*1");
+        assert_eq!(demand.get(&Aluminium), Some(&10));
+        assert_eq!(demand.get(&Oil), Some(&25));
+        assert_eq!(demand.get(&Rubber), None, "резина не нужна ни одной линии");
+    }
+
+    #[test]
+    fn deficit_percent_is_integer_and_zero_when_covered() {
+        assert_eq!(deficit_percent(60, 140), 57, "80 * 100 / 140 = 57.1 -> 57");
+        assert_eq!(deficit_percent(15, 40), 62, "62.5 -> 62");
+        assert_eq!(deficit_percent(45, 100), 55);
+        assert_eq!(deficit_percent(0, 10), 100);
+        assert_eq!(deficit_percent(10, 10), 0, "ровно хватает");
+        assert_eq!(deficit_percent(11, 10), 0, "избыток");
+        assert_eq!(deficit_percent(5, 0), 0, "нет потребности");
+    }
+
+    #[test]
+    fn line_penalty_is_the_worst_deficit_among_its_resources() {
+        let eco = ger();
+        assert_eq!(eco.resource_penalty(InfantryEquipment), 57, "только сталь");
+        assert_eq!(eco.resource_penalty(SupportEquipment), 57, "сталь 57 против алюминия 0");
+        assert_eq!(eco.resource_penalty(Artillery), 62, "вольфрам 62 хуже стали 57");
+        assert_eq!(eco.resource_penalty(LightTank), 62, "вольфрам 62, нефть 60, сталь 57");
+        assert_eq!(eco.resource_shortage(LightTank), Some((Tungsten, 62)));
+        assert_eq!(eco.resource_penalty(MediumTank), 62, "линия пуста, но потребность типа считается по общему дефициту");
+    }
+
+    #[test]
+    fn no_deficit_when_the_pool_covers_demand() {
+        let mut eco = ger();
+        eco.set_resources(BTreeMap::from([(Steel, 140), (Tungsten, 40), (Aluminium, 10), (Oil, 25)]));
+        for t in EquipmentType::ALL {
+            assert_eq!(eco.resource_penalty(t), 0);
+            assert_eq!(eco.resource_shortage(t), None);
+        }
+        assert_eq!(eco.output_of(InfantryEquipment), 50, "50 * 5 * 20% без штрафа");
+        // страна без заданного пула не ограничена
+        assert_eq!(CountryEconomy::new(0, 100).resource_penalty(LightTank), 0);
+    }
+
+    #[test]
+    fn penalty_is_capped_at_ninety_percent() {
+        let mut eco = CountryEconomy::new(0, 100);
+        eco.production_lines = vec![ProductionLine::new(InfantryEquipment, 100)];
+        eco.set_resources(BTreeMap::new());
+        assert_eq!(eco.resource_deficits().get(&Steel), Some(&100), "сам дефицит 100%");
+        assert_eq!(eco.resource_penalty(InfantryEquipment), MAX_RESOURCE_PENALTY, "штраф ограничен 90%");
+        // база 100 * 5 * 20% = 100; 10% потенциала остаётся
+        assert_eq!(eco.output_of(InfantryEquipment), 10);
+        assert_eq!(resource_status_text(&eco, InfantryEquipment), "Дефицит Стали: -90% к выпуску");
+        // и сама линия не принимает штраф выше потолка
+        assert_eq!(ProductionLine::new(InfantryEquipment, 100).output_with_penalty(100, 100), 10);
+    }
+
+    #[test]
+    fn output_with_penalty_keeps_the_minimum_of_one() {
+        let line = ProductionLine::new(InfantryEquipment, 1); // база 1
+        assert_eq!(line.output_with_penalty(1, 90), 1);
+        assert_eq!(line.output_with_penalty(0, 90), 0, "без работающих заводов выпуска нет");
+        let artillery = ProductionLine::new(Artillery, 15); // 15 * 20% = 3
+        assert_eq!(artillery.output_with_penalty(15, 62), 1, "3 * 38 / 100 = 1");
+        assert_eq!(artillery.output_with_penalty(15, 0), 3);
+    }
+
+    #[test]
+    fn daily_output_drops_under_shortage() {
+        let eco = ger();
+        assert_eq!(eco.output_of(InfantryEquipment), 21, "база 50, штраф 57% -> 50 * 43 / 100");
+        assert_eq!(eco.output_of(SupportEquipment), 2, "база 6 * 43 / 100");
+        assert_eq!(eco.output_of(Artillery), 1, "база 3 * 38 / 100 = 1");
+        assert_eq!(eco.output_of(LightTank), 1, "база 5 * 38 / 100 = 1");
+    }
+
+    #[test]
+    fn midnight_tick_applies_the_penalty_to_the_stockpile() {
+        let mut eco = ger();
+        for t in EquipmentType::ALL {
+            eco.set_stock(t, 0);
+        }
+        let mut app = App::new();
+        app.add_event::<DailyTickEvent>()
+            .insert_resource(Economies(BTreeMap::from([("GER".to_string(), eco)])))
+            .add_systems(Update, daily_production);
+        app.world_mut().send_event(DailyTickEvent { day: 1, month: 1, year: 1936 });
+        app.update();
+        let eco = &app.world().resource::<Economies>().0["GER"];
+        assert_eq!(eco.stock(InfantryEquipment), 21);
+        assert_eq!(eco.stock(SupportEquipment), 2);
+        assert_eq!(eco.stock(Artillery), 1);
+        // пополнили сталь: штраф винтовок уходит сразу на следующих сутках
+        app.world_mut().resource_mut::<Economies>().0.get_mut("GER").unwrap().set_resources(BTreeMap::from([
+            (Steel, 1000),
+            (Tungsten, 40),
+            (Aluminium, 10),
+            (Oil, 25),
+        ]));
+        app.world_mut().send_event(DailyTickEvent { day: 2, month: 1, year: 1936 });
+        app.update();
+        let eco = &app.world().resource::<Economies>().0["GER"];
+        // эффективность выросла до 21%: 50 * 5 * 21 / 100 = 52 без штрафа
+        assert_eq!(eco.stock(InfantryEquipment), 21 + 52);
+    }
+
+    #[test]
+    fn ui_texts_show_resources_and_status() {
+        let eco = ger();
+        assert_eq!(resources_text(&eco), "[Ресурсы: ⚙️ 0/60 | 🪨 0 | ✈️ 10 | 🌿 5 | 🛢️ 0]");
+        assert_eq!(resource_status_text(&eco, InfantryEquipment), "Дефицит Стали: -57% к выпуску");
+        assert_eq!(resource_status_text(&eco, Artillery), "Дефицит Вольфрама: -62% к выпуску");
+        let rich = CountryEconomy::new(0, 100);
+        assert_eq!(resource_status_text(&rich, InfantryEquipment), "Сырьё: 100%");
+        let mut covered = ger();
+        covered.set_resources(BTreeMap::from([(Steel, 200), (Tungsten, 50), (Aluminium, 10), (Oil, 25), (Rubber, 5)]));
+        assert_eq!(resources_text(&covered), "[Ресурсы: ⚙️ 60/200 | 🪨 10 | ✈️ 0 | 🌿 5 | 🛢️ 0]");
     }
 }
