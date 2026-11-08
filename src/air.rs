@@ -163,6 +163,7 @@ mod tests {
             victory_points: vec![],
             civilian_factories: 0,
             military_factories: 0,
+            resources: Default::default(),
         })
     }
 

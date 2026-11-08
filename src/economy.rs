@@ -61,8 +61,9 @@ const START_LINE_SHARES: [(EquipmentType, u32); 5] = [
 pub const MAX_RESOURCE_PENALTY: u32 = 90;
 /// Сколько единиц ресурса в сутки покупает одна гражданская фабрика, вложенная в импорт.
 pub const RESOURCE_PER_FACTORY: u32 = 8;
-/// Объём каждого ресурса у стран без заданного пула (фактически неограниченно, штрафов нет).
-pub const ABUNDANT_RESOURCE: u32 = 1_000_000;
+/// Природная добыча в тестовых экономиках: домашний пул при законе 50% — 1 000 000 каждого ресурса.
+#[cfg(test)]
+const TEST_NATURAL_RESOURCE: u32 = 2_000_000;
 
 // ---------------------------------------------------------------------------
 // Стратегические ресурсы
@@ -91,6 +92,18 @@ impl ResourceType {
             ResourceType::Aluminium => "Алюминий",
             ResourceType::Rubber => "Резина",
             ResourceType::Oil => "Нефть",
+        }
+    }
+
+    /// Ключ ресурса в файлах стейтов (`steel`, `tungsten`, ...); хром и прочее игнорируются.
+    pub fn from_key(key: &str) -> Option<ResourceType> {
+        match key {
+            "steel" => Some(ResourceType::Steel),
+            "tungsten" => Some(ResourceType::Tungsten),
+            "aluminium" => Some(ResourceType::Aluminium),
+            "rubber" => Some(ResourceType::Rubber),
+            "oil" => Some(ResourceType::Oil),
+            _ => None,
         }
     }
 
@@ -123,7 +136,24 @@ impl TradeOrder {
     }
 }
 
-/// Стартовый пул GER для тестирования.
+/// Торговый закон страны: какая доля добычи уходит на мировой рынок.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExportLaw {
+    /// Исторический стандарт 1936 года: 50% добычи в экспортный пул, 50% остаётся дома.
+    #[default]
+    ExportFocus,
+}
+
+impl ExportLaw {
+    pub fn export_share_pct(self) -> u32 {
+        match self {
+            ExportLaw::ExportFocus => 50,
+        }
+    }
+}
+
+/// Домашний пул GER для тестов (значения прежней заглушки).
+#[cfg(test)]
 pub fn ger_start_resources() -> BTreeMap<ResourceType, u32> {
     BTreeMap::from([
         (ResourceType::Steel, 60),
@@ -364,8 +394,10 @@ pub struct CountryEconomy {
     pub reinforce_cost: BTreeMap<EquipmentType, u32>,
     /// Очередь стройки военных заводов.
     pub construction: ConstructionQueue,
-    /// Пул стратегического сырья (суточный приток; нет записи — ноль).
-    pub resources: BTreeMap<ResourceType, u32>,
+    /// Природная добыча из стейтов страны (суточная; нет записи — ноль).
+    pub natural_resources: BTreeMap<ResourceType, u32>,
+    /// Торговый закон: доля добычи, уходящая в экспортный пул.
+    pub export_law: ExportLaw,
     /// Активные контракты импорта этой страны (она — покупатель).
     pub trade_orders: Vec<TradeOrder>,
     /// Фабрики, временно переданные этой стране покупателями (она — продавец). Пересчитывается
@@ -383,7 +415,8 @@ impl CountryEconomy {
             daily_output: BTreeMap::new(),
             reinforce_cost: BTreeMap::new(),
             construction: ConstructionQueue::default(),
-            resources: ResourceType::ALL.iter().map(|&r| (r, ABUNDANT_RESOURCE)).collect(),
+            natural_resources: BTreeMap::new(),
+            export_law: ExportLaw::default(),
             trade_orders: Vec::new(),
             imported_factories: 0,
         };
@@ -391,14 +424,45 @@ impl CountryEconomy {
         eco
     }
 
-    pub fn resource(&self, resource: ResourceType) -> u32 {
-        self.resources.get(&resource).copied().unwrap_or(0)
+    /// Добыча ресурса в стейтах страны.
+    pub fn natural(&self, resource: ResourceType) -> u32 {
+        self.natural_resources.get(&resource).copied().unwrap_or(0)
     }
 
-    /// Заменяет пул сырья и пересчитывает выпуск.
-    pub fn set_resources(&mut self, resources: BTreeMap<ResourceType, u32>) {
-        self.resources = resources;
+    /// Экспортный пул: `добыча * доля закона / 100`.
+    pub fn exportable_amount(&self, resource: ResourceType) -> u32 {
+        (u64::from(self.natural(resource)) * u64::from(self.export_law.export_share_pct()) / 100) as u32
+    }
+
+    /// Остаётся дома: добыча минус экспортный пул.
+    pub fn domestic_available(&self, resource: ResourceType) -> u32 {
+        self.natural(resource) - self.exportable_amount(resource)
+    }
+
+    /// Собственный базовый пул для производства (без импорта).
+    pub fn resource(&self, resource: ResourceType) -> u32 {
+        self.domestic_available(resource)
+    }
+
+    /// Заменяет добычу (смена владельцев стейтов) и пересчитывает выпуск.
+    pub fn set_natural_resources(&mut self, natural: BTreeMap<ResourceType, u32>) {
+        self.natural_resources = natural;
         self.recalc_daily_output();
+    }
+
+    /// Тест: экономика с практически неограниченной добычей, чтобы штрафы не мешали проверкам других систем.
+    #[cfg(test)]
+    pub(crate) fn new_abundant(civilian_factories: u32, military_factories: u32) -> Self {
+        let mut eco = Self::new(civilian_factories, military_factories);
+        eco.set_natural_resources(ResourceType::ALL.iter().map(|&r| (r, TEST_NATURAL_RESOURCE)).collect());
+        eco
+    }
+
+    /// Тест: задаёт домашний пул так, чтобы `domestic_available` равнялся `pool`.
+    #[cfg(test)]
+    pub(crate) fn set_pool(&mut self, pool: BTreeMap<ResourceType, u32>) {
+        let keep = 100 - self.export_law.export_share_pct();
+        self.set_natural_resources(pool.into_iter().map(|(r, v)| (r, (u64::from(v) * 100).div_ceil(u64::from(keep)) as u32)).collect());
     }
 
     /// Суточная потребность в сырье: сумма `работающие заводы * норма` по всем линиям.
@@ -638,6 +702,119 @@ pub fn recompute_trade_links(economies: &mut BTreeMap<String, CountryEconomy>) {
     }
 }
 
+/// Сколько единиц ресурса у `seller` уже покупают другие страны по активным заказам.
+pub fn exported_from(economies: &BTreeMap<String, CountryEconomy>, seller: &str, resource: ResourceType) -> u32 {
+    economies
+        .iter()
+        .filter(|(buyer, _)| buyer.as_str() != seller)
+        .flat_map(|(_, eco)| eco.trade_orders.iter())
+        .filter(|o| o.seller == seller && o.resource == resource)
+        .map(TradeOrder::amount)
+        .sum()
+}
+
+/// Экспортный лимит продавца: (свободно, всего) единиц ресурса. Неизвестная страна — (0, 0).
+pub fn free_export(economies: &BTreeMap<String, CountryEconomy>, seller: &str, resource: ResourceType) -> (u32, u32) {
+    let total = economies.get(seller).map_or(0, |e| e.exportable_amount(resource));
+    (total.saturating_sub(exported_from(economies, seller, resource)), total)
+}
+
+/// Открывает контракт покупателя с проверкой экспортной квоты продавца:
+/// `уже_экспортируется + factories * 8 <= exportable_amount`. Затем обновляет связи фабрик.
+pub fn open_trade_order(
+    economies: &mut BTreeMap<String, CountryEconomy>,
+    buyer: &str,
+    resource: ResourceType,
+    seller: &str,
+    factories: u32,
+) -> Result<(), &'static str> {
+    if seller == buyer || !economies.contains_key(seller) {
+        return Err("неверный продавец");
+    }
+    if !economies.contains_key(buyer) {
+        return Err("неизвестный покупатель");
+    }
+    let (free, _) = free_export(economies, seller, resource);
+    if u64::from(factories) * u64::from(RESOURCE_PER_FACTORY) > u64::from(free) {
+        return Err("превышен экспортный лимит продавца");
+    }
+    match economies.get_mut(buyer) {
+        Some(eco) => eco.create_trade_order(resource, seller, factories)?,
+        None => return Err("неизвестный покупатель"),
+    }
+    recompute_trade_links(economies);
+    Ok(())
+}
+
+/// Если суммарный экспорт продавца превысил новый лимит (потеря стейтов), заказы пропорционально
+/// уменьшаются: `factories * допустимо / всего` (целые, вниз); нулевые заказы удаляются.
+/// Возвращает `true`, если что-то изменилось.
+pub fn enforce_export_quotas(economies: &mut BTreeMap<String, CountryEconomy>) -> bool {
+    let pairs: BTreeSet<(String, ResourceType)> = economies
+        .values()
+        .flat_map(|e| e.trade_orders.iter().map(|o| (o.seller.clone(), o.resource)))
+        .collect();
+    let mut changed = false;
+    for (seller, resource) in pairs {
+        let limit = economies.get(&seller).map_or(0, |e| e.exportable_amount(resource));
+        let allowed = u64::from(limit / RESOURCE_PER_FACTORY);
+        let total: u64 = economies
+            .iter()
+            .filter(|(buyer, _)| **buyer != seller)
+            .flat_map(|(_, e)| e.trade_orders.iter())
+            .filter(|o| o.seller == seller && o.resource == resource)
+            .map(|o| u64::from(o.factories))
+            .sum();
+        if total <= allowed {
+            continue;
+        }
+        changed = true;
+        for (buyer, eco) in economies.iter_mut() {
+            if *buyer == seller {
+                continue;
+            }
+            for order in eco.trade_orders.iter_mut().filter(|o| o.seller == seller && o.resource == resource) {
+                order.factories = (u64::from(order.factories) * allowed / total) as u32;
+            }
+            eco.trade_orders.retain(|o| o.factories > 0);
+        }
+    }
+    if changed {
+        for eco in economies.values_mut() {
+            eco.recalc_daily_output();
+        }
+        recompute_trade_links(economies);
+    }
+    changed
+}
+
+/// Природные ресурсы по странам с учётом контроля: стейт достаётся стране, контролирующей больше
+/// половины его провинций, иначе — владельцу.
+pub fn natural_by_controller(
+    registry: &StateRegistry,
+    controllers: &ProvinceControllers,
+) -> BTreeMap<String, BTreeMap<ResourceType, u32>> {
+    let mut totals: BTreeMap<String, BTreeMap<ResourceType, u32>> = BTreeMap::new();
+    for state in &registry.states {
+        let mut held: BTreeMap<&str, usize> = BTreeMap::new();
+        for province in &state.provinces {
+            if let Some(controller) = controllers.0.get(province) {
+                *held.entry(controller.as_str()).or_insert(0) += 1;
+            }
+        }
+        let holder = held
+            .iter()
+            .find(|(_, n)| **n * 2 > state.provinces.len())
+            .map_or(state.owner.as_str(), |(&tag, _)| tag);
+        let entry = totals.entry(holder.to_string()).or_default();
+        for (&resource, &amount) in &state.resources {
+            let slot = entry.entry(resource).or_insert(0);
+            *slot = slot.saturating_add(amount);
+        }
+    }
+    totals
+}
+
 /// Приказ игрока: открыть контракт импорта.
 #[derive(Event, Debug, Clone)]
 pub struct CreateTradeOrder {
@@ -857,7 +1034,8 @@ impl Plugin for EconomyPlugin {
             .add_systems(
                 Update,
                 (
-                    daily_production.after(ClockSet),
+                    daily_natural_resources.after(ClockSet),
+                    daily_production.after(ClockSet).after(daily_natural_resources),
                     update_supply_network.after(ClockSet),
                     daily_reinforcement.after(daily_production).after(daily_supply),
                     economy_bar,
@@ -905,20 +1083,24 @@ pub fn update_supply_network(
 fn init_economies(registry: Res<StateRegistry>, mut economies: ResMut<Economies>) {
     let mut total_civ = 0u64;
     let mut total_mil = 0u64;
+    let mut natural = registry.resources_by_owner();
     for (tag, (civ, mil)) in registry.factories_by_owner() {
         total_civ += u64::from(civ);
         total_mil += u64::from(mil);
         let mut eco = CountryEconomy::new(civ, mil);
-        if tag == DEFAULT_PLAYER_COUNTRY {
-            eco.set_resources(ger_start_resources());
-        }
+        eco.set_natural_resources(natural.remove(&tag).unwrap_or_default());
         economies.0.insert(tag, eco);
     }
-    // стартовый контракт GER: 24 стали у Швеции за 3 гражданские фабрики
-    if let Some(ger) = economies.0.get_mut(DEFAULT_PLAYER_COUNTRY) {
-        let _ = ger.create_trade_order(ResourceType::Steel, START_TRADE_SELLER, START_TRADE_FACTORIES);
+    // стартовый контракт GER: 24 стали у Швеции за 3 гражданские фабрики (проходит экспортную квоту SWE)
+    if let Err(reason) = open_trade_order(
+        &mut economies.0,
+        DEFAULT_PLAYER_COUNTRY,
+        ResourceType::Steel,
+        START_TRADE_SELLER,
+        START_TRADE_FACTORIES,
+    ) {
+        println!("[ТОРГОВЛЯ] стартовый контракт GER/SWE не открыт: {reason}");
     }
-    recompute_trade_links(&mut economies.0);
     println!(
         "[ЭКОНОМИКА] Стран: {}, гражданских фабрик: {total_civ}, военных заводов: {total_mil}",
         economies.0.len()
@@ -931,7 +1113,8 @@ fn init_economies(registry: Res<StateRegistry>, mut economies: ResMut<Economies>
 /// каждой линии растёт на 1% до её потолка.
 fn daily_production(mut events: EventReader<DailyTickEvent>, mut economies: ResMut<Economies>) {
     for event in events.read() {
-        // фабрики, переданные продавцам, обновляются до расчёта выпуска и стройки
+        // потерянные ресурсы продавцов урезают заказы; фабрики продавцам обновляются до выпуска и стройки
+        enforce_export_quotas(&mut economies.0);
         recompute_trade_links(&mut economies.0);
         for eco in economies.0.values_mut() {
             eco.recalc_daily_output();
@@ -942,6 +1125,22 @@ fn daily_production(mut events: EventReader<DailyTickEvent>, mut economies: ResM
             eco.grow_efficiency();
         }
         println!("[ЭКОНОМИКА] Сутки {}.{}.{}: производство учтено", event.day, event.month, event.year);
+    }
+}
+
+/// Раз в сутки пересчитывает природную добычу стран по контролю над стейтами (до производства).
+fn daily_natural_resources(
+    mut events: EventReader<DailyTickEvent>,
+    registry: Res<StateRegistry>,
+    controllers: Res<ProvinceControllers>,
+    mut economies: ResMut<Economies>,
+) {
+    if events.read().count() == 0 {
+        return;
+    }
+    let mut totals = natural_by_controller(&registry, &controllers);
+    for (tag, eco) in economies.0.iter_mut() {
+        eco.natural_resources = totals.remove(tag).unwrap_or_default();
     }
 }
 
@@ -1107,12 +1306,7 @@ fn apply_trade_orders(
     mut economies: ResMut<Economies>,
 ) {
     for order in creates.read() {
-        if order.seller == order.country || !economies.0.contains_key(&order.seller) {
-            println!("[ТОРГОВЛЯ] {}: заказ отклонён: неверный продавец {}", order.country, order.seller);
-            continue;
-        }
-        let Some(eco) = economies.0.get_mut(&order.country) else { continue };
-        match eco.create_trade_order(order.resource, &order.seller, order.factories) {
+        match open_trade_order(&mut economies.0, &order.country, order.resource, &order.seller, order.factories) {
             Ok(()) => println!(
                 "[ТОРГОВЛЯ] {}: +{} {} от {} за {} фабр.",
                 order.country,
@@ -1131,6 +1325,7 @@ fn apply_trade_orders(
             Err(reason) => println!("[ТОРГОВЛЯ] {}: отмена отклонена: {reason}", order.country),
         }
     }
+    enforce_export_quotas(&mut economies.0);
     recompute_trade_links(&mut economies.0);
 }
 
@@ -1449,6 +1644,9 @@ fn trade_panel(
                 ui.add(egui::TextEdit::singleline(&mut form.seller).desired_width(48.0));
             });
             let free = eco.own_available_civilian_factories();
+            let seller = form.seller.trim().to_uppercase();
+            let (free_export_units, total_export) = free_export(&economies.0, &seller, form.resource);
+            ui.label(format!("Доступно для импорта: {free_export_units}/{total_export} ед."));
             ui.horizontal(|ui| {
                 if ui.add_enabled(form.factories > 1, egui::Button::new("−")).clicked() {
                     form.factories -= 1;
@@ -1458,7 +1656,10 @@ fn trade_panel(
                     form.factories += 1;
                 }
             });
-            let valid = !form.seller.trim().is_empty() && form.factories >= 1 && form.factories <= free;
+            let valid = !seller.is_empty()
+                && form.factories >= 1
+                && form.factories <= free
+                && form.factories * RESOURCE_PER_FACTORY <= free_export_units;
             if ui.add_enabled(valid, egui::Button::new("Купить")).clicked() {
                 creates.send(CreateTradeOrder {
                     country: player.0.clone(),
@@ -1716,6 +1917,7 @@ mod tests {
                 victory_points: vps,
                 civilian_factories: 0,
                 military_factories: 0,
+                resources: Default::default(),
             })
         };
         let registry = StateRegistry {
@@ -1807,7 +2009,7 @@ mod reinforcement_tests {
 
     fn app_with_stocks(stocks: &[(EquipmentType, u32)]) -> App {
         let mut app = App::new();
-        let mut economy = CountryEconomy::new(10, 10);
+        let mut economy = CountryEconomy::new_abundant(10, 10);
         for t in EquipmentType::ALL {
             economy.set_stock(t, 0);
         }
@@ -1932,7 +2134,7 @@ mod reinforcement_tests {
         // Хаб в провинции 1 снабжает 1 и 2; провинция 9 далеко от любого хаба
         let mut app = App::new();
         let neighbors = BTreeMap::from([(1, BTreeSet::from([2])), (2, BTreeSet::from([1]))]);
-        let mut economy = CountryEconomy::new(10, 10);
+        let mut economy = CountryEconomy::new_abundant(10, 10);
         economy.set_stock(InfantryEquipment, 1000);
         app.add_event::<DailyTickEvent>()
             .insert_resource(Economies(BTreeMap::from([("GER".to_string(), economy)])))
@@ -2023,7 +2225,7 @@ mod equipment_tests {
 
     #[test]
     fn start_stock_and_labels() {
-        let eco = CountryEconomy::new(5, 10);
+        let eco = CountryEconomy::new_abundant(5, 10);
         assert_eq!(eco.stock(InfantryEquipment), 5000);
         assert_eq!((eco.stock(SupportEquipment), eco.stock(Artillery), eco.stock(LightTank), eco.stock(MediumTank)), (500, 300, 600, 0));
         assert_eq!(InfantryEquipment.label(), "Винтовки");
@@ -2038,13 +2240,13 @@ mod equipment_tests {
     #[test]
     fn start_lines_use_all_military_factories_and_never_exceed_them() {
         for mil in [0, 1, 3, 4, 10, 37, 100] {
-            let eco = CountryEconomy::new(0, mil);
+            let eco = CountryEconomy::new_abundant(0, mil);
             let assigned: u32 = eco.production_lines.iter().map(|l| l.assigned_factories).sum();
             assert_eq!(assigned, mil, "{mil} заводов распределены без остатка");
             assert_eq!(eco.free_factories(), 0);
         }
         // 10 заводов: 15% -> 1 пушки, 25% -> 2 лёгких танка, 10% -> 1 оснащения, остаток до 10 — винтовки (6)
-        let eco = CountryEconomy::new(0, 10);
+        let eco = CountryEconomy::new_abundant(0, 10);
         let lines: BTreeMap<_, _> = eco.production_lines.iter().map(|l| (l.equipment, l.assigned_factories)).collect();
         assert_eq!(lines[&InfantryEquipment], 6);
         assert_eq!((lines[&SupportEquipment], lines[&Artillery], lines[&LightTank], lines[&MediumTank]), (1, 1, 2, 0));
@@ -2054,7 +2256,7 @@ mod equipment_tests {
 
     #[test]
     fn assign_factories_respects_the_military_factory_limit() {
-        let mut eco = CountryEconomy::new(0, 10);
+        let mut eco = CountryEconomy::new_abundant(0, 10);
         // заводы все заняты: на средние танки свободных нет
         assert_eq!(eco.assign_factories(MediumTank, 3), 0);
         // освобождаем 4 завода на винтовках — теперь 3 уходят в средние танки, ещё 1 свободен
@@ -2074,7 +2276,7 @@ mod equipment_tests {
 
     #[test]
     fn oversubscribed_lines_are_clamped_when_producing() {
-        let mut eco = CountryEconomy::new(0, 10);
+        let mut eco = CountryEconomy::new_abundant(0, 10);
         eco.production_lines = vec![
             ProductionLine::new(InfantryEquipment, 8),
             ProductionLine::new(LightTank, 8),
@@ -2088,7 +2290,7 @@ mod equipment_tests {
 
     fn production_app() -> App {
         let mut app = App::new();
-        let mut eco = CountryEconomy::new(0, 10);
+        let mut eco = CountryEconomy::new_abundant(0, 10);
         for t in EquipmentType::ALL {
             eco.set_stock(t, 0);
         }
@@ -2146,7 +2348,7 @@ mod equipment_tests {
 
     #[test]
     fn top_panel_shows_rifles_tanks_and_guns() {
-        let mut eco = CountryEconomy::new(0, 10);
+        let mut eco = CountryEconomy::new_abundant(0, 10);
         eco.set_stock(InfantryEquipment, 1234);
         eco.set_stock(LightTank, 40);
         eco.set_stock(MediumTank, 2);
@@ -2228,7 +2430,7 @@ mod construction_tests {
     #[test]
     fn consumer_goods_take_twenty_percent_but_at_least_one() {
         let factories = |total: u32| {
-            let eco = CountryEconomy::new(total, 0);
+            let eco = CountryEconomy::new_abundant(total, 0);
             (eco.consumer_goods_factories(), eco.available_civilian_factories())
         };
         assert_eq!(factories(0), (0, 0), "без фабрик нечем занимать");
@@ -2309,6 +2511,7 @@ mod construction_tests {
             victory_points: vec![],
             civilian_factories: 0,
             military_factories: military,
+            resources: Default::default(),
         })
     }
 
@@ -2329,7 +2532,7 @@ mod construction_tests {
     #[test]
     fn completed_factory_joins_the_state_and_the_nation_and_can_be_assigned() {
         // 10 гражданских: 2 на ТНП, 8 свободных; проекту не хватает 5 очков — нужна одна фабрика
-        let mut economy = CountryEconomy::new(10, 10);
+        let mut economy = CountryEconomy::new_abundant(10, 10);
         economy.construction.projects.push(project(5, 7195));
         let mut app = daily_app(economy, &[(5, 2)]);
         day(&mut app);
@@ -2349,7 +2552,7 @@ mod construction_tests {
 
     #[test]
     fn several_projects_can_finish_on_the_same_day() {
-        let mut economy = CountryEconomy::new(10, 10);
+        let mut economy = CountryEconomy::new_abundant(10, 10);
         economy.construction.projects.extend([project(1, 7195), project(2, 7195), project(1, 0)]);
         let mut app = daily_app(economy, &[(1, 0)]);
         day(&mut app);
@@ -2365,7 +2568,7 @@ mod construction_tests {
     #[test]
     fn construction_is_paid_only_by_non_consumer_factories() {
         // 1 гражданская фабрика целиком уходит на ТНП: стройка стоит
-        let mut economy = CountryEconomy::new(1, 10);
+        let mut economy = CountryEconomy::new_abundant(1, 10);
         economy.construction.projects.push(project(5, 0));
         let mut app = daily_app(economy, &[]);
         day(&mut app);
@@ -2376,7 +2579,7 @@ mod construction_tests {
         let mut app = App::new();
         app.add_event::<QueueConstruction>()
             .init_resource::<StateFactories>()
-            .insert_resource(Economies(BTreeMap::from([("GER".to_string(), CountryEconomy::new(10, 10))])))
+            .insert_resource(Economies(BTreeMap::from([("GER".to_string(), CountryEconomy::new_abundant(10, 10))])))
             .insert_resource(StateRegistry {
                 states: vec![state(7, vec![1, 2, 3], 0), state(8, vec![4, 5], 0)],
                 ..Default::default()
@@ -2448,7 +2651,7 @@ mod construction_tests {
 
     #[test]
     fn panel_texts_match_the_requested_format() {
-        let eco = CountryEconomy::new(100, 10);
+        let eco = CountryEconomy::new_abundant(100, 10);
         assert_eq!(civilian_text(&eco), "Гражд. фабрики: 100 (Свободно: 80, ТНП: 20, Торговля: 0)");
         assert_eq!(
             project_text(&project(5, 30), 6),
@@ -2476,7 +2679,7 @@ mod efficiency_tests {
         let l = ProductionLine::new(Artillery, 3);
         assert_eq!((l.efficiency, l.max_efficiency), (20, 50));
         // стартовые линии страны тоже начинают с 20%
-        let eco = CountryEconomy::new(0, 10);
+        let eco = CountryEconomy::new_abundant(0, 10);
         assert!(eco.production_lines.iter().all(|l| (l.efficiency, l.max_efficiency) == (20, 50)));
     }
 
@@ -2519,7 +2722,7 @@ mod efficiency_tests {
 
     fn production_app() -> App {
         let mut app = App::new();
-        let mut eco = CountryEconomy::new(0, 10);
+        let mut eco = CountryEconomy::new_abundant(0, 10);
         for t in EquipmentType::ALL {
             eco.set_stock(t, 0);
         }
@@ -2568,7 +2771,7 @@ mod efficiency_tests {
 
     #[test]
     fn switching_equipment_resets_efficiency_to_ten_percent() {
-        let mut economy = CountryEconomy::new(0, 10);
+        let mut economy = CountryEconomy::new_abundant(0, 10);
         economy.production_lines.iter_mut().for_each(|l| l.efficiency = 45);
         // винтовки (6 заводов) -> средние танки: у средних танков пустая линия, она заменяется
         assert_eq!(economy.switch_line_equipment(InfantryEquipment, MediumTank), Ok(()));
@@ -2586,7 +2789,7 @@ mod efficiency_tests {
 
     #[test]
     fn switching_is_rejected_for_missing_same_or_busy_target_lines() {
-        let mut economy = CountryEconomy::new(0, 10);
+        let mut economy = CountryEconomy::new_abundant(0, 10);
         assert_eq!(economy.switch_line_equipment(InfantryEquipment, InfantryEquipment), Err("тип не меняется"));
         // пушки уже работают (1 завод)
         assert_eq!(economy.switch_line_equipment(InfantryEquipment, Artillery), Err("линия этого типа уже работает"));
@@ -2643,6 +2846,7 @@ mod conversion_tests {
             victory_points: vec![],
             civilian_factories: 0,
             military_factories: 0,
+            resources: Default::default(),
         })
     }
 
@@ -2689,7 +2893,7 @@ mod conversion_tests {
     fn can_queue_checks_control_and_available_factories() {
         let s = state(1, vec![1, 2, 3]); // два из трёх под GER
         let foreign = state(2, vec![3, 4]);
-        let eco = CountryEconomy::new(10, 10);
+        let eco = CountryEconomy::new_abundant(10, 10);
         let sf = factories(&[(1, 2)], &[(1, 3)]);
         let c = controllers();
         let ok = |kind, st: &StateDef| can_queue(kind, st, &c, &eco, &sf, "GER");
@@ -2713,7 +2917,7 @@ mod conversion_tests {
         let s = state(1, vec![1, 2]);
         let c = controllers();
         let sf = factories(&[(1, 1)], &[(1, 2)]);
-        let mut eco = CountryEconomy::new(10, 10);
+        let mut eco = CountryEconomy::new_abundant(10, 10);
         // в стейте две гражданские фабрики: третья конверсия уже не пройдёт
         for _ in 0..2 {
             assert_eq!(can_queue(BuildingType::CivToMilConversion, &s, &c, &eco, &sf, "GER"), Ok(()));
@@ -2725,7 +2929,7 @@ mod conversion_tests {
         eco.construction.projects.push(ConstructionProject::new(BuildingType::MilToCivConversion, 1));
         assert!(can_queue(BuildingType::MilToCivConversion, &s, &c, &eco, &sf, "GER").is_err());
         // у страны всего две гражданские фабрики: третьей для конверсии нет и в другом стейте
-        let mut small = CountryEconomy::new(2, 10);
+        let mut small = CountryEconomy::new_abundant(2, 10);
         small.construction.projects.extend([
             ConstructionProject::new(BuildingType::CivToMilConversion, 7),
             ConstructionProject::new(BuildingType::CivToMilConversion, 7),
@@ -2758,7 +2962,7 @@ mod conversion_tests {
 
     #[test]
     fn civilian_factory_becomes_a_military_one() {
-        let mut economy = CountryEconomy::new(10, 10);
+        let mut economy = CountryEconomy::new_abundant(10, 10);
         economy.construction.projects.push(almost_done(BuildingType::CivToMilConversion, 5));
         let mut app = daily_app(economy, factories(&[(5, 1)], &[(5, 4)]));
         day(&mut app);
@@ -2774,7 +2978,7 @@ mod conversion_tests {
 
     #[test]
     fn military_factory_becomes_a_civilian_one_and_lines_stay_within_the_limit() {
-        let mut economy = CountryEconomy::new(10, 10);
+        let mut economy = CountryEconomy::new_abundant(10, 10);
         economy.construction.projects.push(almost_done(BuildingType::MilToCivConversion, 5));
         // все 10 заводов заняты линиями: конверсия снимет завод с последней работающей линии (лёгкие танки)
         let before: u32 = economy.production_lines.iter().map(|l| l.assigned_factories).sum();
@@ -2794,7 +2998,7 @@ mod conversion_tests {
 
     #[test]
     fn free_military_factory_is_converted_before_any_line_loses_one() {
-        let mut economy = CountryEconomy::new(10, 10);
+        let mut economy = CountryEconomy::new_abundant(10, 10);
         economy.assign_factories(InfantryEquipment, 3); // 3 заводов освободилось
         assert_eq!(economy.free_factories(), 3);
         economy.construction.projects.push(almost_done(BuildingType::MilToCivConversion, 5));
@@ -2808,7 +3012,7 @@ mod conversion_tests {
 
     #[test]
     fn conversion_without_a_factory_at_completion_is_cancelled_without_effect() {
-        let mut economy = CountryEconomy::new(10, 10);
+        let mut economy = CountryEconomy::new_abundant(10, 10);
         economy.construction.projects.extend([
             almost_done(BuildingType::CivToMilConversion, 5),
             almost_done(BuildingType::MilToCivConversion, 6),
@@ -2827,7 +3031,7 @@ mod conversion_tests {
     fn conversion_orders_go_through_the_queue_system() {
         let mut app = App::new();
         app.add_event::<QueueConstruction>()
-            .insert_resource(Economies(BTreeMap::from([("GER".to_string(), CountryEconomy::new(10, 10))])))
+            .insert_resource(Economies(BTreeMap::from([("GER".to_string(), CountryEconomy::new_abundant(10, 10))])))
             .insert_resource(StateRegistry { states: vec![state(1, vec![1, 2]), state(2, vec![3, 4])], ..Default::default() })
             .insert_resource(controllers())
             .insert_resource(factories(&[(1, 1), (2, 1)], &[(1, 2), (2, 2)]))
@@ -2855,8 +3059,8 @@ mod resource_tests {
 
     /// 100 заводов: линии 50 / 10 / 15 / 25 / 0 (пехота, оснащение, орудия, лёгкие танки, средние).
     fn ger() -> CountryEconomy {
-        let mut eco = CountryEconomy::new(0, 100);
-        eco.set_resources(ger_start_resources());
+        let mut eco = CountryEconomy::new_abundant(0, 100);
+        eco.set_pool(ger_start_resources());
         eco
     }
 
@@ -2914,21 +3118,21 @@ mod resource_tests {
     #[test]
     fn no_deficit_when_the_pool_covers_demand() {
         let mut eco = ger();
-        eco.set_resources(BTreeMap::from([(Steel, 140), (Tungsten, 40), (Aluminium, 10), (Oil, 25)]));
+        eco.set_pool(BTreeMap::from([(Steel, 140), (Tungsten, 40), (Aluminium, 10), (Oil, 25)]));
         for t in EquipmentType::ALL {
             assert_eq!(eco.resource_penalty(t), 0);
             assert_eq!(eco.resource_shortage(t), None);
         }
         assert_eq!(eco.output_of(InfantryEquipment), 50, "50 * 5 * 20% без штрафа");
         // страна без заданного пула не ограничена
-        assert_eq!(CountryEconomy::new(0, 100).resource_penalty(LightTank), 0);
+        assert_eq!(CountryEconomy::new_abundant(0, 100).resource_penalty(LightTank), 0);
     }
 
     #[test]
     fn penalty_is_capped_at_ninety_percent() {
-        let mut eco = CountryEconomy::new(0, 100);
+        let mut eco = CountryEconomy::new_abundant(0, 100);
         eco.production_lines = vec![ProductionLine::new(InfantryEquipment, 100)];
-        eco.set_resources(BTreeMap::new());
+        eco.set_pool(BTreeMap::new());
         assert_eq!(eco.resource_deficits().get(&Steel), Some(&100), "сам дефицит 100%");
         assert_eq!(eco.resource_penalty(InfantryEquipment), MAX_RESOURCE_PENALTY, "штраф ограничен 90%");
         // база 100 * 5 * 20% = 100; 10% потенциала остаётся
@@ -2974,7 +3178,7 @@ mod resource_tests {
         assert_eq!(eco.stock(SupportEquipment), 2);
         assert_eq!(eco.stock(Artillery), 1);
         // пополнили сталь: штраф винтовок уходит сразу на следующих сутках
-        app.world_mut().resource_mut::<Economies>().0.get_mut("GER").unwrap().set_resources(BTreeMap::from([
+        app.world_mut().resource_mut::<Economies>().0.get_mut("GER").unwrap().set_pool(BTreeMap::from([
             (Steel, 1000),
             (Tungsten, 40),
             (Aluminium, 10),
@@ -2993,10 +3197,10 @@ mod resource_tests {
         assert_eq!(resources_text(&eco), "[Ресурсы: ⚙️ 0/60 | 🪨 0 | ✈️ 10 | 🌿 5 | 🛢️ 0]");
         assert_eq!(resource_status_text(&eco, InfantryEquipment), "Дефицит Стали: -57% к выпуску");
         assert_eq!(resource_status_text(&eco, Artillery), "Дефицит Вольфрама: -62% к выпуску");
-        let rich = CountryEconomy::new(0, 100);
+        let rich = CountryEconomy::new_abundant(0, 100);
         assert_eq!(resource_status_text(&rich, InfantryEquipment), "Сырьё: 100%");
         let mut covered = ger();
-        covered.set_resources(BTreeMap::from([(Steel, 200), (Tungsten, 50), (Aluminium, 10), (Oil, 25), (Rubber, 5)]));
+        covered.set_pool(BTreeMap::from([(Steel, 200), (Tungsten, 50), (Aluminium, 10), (Oil, 25), (Rubber, 5)]));
         assert_eq!(resources_text(&covered), "[Ресурсы: ⚙️ 60/200 | 🪨 10 | ✈️ 0 | 🌿 5 | 🛢️ 0]");
     }
 }
@@ -3009,8 +3213,8 @@ mod trade_tests {
 
     /// 100 гражданских (20 ТНП, 80 свободно), 100 военных заводов на стандартных линиях, пул GER.
     fn buyer() -> CountryEconomy {
-        let mut eco = CountryEconomy::new(100, 100);
-        eco.set_resources(ger_start_resources());
+        let mut eco = CountryEconomy::new_abundant(100, 100);
+        eco.set_pool(ger_start_resources());
         eco
     }
 
@@ -3057,7 +3261,7 @@ mod trade_tests {
 
     #[test]
     fn free_factories_never_go_negative() {
-        let mut eco = CountryEconomy::new(10, 10); // 2 ТНП, 8 свободно
+        let mut eco = CountryEconomy::new_abundant(10, 10); // 2 ТНП, 8 свободно
         assert!(eco.create_trade_order(Steel, "SWE", 9).is_err(), "9 > 8 свободных");
         assert!(eco.create_trade_order(Steel, "SWE", 0).is_err());
         eco.create_trade_order(Steel, "SWE", 8).unwrap();
@@ -3072,7 +3276,7 @@ mod trade_tests {
 
     #[test]
     fn construction_queue_gets_only_the_remaining_factories() {
-        let mut eco = CountryEconomy::new(10, 0); // 8 свободно
+        let mut eco = CountryEconomy::new_abundant(10, 0); // 8 свободно
         eco.create_trade_order(Steel, "SWE", 5).unwrap();
         eco.construction.projects.push(ConstructionProject::new(BuildingType::MilitaryFactory, 1));
         assert_eq!(eco.construction.allocation(eco.available_civilian_factories()), vec![3]);
@@ -3107,7 +3311,7 @@ mod trade_tests {
 
     #[test]
     fn seller_receives_the_buyers_factories() {
-        let mut app = trade_app(buyer(), CountryEconomy::new(10, 0));
+        let mut app = trade_app(buyer(), CountryEconomy::new_abundant(10, 0));
         assert_eq!(eco(&app, "SWE").available_civilian_factories(), 8);
         buy(&mut app, Steel, "SWE", 3);
         assert_eq!(eco(&app, "GER").available_civilian_factories(), 77);
@@ -3124,7 +3328,7 @@ mod trade_tests {
 
     #[test]
     fn invalid_orders_are_rejected_without_panic() {
-        let mut app = trade_app(buyer(), CountryEconomy::new(10, 0));
+        let mut app = trade_app(buyer(), CountryEconomy::new_abundant(10, 0));
         buy(&mut app, Steel, "XXX", 3); // нет такой страны
         buy(&mut app, Steel, "GER", 3); // сам себе
         buy(&mut app, Steel, "SWE", 81); // больше свободных (80)
@@ -3145,7 +3349,7 @@ mod trade_tests {
             ger.set_stock(t, 0);
         }
         ger.trade_orders.push(TradeOrder { resource: Steel, seller: "SWE".into(), factories: 10 }); // +80 стали
-        let mut app = trade_app(ger, CountryEconomy::new(10, 0));
+        let mut app = trade_app(ger, CountryEconomy::new_abundant(10, 0));
         assert_eq!(eco(&app, "SWE").imported_factories, 0, "связи обновятся в полночь");
         app.world_mut().send_event(DailyTickEvent { day: 1, month: 1, year: 1936 });
         app.update();
@@ -3157,10 +3361,218 @@ mod trade_tests {
 
     #[test]
     fn ui_text_shows_trade_factories() {
-        let mut eco = CountryEconomy::new(100, 10);
+        let mut eco = CountryEconomy::new_abundant(100, 10);
         eco.create_trade_order(Steel, "SWE", 3).unwrap();
         assert_eq!(civilian_text(&eco), "Гражд. фабрики: 100 (Свободно: 77, ТНП: 20, Торговля: 3)");
-        eco.set_resources(ger_start_resources());
+        eco.set_pool(ger_start_resources());
         assert!(resources_text(&eco).starts_with("[Ресурсы: ⚙️ "));
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use crate::map::StateDef;
+    use ResourceType::*;
+    use std::sync::Arc;
+
+    fn nat(steel: u32) -> BTreeMap<ResourceType, u32> {
+        BTreeMap::from([(Steel, steel)])
+    }
+
+    fn eco_with(natural_steel: u32) -> CountryEconomy {
+        let mut eco = CountryEconomy::new(100, 0);
+        eco.set_natural_resources(nat(natural_steel));
+        eco
+    }
+
+    /// GER и FRA (покупатели) и SWE (продавец) с добычей стали `swe_steel`.
+    fn world(swe_steel: u32) -> BTreeMap<String, CountryEconomy> {
+        BTreeMap::from([
+            ("FRA".to_string(), eco_with(0)),
+            ("GER".to_string(), eco_with(120)),
+            ("SWE".to_string(), eco_with(swe_steel)),
+        ])
+    }
+
+    #[test]
+    fn export_focus_splits_production_fifty_fifty() {
+        assert_eq!(ExportLaw::default(), ExportLaw::ExportFocus);
+        assert_eq!(ExportLaw::ExportFocus.export_share_pct(), 50);
+        let eco = eco_with(101);
+        assert_eq!(eco.exportable_amount(Steel), 50, "101 * 50 / 100 вниз");
+        assert_eq!(eco.domestic_available(Steel), 51, "остаток дома");
+        assert_eq!(eco.exportable_amount(Steel) + eco.domestic_available(Steel), eco.natural(Steel));
+        assert_eq!(eco.exportable_amount(Oil), 0, "нет добычи — нет экспорта");
+        // у новой страны добычи нет вовсе: заглушки 1_000_000 больше нет
+        let fresh = CountryEconomy::new(10, 10);
+        assert!(fresh.natural_resources.is_empty());
+        assert_eq!(fresh.resource(Steel), 0);
+    }
+
+    #[test]
+    fn buyer_pool_is_domestic_plus_imports() {
+        let mut ger = eco_with(120); // дома 60
+        assert_eq!(ger.resource(Steel), 60);
+        ger.create_trade_order(Steel, "SWE", 3).unwrap();
+        assert_eq!(ger.total_resource(Steel), 84, "60 + 24");
+        // потребность: 100 заводов не назначено — проверяем поток через деф. по прежней формуле
+        ger.military_factories = 100;
+        ger.production_lines = vec![ProductionLine::new(EquipmentType::InfantryEquipment, 100)];
+        ger.recalc_daily_output();
+        assert_eq!(ger.resource_penalty(EquipmentType::InfantryEquipment), 16, "(100 - 84) * 100 / 100");
+    }
+
+    #[test]
+    fn sum_of_orders_cannot_exceed_seller_export_pool() {
+        let mut w = world(100); // экспорт 50
+        assert_eq!(free_export(&w, "SWE", Steel), (50, 50));
+        open_trade_order(&mut w, "GER", Steel, "SWE", 4).unwrap(); // 32
+        open_trade_order(&mut w, "FRA", Steel, "SWE", 2).unwrap(); // 16 -> 48
+        assert_eq!(exported_from(&w, "SWE", Steel), 48);
+        assert_eq!(free_export(&w, "SWE", Steel), (2, 50));
+        // 1 фабрика = 8 > 2 свободных
+        assert_eq!(open_trade_order(&mut w, "GER", Steel, "SWE", 1), Err("превышен экспортный лимит продавца"));
+        assert_eq!(w["GER"].trade_orders.len(), 1, "отклонённый заказ не создаётся");
+        assert_eq!(w["GER"].available_civilian_factories(), 100 - 20 - 4, "фабрики не списаны");
+        // отмена освобождает квоту
+        w.get_mut("FRA").unwrap().cancel_trade_order(0).unwrap();
+        assert_eq!(free_export(&w, "SWE", Steel), (18, 50));
+        open_trade_order(&mut w, "GER", Steel, "SWE", 2).unwrap(); // 16 <= 18
+        // другой ресурс не затронут
+        assert_eq!(free_export(&w, "SWE", Oil), (0, 0));
+        assert!(open_trade_order(&mut w, "GER", Oil, "SWE", 1).is_err(), "нефти для экспорта нет");
+    }
+
+    #[test]
+    fn order_exactly_at_the_limit_passes_and_foreign_sellers_fail() {
+        let mut w = world(128); // экспорт 64 = 8 фабрик
+        assert!(open_trade_order(&mut w, "GER", Steel, "SWE", 9).is_err());
+        open_trade_order(&mut w, "GER", Steel, "SWE", 8).unwrap();
+        assert_eq!(free_export(&w, "SWE", Steel), (0, 64));
+        assert!(open_trade_order(&mut w, "GER", Steel, "XXX", 1).is_err(), "нет такой страны");
+        assert!(open_trade_order(&mut w, "GER", Steel, "GER", 1).is_err(), "сам себе");
+        assert!(open_trade_order(&mut w, "NOP", Steel, "SWE", 1).is_err(), "нет покупателя");
+    }
+
+    #[test]
+    fn lost_states_cut_orders_proportionally() {
+        let mut w = world(200); // экспорт 100 -> 12 фабрик
+        open_trade_order(&mut w, "GER", Steel, "SWE", 8).unwrap();
+        open_trade_order(&mut w, "FRA", Steel, "SWE", 4).unwrap();
+        assert!(!enforce_export_quotas(&mut w), "в пределах лимита ничего не меняется");
+        assert_eq!(w["SWE"].imported_factories, 12);
+        // SWE теряет половину добычи: экспорт 50 -> 6 фабрик из 12: GER 8 -> 4, FRA 4 -> 2
+        w.get_mut("SWE").unwrap().set_natural_resources(nat(100));
+        assert!(enforce_export_quotas(&mut w));
+        assert_eq!(w["GER"].trade_orders[0].factories, 4);
+        assert_eq!(w["FRA"].trade_orders[0].factories, 2);
+        assert!(exported_from(&w, "SWE", Steel) <= w["SWE"].exportable_amount(Steel));
+        assert_eq!(w["SWE"].imported_factories, 6, "продавец получает меньше фабрик");
+        assert_eq!(w["GER"].available_civilian_factories(), 100 - 20 - 4, "лишние фабрики вернулись покупателю");
+        // потеря всего: заказы удалены
+        w.get_mut("SWE").unwrap().set_natural_resources(BTreeMap::new());
+        assert!(enforce_export_quotas(&mut w));
+        assert!(w["GER"].trade_orders.is_empty() && w["FRA"].trade_orders.is_empty());
+        assert_eq!(w["SWE"].imported_factories, 0);
+    }
+
+    #[test]
+    fn midnight_tick_trims_orders_after_the_seller_loses_resources() {
+        let mut w = world(200);
+        open_trade_order(&mut w, "GER", Steel, "SWE", 10).unwrap(); // 80 из 100
+        w.get_mut("SWE").unwrap().natural_resources = nat(80); // экспорт 40 = 5 фабрик
+        let mut app = App::new();
+        app.add_event::<DailyTickEvent>().insert_resource(Economies(w)).add_systems(Update, daily_production);
+        app.world_mut().send_event(DailyTickEvent { day: 1, month: 1, year: 1936 });
+        app.update();
+        let eco = &app.world().resource::<Economies>().0;
+        assert_eq!(eco["GER"].trade_orders[0].factories, 5);
+        assert_eq!(eco["SWE"].imported_factories, 5);
+    }
+
+    #[test]
+    fn system_rejects_orders_over_quota_without_spending_factories() {
+        let mut app = App::new();
+        app.add_event::<CreateTradeOrder>()
+            .add_event::<CancelTradeOrder>()
+            .insert_resource(Economies(world(100)))
+            .add_systems(Update, apply_trade_orders);
+        for factories in [6, 1, 7] {
+            app.world_mut().send_event(CreateTradeOrder {
+                country: "GER".into(),
+                resource: Steel,
+                seller: "SWE".into(),
+                factories,
+            });
+            app.update();
+        }
+        let ger = &app.world().resource::<Economies>().0["GER"];
+        assert_eq!(ger.trade_orders.len(), 1, "6 (48 ед.) принят; +1 (56 > 50) и +7 отклонены");
+        assert_eq!(ger.dedicated_trade_factories(), 6);
+    }
+
+    #[test]
+    fn natural_resources_follow_control_of_states() {
+        let state = |id: u32, owner: &str, provinces: Vec<u32>, steel: u32| {
+            Arc::new(StateDef {
+                id,
+                name: format!("S{id}"),
+                owner: owner.into(),
+                provinces,
+                victory_points: vec![],
+                civilian_factories: 0,
+                military_factories: 0,
+                resources: nat(steel),
+            })
+        };
+        let registry = StateRegistry {
+            states: vec![state(1, "SWE", vec![1, 2, 3], 50), state(2, "SWE", vec![4, 5], 30)],
+            province_to_state: Default::default(),
+        };
+        let mut controllers = ProvinceControllers(
+            [(1, "SWE"), (2, "SWE"), (3, "SWE"), (4, "SWE"), (5, "SWE")].iter().map(|&(p, c)| (p, c.to_string())).collect(),
+        );
+        let start = natural_by_controller(&registry, &controllers);
+        assert_eq!(start["SWE"][&Steel], 80);
+        // GER занимает 2 из 3 провинций первого стейта: ресурсы стейта переходят к GER
+        controllers.0.insert(1, "GER".into());
+        controllers.0.insert(2, "GER".into());
+        let after = natural_by_controller(&registry, &controllers);
+        assert_eq!((after["GER"][&Steel], after["SWE"][&Steel]), (50, 30));
+        // ровно половина второго стейта (1 из 2) — большинства нет, остаётся владелец
+        controllers.0.insert(4, "GER".into());
+        assert_eq!(natural_by_controller(&registry, &controllers)["SWE"][&Steel], 30);
+    }
+
+    #[test]
+    fn export_panel_text_numbers() {
+        let mut w = world(100);
+        open_trade_order(&mut w, "GER", Steel, "SWE", 2).unwrap();
+        let (free, total) = free_export(&w, "SWE", Steel);
+        assert_eq!(format!("Доступно для импорта: {free}/{total} ед."), "Доступно для импорта: 34/50 ед.");
+    }
+
+    /// Реальные данные: добыча SWE читается из стейтов, а стартовый заказ GER на 24 стали проходит квоту.
+    #[test]
+    fn real_data_start_contract_passes_sweden_quota() {
+        let root = std::path::Path::new("D:\\SteamLibrary\\steamapps\\common\\Hearts of Iron IV");
+        if !root.exists() {
+            return;
+        }
+        let registry = crate::map::load_all_states(&root.join("history").join("states")).expect("стейты");
+        let mut natural = registry.resources_by_owner();
+        let mut economies = BTreeMap::new();
+        for (tag, (civ, mil)) in registry.factories_by_owner() {
+            let mut eco = CountryEconomy::new(civ, mil);
+            eco.set_natural_resources(natural.remove(&tag).unwrap_or_default());
+            economies.insert(tag, eco);
+        }
+        let sweden = &economies["SWE"];
+        println!("SWE: добыча стали {}, экспорт {}", sweden.natural(Steel), sweden.exportable_amount(Steel));
+        assert!(sweden.exportable_amount(Steel) >= 24, "экспорт стали Швеции покрывает 3 фабрики");
+        assert!(economies["GER"].natural(Steel) > 0);
+        open_trade_order(&mut economies, "GER", Steel, "SWE", START_TRADE_FACTORIES).expect("стартовый контракт");
+        assert_eq!(economies["GER"].imported_resources(Steel), 24);
     }
 }

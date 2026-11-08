@@ -2379,6 +2379,7 @@ mod tests {
             victory_points: vec![],
             civilian_factories: 0,
             military_factories: 0,
+            resources: Default::default(),
         });
         let mut registry = StateRegistry::default();
         registry.province_to_state.insert(2, state);

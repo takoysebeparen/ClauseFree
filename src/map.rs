@@ -210,6 +210,8 @@ pub struct StateDef {
     pub civilian_factories: u32,
     /// `arms_factory` — военные заводы стейта.
     pub military_factories: u32,
+    /// `resources = { steel = N ... }` — природные ресурсы стейта (суточная добыча).
+    pub resources: BTreeMap<crate::economy::ResourceType, u32>,
 }
 
 /// Все стейты мира + O(1) lookup провинция -> стейт.
@@ -232,6 +234,19 @@ impl StateRegistry {
             let entry = totals.entry(state.owner.clone()).or_default();
             entry.0 = entry.0.saturating_add(state.civilian_factories);
             entry.1 = entry.1.saturating_add(state.military_factories);
+        }
+        totals
+    }
+
+    /// Природные ресурсы по странам-владельцам стейтов на старте: тег -> ресурс -> добыча.
+    pub fn resources_by_owner(&self) -> BTreeMap<String, BTreeMap<crate::economy::ResourceType, u32>> {
+        let mut totals: BTreeMap<String, BTreeMap<crate::economy::ResourceType, u32>> = BTreeMap::new();
+        for state in &self.states {
+            let entry = totals.entry(state.owner.clone()).or_default();
+            for (&resource, &amount) in &state.resources {
+                let slot = entry.entry(resource).or_insert(0);
+                *slot = slot.saturating_add(amount);
+            }
         }
         totals
     }
@@ -569,6 +584,7 @@ fn parse_state(text: &str) -> Option<StateDef> {
     let mut civilian_factories = None;
     let mut military_factories = None;
     let mut victory_points: Vec<(u32, u32)> = Vec::new();
+    let mut resources: BTreeMap<crate::economy::ResourceType, u32> = BTreeMap::new();
     let mut depth = 0usize;
 
     let mut i = 0;
@@ -617,6 +633,27 @@ fn parse_state(text: &str) -> Option<StateDef> {
                                 i = j; // остановились на закрывающей `}`
                             }
                         }
+                        // resources = { steel = 50 tungsten = 44 chromium = 25 }: ключи на глубине 2;
+                        // неизвестные ресурсы (chromium) пропускаются
+                        ("resources", 1) => {
+                            if tokens.get(i + 2).map(String::as_str) == Some("{") {
+                                let mut j = i + 3;
+                                while j < tokens.len() && tokens[j] != "}" {
+                                    if tokens.get(j + 1).map(String::as_str) == Some("=") {
+                                        let kind = crate::economy::ResourceType::from_key(&tokens[j]);
+                                        let amount = tokens.get(j + 2).and_then(|t| t.parse::<u32>().ok());
+                                        if let (Some(kind), Some(amount)) = (kind, amount) {
+                                            let slot = resources.entry(kind).or_insert(0);
+                                            *slot = slot.saturating_add(amount);
+                                        }
+                                        j += 3;
+                                    } else {
+                                        j += 1;
+                                    }
+                                }
+                                i = j; // остановились на закрывающей `}`
+                            }
+                        }
                         ("provinces", 1) if provinces.is_empty() => {
                             if tokens.get(i + 2).map(String::as_str) == Some("{") {
                                 let mut j = i + 3;
@@ -646,6 +683,7 @@ fn parse_state(text: &str) -> Option<StateDef> {
         civilian_factories: civilian_factories.unwrap_or(0),
         military_factories: military_factories.unwrap_or(0),
         victory_points,
+        resources,
     })
 }
 
@@ -941,5 +979,64 @@ mod palette_color_tests {
         assert_eq!(palette_texel(None, &colors), [WATER_COLOR[0], WATER_COLOR[1], WATER_COLOR[2], 0]);
         // пустой ресурс не приводит к панике
         assert_eq!(palette_texel(Some("FRA"), &CountryColors::default())[..3], FALLBACK_COLOR);
+    }
+}
+
+#[cfg(test)]
+mod resource_parse_tests {
+    use super::*;
+    use crate::economy::ResourceType::*;
+
+    const SWEDEN: &str = "state = {\n\tid = 666\n\tname = \"STATE_666\"\n\tmanpower = 100222\n\n\tresources = {\n\t\ttungsten = 44\n\t\tsteel = 50\n\t\tchromium = 25\n\t}\n\n\thistory = {\n\t\towner = SWE\n\t\tbuildings = {\n\t\t\tindustrial_complex = 2\n\t\t}\n\t}\n\tprovinces = {\n\t\t1 2 3\n\t}\n}\n";
+
+    #[test]
+    fn resources_block_is_parsed_and_unknown_kinds_are_skipped() {
+        let state = parse_state(SWEDEN).expect("стейт");
+        assert_eq!(state.resources.get(&Steel), Some(&50));
+        assert_eq!(state.resources.get(&Tungsten), Some(&44));
+        assert_eq!(state.resources.len(), 2, "chromium игнорируется");
+        // остальные поля не пострадали
+        assert_eq!((state.owner.as_str(), state.civilian_factories, state.provinces.len()), ("SWE", 2, 3));
+    }
+
+    #[test]
+    fn compact_syntax_comments_and_missing_block() {
+        let text = "state = {\n id = 1\n resources = {\n aluminium=2 # was: 4\n oil = 7 rubber=3\n steel = 24 # was: 40\n }\n history = { owner = FRA }\n provinces = { 9 }\n}";
+        let state = parse_state(text).expect("стейт");
+        assert_eq!(state.resources.into_iter().collect::<Vec<_>>(), vec![(Steel, 24), (Aluminium, 2), (Rubber, 3), (Oil, 7)]);
+        let bare = parse_state("state = { id = 2 history = { owner = FRA } provinces = { 1 } }").expect("стейт");
+        assert!(bare.resources.is_empty());
+    }
+
+    #[test]
+    fn resources_are_summed_by_owner() {
+        let a = parse_state(SWEDEN).expect("a");
+        let b = parse_state(&SWEDEN.replace("id = 666", "id = 667").replace("steel = 50", "steel = 4")).expect("b");
+        let c = parse_state(&SWEDEN.replace("id = 666", "id = 668").replace("owner = SWE", "owner = NOR")).expect("c");
+        let registry = StateRegistry {
+            states: vec![Arc::new(a), Arc::new(b), Arc::new(c)],
+            province_to_state: HashMap::new(),
+        };
+        let totals = registry.resources_by_owner();
+        assert_eq!(totals["SWE"][&Steel], 54);
+        assert_eq!(totals["SWE"][&Tungsten], 88);
+        assert_eq!(totals["NOR"][&Steel], 50);
+        assert!(!totals["SWE"].contains_key(&Oil));
+    }
+
+    #[test]
+    fn real_data_resources_are_read() {
+        let root = Path::new("D:\\SteamLibrary\\steamapps\\common\\Hearts of Iron IV");
+        if !root.exists() {
+            return;
+        }
+        let registry = load_all_states(&root.join("history").join("states")).expect("стейты");
+        let totals = registry.resources_by_owner();
+        let steel = |tag: &str| totals.get(tag).and_then(|m| m.get(&Steel)).copied().unwrap_or(0);
+        println!("сталь: GER {} SWE {} FRA {}", steel("GER"), steel("SWE"), steel("FRA"));
+        assert!(steel("SWE") > 0 && steel("GER") > 0, "у Швеции и Германии есть сталь");
+        // стейт 666 (Norrnorrland) — 50 стали и 44 вольфрама
+        let state = registry.states.iter().find(|s| s.id == 666).expect("стейт 666");
+        assert_eq!((state.resources.get(&Steel), state.resources.get(&Tungsten)), (Some(&50), Some(&44)));
     }
 }
