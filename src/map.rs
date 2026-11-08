@@ -45,6 +45,43 @@ pub struct ProvinceMap {
     terrain_by_id: HashMap<u32, String>,
     /// Маска речных пикселей из `map/rivers.bmp` (тот же размер, что и карта провинций); `None`, если файла нет.
     river_mask: Option<Vec<bool>>,
+    /// Карта высот из `map/heightmap.bmp` (только для шейдера рельефа); `None` — карта плоская.
+    heightmap: Option<HeightMap>,
+}
+
+/// Карта высот: 8 бит на пиксель, построчно сверху вниз. Чисто визуальные данные, симуляцию не трогают.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeightMap {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+/// Декодирует `heightmap.bmp` (градации серого 8 бит; 16-битный источник приводится к 8 битам).
+/// Битый файл или нулевой размер — `None`, карта рисуется плоской.
+pub fn decode_heightmap(bytes: &[u8]) -> Option<HeightMap> {
+    let gray = image::load_from_memory(bytes).ok()?.to_luma8();
+    let (width, height) = (gray.width(), gray.height());
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(HeightMap { width, height, pixels: gray.into_raw() })
+}
+
+/// Текстура высот для шейдера: настоящая карта (R8Unorm) или плоская заглушка 1x1 — по ней шейдер
+/// (размер текстуры 1x1) отключает рельеф и рисует обычную политическую карту.
+pub fn height_image(heightmap: Option<&HeightMap>) -> Image {
+    let (width, height, data) = match heightmap {
+        Some(h) => (h.width, h.height, h.pixels.clone()),
+        None => (1, 1, vec![0u8]),
+    };
+    Image::new(
+        Extent3d { width, height, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        data,
+        TextureFormat::R8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
+    )
 }
 
 /// Пары смежных провинций (меньший id, больший id), между которыми проходит река:
@@ -93,13 +130,13 @@ impl ProvinceMap {
     #[cfg(test)]
     pub fn with_terrain_for_test(terrain: &[(u32, &str)]) -> Self {
         let terrain_by_id = terrain.iter().map(|&(id, t)| (id, t.to_string())).collect();
-        Self { image: RgbaImage::new(1, 1), by_color: HashMap::new(), terrain_by_id, river_mask: None }
+        Self { image: RgbaImage::new(1, 1), by_color: HashMap::new(), terrain_by_id, river_mask: None, heightmap: None }
     }
 
     /// Пустая карта для модульных тестов: вся суша, цветов и местности нет.
     #[cfg(test)]
     pub fn empty_for_test() -> Self {
-        Self { image: RgbaImage::new(1, 1), by_color: HashMap::new(), terrain_by_id: HashMap::new(), river_mask: None }
+        Self { image: RgbaImage::new(1, 1), by_color: HashMap::new(), terrain_by_id: HashMap::new(), river_mask: None, heightmap: None }
     }
 
     pub fn terrain_of(&self, province_id: u32) -> Option<&str> {
@@ -344,6 +381,10 @@ pub struct PoliticalMaterial {
     pub ids: Handle<Image>,
     #[texture(1)]
     pub palette: Handle<Image>,
+    /// Высоты суши (R8Unorm); текстура 1x1 означает «рельефа нет».
+    #[texture(2)]
+    #[sampler(3)]
+    pub heights: Handle<Image>,
 }
 
 impl Material2d for PoliticalMaterial {
@@ -490,7 +531,16 @@ pub fn setup_map(
         RenderAssetUsages::default(), // данные остаются в RAM для точечных правок
     );
     let palette_handle = images.add(palette_image);
-    let material = materials.add(PoliticalMaterial { ids: images.add(ids_image), palette: palette_handle.clone() });
+    let heights = images.add(height_image(map.heightmap.as_ref()));
+    println!(
+        "[РЕЛЬЕФ] {}",
+        match &map.heightmap {
+            Some(h) => format!("карта высот {}x{} загружена", h.width, h.height),
+            None => "карта высот недоступна, плоский режим".to_string(),
+        }
+    );
+    let material =
+        materials.add(PoliticalMaterial { ids: images.add(ids_image), palette: palette_handle.clone(), heights });
     commands.insert_resource(MapPaint { palette: palette_handle, material: material.clone() });
 
     // Меш-прямоугольник по центру (0,0), масштаб 1:1. Оригинальный provinces.bmp остаётся в RAM
@@ -790,7 +840,25 @@ pub(crate) fn load_province_map(root: &Path) -> Result<ProvinceMap, String> {
         by_color.len()
     );
     let river_mask = load_river_mask(root, image.width(), image.height());
-    Ok(ProvinceMap { image, by_color, terrain_by_id, river_mask })
+    let heightmap = load_heightmap(root);
+    Ok(ProvinceMap { image, by_color, terrain_by_id, river_mask, heightmap })
+}
+
+/// `map/heightmap.bmp` -> карта высот. Нет файла или он битый — предупреждение и плоский режим.
+fn load_heightmap(root: &Path) -> Option<HeightMap> {
+    let path = root.join("map").join("heightmap.bmp");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("[ПРЕДУПРЕЖДЕНИЕ] {}: {e}; рельеф отключён, карта плоская", path.display());
+            return None;
+        }
+    };
+    let heightmap = decode_heightmap(&bytes);
+    if heightmap.is_none() {
+        eprintln!("[ПРЕДУПРЕЖДЕНИЕ] heightmap.bmp не удалось декодировать; рельеф отключён, карта плоская");
+    }
+    heightmap
 }
 
 /// `map/rivers.bmp` -> маска речных пикселей. В файле реки нарисованы цветами палитры (индексы 0..=11),
@@ -1039,5 +1107,66 @@ mod resource_parse_tests {
         // стейт 666 (Norrnorrland) — 50 стали и 44 вольфрама
         let state = registry.states.iter().find(|s| s.id == 666).expect("стейт 666");
         assert_eq!((state.resources.get(&Steel), state.resources.get(&Tungsten)), (Some(&50), Some(&44)));
+    }
+}
+
+#[cfg(test)]
+mod relief_tests {
+    use super::*;
+
+    fn gray_bmp(width: u32, height: u32, f: impl Fn(u32, u32) -> u8) -> Vec<u8> {
+        let img = image::GrayImage::from_fn(width, height, |x, y| image::Luma([f(x, y)]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Bmp).expect("запись BMP");
+        out.into_inner()
+    }
+
+    #[test]
+    fn grayscale_bmp_is_decoded_to_heights() {
+        let bytes = gray_bmp(8, 4, |x, y| (x * 10 + y) as u8);
+        let h = decode_heightmap(&bytes).expect("карта высот");
+        assert_eq!((h.width, h.height, h.pixels.len()), (8, 4, 32));
+        assert_eq!(h.pixels[0], 0);
+        assert_eq!(h.pixels[7], 70, "строка 0, x = 7");
+        assert_eq!(h.pixels[8 + 2], 21, "строка 1, x = 2");
+    }
+
+    #[test]
+    fn broken_heightmap_gives_none_without_panic() {
+        assert!(decode_heightmap(b"").is_none());
+        assert!(decode_heightmap(b"BM garbage").is_none());
+        let mut truncated = gray_bmp(8, 8, |_, _| 5);
+        truncated.truncate(30);
+        assert!(decode_heightmap(&truncated).is_none());
+    }
+
+    #[test]
+    fn missing_file_means_flat_mode() {
+        assert!(load_heightmap(Path::new("Z:\\нет\\такой\\папки")).is_none());
+        let flat = height_image(None);
+        assert_eq!((flat.width(), flat.height()), (1, 1), "1x1 — шейдер рисует карту плоской");
+        assert_eq!(flat.texture_descriptor.format, TextureFormat::R8Unorm);
+    }
+
+    #[test]
+    fn height_image_is_r8_with_the_source_size() {
+        let h = HeightMap { width: 3, height: 2, pixels: vec![1, 2, 3, 4, 5, 6] };
+        let image = height_image(Some(&h));
+        assert_eq!((image.width(), image.height()), (3, 2));
+        assert_eq!(image.texture_descriptor.format, TextureFormat::R8Unorm);
+    }
+
+    #[test]
+    fn real_heightmap_matches_the_province_map() {
+        let root = Path::new("D:\\SteamLibrary\\steamapps\\common\\Hearts of Iron IV");
+        if !root.exists() {
+            return;
+        }
+        let h = load_heightmap(root).expect("heightmap.bmp");
+        let map = load_province_map(root).expect("карта");
+        assert_eq!((h.width, h.height), (map.width(), map.height()));
+        assert_eq!(h.pixels.len(), (h.width * h.height) as usize);
+        let (min, max) = (h.pixels.iter().min().copied().unwrap_or(0), h.pixels.iter().max().copied().unwrap_or(0));
+        assert!(max > min + 50, "в рельефе есть перепад высот: {min}..{max}");
     }
 }

@@ -6,12 +6,48 @@
 @group(2) @binding(0) var ids: texture_2d<f32>;
 // палитра: тексель (id % 256, id / 256) = цвет контроллера; a = 1 суша, a = 0 вода / без стейта
 @group(2) @binding(1) var palette: texture_2d<f32>;
+// карта высот (R8Unorm); текстура 1x1 — рельефа нет (файла не было), карта остаётся плоской
+@group(2) @binding(2) var heights: texture_2d<f32>;
+@group(2) @binding(3) var heights_sampler: sampler;
 
 const PALETTE_WIDTH: i32 = 256;
 // [25, 25, 25] в sRGB, переведённый в линейное пространство
 const COUNTRY_BORDER: vec3<f32> = vec3<f32>(0.0097, 0.0097, 0.0097);
 // 0.75 в sRGB-пространстве = 0.53 в линейном
 const PROVINCE_SHADE: f32 = 0.53;
+
+// Рельеф. Уровень моря в heightmap.bmp ~ 95 из 255: всё ниже считается берегом, чтобы дно моря
+// не давало ложных склонов на побережье.
+const SEA_LEVEL: f32 = 95.0 / 255.0;
+// Крутизна рельефа: 1 уровень яркости карты высот на пиксель даёт этот наклон нормали.
+const RELIEF_SCALE: f32 = 0.2;
+// Сила оттенения и допустимый разброс яркости (горы не уходят в чёрное и не выгорают).
+const SHADE_GAIN: f32 = 0.9;
+const SHADE_MIN: f32 = 0.65;
+const SHADE_MAX: f32 = 1.3;
+// Направление на источник света в координатах изображения (x на восток, y на юг, z вверх): северо-запад, 45 над горизонтом.
+const LIGHT_DIR: vec3<f32> = vec3<f32>(-0.5, -0.5, 0.7071);
+
+fn height_at(uv: vec2<f32>) -> f32 {
+    // билинейная выборка сглаживает 8-битные ступени высот
+    return max(textureSampleLevel(heights, heights_sampler, uv, 0.0).r, SEA_LEVEL) * 255.0;
+}
+
+// Множитель яркости по hillshading: нормаль из градиента высот соседних текселей, свет с северо-запада.
+// Плоская местность даёт ровно 1.0.
+fn relief_shade(uv: vec2<f32>) -> f32 {
+    let hd = vec2<f32>(textureDimensions(heights));
+    if (hd.x <= 1.0) {
+        return 1.0;
+    }
+    let tx = vec2<f32>(1.0 / hd.x, 0.0);
+    let ty = vec2<f32>(0.0, 1.0 / hd.y);
+    let gx = (height_at(uv + tx) - height_at(uv - tx)) * 0.5;
+    let gy = (height_at(uv + ty) - height_at(uv - ty)) * 0.5;
+    let n = normalize(vec3<f32>(-gx * RELIEF_SCALE, -gy * RELIEF_SCALE, 1.0));
+    let l = normalize(LIGHT_DIR);
+    return clamp(1.0 + (dot(n, l) - l.z) * SHADE_GAIN, SHADE_MIN, SHADE_MAX);
+}
 
 fn province_at(p: vec2<i32>, dims: vec2<i32>) -> i32 {
     let q = clamp(p, vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
@@ -60,8 +96,10 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     if (country_border) {
         return vec4<f32>(COUNTRY_BORDER, 1.0);
     }
+    // Рельеф только на суше (вода вернулась выше); границы государств остаются чёткими
+    let shade = relief_shade(in.uv);
     if (province_border) {
-        return vec4<f32>(base.rgb * PROVINCE_SHADE, 1.0);
+        return vec4<f32>(base.rgb * shade * PROVINCE_SHADE, 1.0);
     }
-    return vec4<f32>(base.rgb, 1.0);
+    return vec4<f32>(base.rgb * shade, 1.0);
 }
