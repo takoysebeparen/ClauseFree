@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 
 use bevy::prelude::*;
 
+use crate::economy::EquipmentType;
+
 /// Шаблон, который используется для всех дивизий, чей шаблон ещё не зарегистрирован.
 pub const BASE_TEMPLATE: &str = "Infanterie-Division";
 
@@ -43,8 +45,9 @@ pub struct BattalionDef {
     /// Вместе с soft_attack даёт силу удара по формуле (soft * (100 - T) + hard * T) / 100, T — твёрдость цели.
     pub hard_attack: u32,
     pub defense: u32,
-    /// Винтовок, необходимых батальону в полном составе.
-    pub required_equipment: u32,
+    /// Тип и количество снаряжения, необходимого батальону в полном составе
+    /// (пехота — 100 пехотного, артиллерия — 24 орудия, лёгкий танк — 50, сапёры — 10 оснащения).
+    pub equipment_needs: (EquipmentType, u32),
     /// Ширина фронта, которую занимает батальон в бою (у рот обеспечения 0).
     pub combat_width: u32,
     /// Броня: у пехоты 0, у лёгких танков 15, у средних 50.
@@ -77,7 +80,7 @@ impl BattalionDef {
             soft_attack: 10,
             hard_attack: 0,
             defense: 25,
-            required_equipment: 100,
+            equipment_needs: (EquipmentType::InfantryEquipment, 100),
             combat_width: 2,
             armor: 0,
             piercing: 4,
@@ -105,7 +108,7 @@ impl BattalionDef {
             soft_attack: 12,
             hard_attack: 10,
             defense: 10,
-            required_equipment: 80,
+            equipment_needs: (EquipmentType::LightTank, 50),
             combat_width: 2,
             armor: 15,
             piercing: 20,
@@ -127,7 +130,7 @@ impl BattalionDef {
             soft_attack: 20,
             hard_attack: 24,
             defense: 15,
-            required_equipment: 100,
+            equipment_needs: (EquipmentType::MediumTank, 50),
             combat_width: 2,
             armor: 50,
             piercing: 30,
@@ -147,7 +150,7 @@ impl BattalionDef {
             soft_attack: 0,
             hard_attack: 0,
             defense: 0,
-            required_equipment: 0,
+            equipment_needs: (EquipmentType::InfantryEquipment, 0),
             combat_width: 0,
             armor: 0,
             piercing: 0,
@@ -168,6 +171,7 @@ impl BattalionDef {
             soft_attack: 25,
             hard_attack: 2,
             piercing: 5,
+            equipment_needs: (EquipmentType::Artillery, 24),
             support_label: SUPPORT_ARTILLERY,
             ..Self::support()
         }
@@ -177,6 +181,7 @@ impl BattalionDef {
     pub fn engineers() -> Self {
         Self {
             manpower: 300,
+            equipment_needs: (EquipmentType::SupportEquipment, 10),
             entrenchment_bonus: 5,
             river_penalty_reduction: 20,
             support_label: SUPPORT_ENGINEERS,
@@ -187,7 +192,13 @@ impl BattalionDef {
     /// Рота разведки: разведка 2.
     #[allow(dead_code)]
     pub fn support_recon() -> Self {
-        Self { manpower: 200, recon: 2, support_label: SUPPORT_RECON, ..Self::support() }
+        Self {
+            manpower: 200,
+            recon: 2,
+            equipment_needs: (EquipmentType::SupportEquipment, 5),
+            support_label: SUPPORT_RECON,
+            ..Self::support()
+        }
     }
 }
 
@@ -201,7 +212,9 @@ pub struct DivisionStats {
     /// Жёсткая атака: сумма по батальонам и ротам обеспечения (мягкая и жёсткая хранятся раздельно).
     pub hard_attack: u32,
     pub defense: u32,
-    pub total_required_equipment: u32,
+    /// Суммарная потребность дивизии в снаряжении по типам для полного укомплектования
+    /// (нулевые потребности в карту не попадают).
+    pub equipment_needs: BTreeMap<EquipmentType, u32>,
     /// Ширина фронта дивизии: сумма по батальонам (пехотная дивизия из 9 батальонов — 18);
     /// роты обеспечения ширину не занимают.
     pub combat_width: u32,
@@ -260,7 +273,13 @@ impl DivisionTemplate {
             soft_attack: sum(|b| b.soft_attack),
             hard_attack: sum(|b| b.hard_attack),
             defense: sum(|b| b.defense),
-            total_required_equipment: sum(|b| b.required_equipment),
+            equipment_needs: {
+                let mut needs = BTreeMap::new();
+                for b in all.iter().filter(|b| b.equipment_needs.1 > 0) {
+                    *needs.entry(b.equipment_needs.0).or_insert(0u32) += b.equipment_needs.1;
+                }
+                needs
+            },
             combat_width: all.iter().filter(|b| !b.is_support).map(|b| b.combat_width).sum(),
             max_speed: all.iter().map(|b| b.speed_kph).min().unwrap_or(0),
             armor: (max(|b| b.armor) * 30 + average(|b| b.armor) * 70) / 100,
@@ -284,6 +303,13 @@ impl DivisionTemplate {
 fn template(name: &str, composition: &[(BattalionDef, usize)]) -> DivisionTemplate {
     let battalions = composition.iter().flat_map(|(def, n)| std::iter::repeat(def.clone()).take(*n)).collect();
     DivisionTemplate { name: name.to_string(), battalions }
+}
+
+impl DivisionStats {
+    /// Общее число единиц снаряжения всех типов, нужное для полного состава.
+    pub fn total_equipment_needs(&self) -> u32 {
+        self.equipment_needs.values().sum()
+    }
 }
 
 /// Реестр шаблонов по имени. `BTreeMap` — детерминированный порядок.
@@ -360,7 +386,8 @@ mod tests {
         assert_eq!(stats.max_org, 60);
         assert_eq!(stats.soft_attack, 90);
         assert_eq!(stats.defense, 225);
-        assert_eq!(stats.total_required_equipment, 900);
+        assert_eq!(stats.equipment_needs, BTreeMap::from([(EquipmentType::InfantryEquipment, 900)]));
+        assert_eq!(stats.total_equipment_needs(), 900);
         assert_eq!(stats.combat_width, 18);
         // пехота: 4.0 км/ч, без брони, пробитие 4, твёрдость 0
         assert_eq!((stats.max_speed, stats.armor, stats.piercing, stats.hardness), (40, 0, 4, 0));
@@ -378,7 +405,16 @@ mod tests {
         assert_eq!(DivisionTemplates::default().get_or_base(BASE_TEMPLATE).battalion_count(), 9);
         // поддержка не занимает ширину фронта и не меняет прочность, организацию, защиту, снаряжение
         assert_eq!(base.combat_width, 18);
-        assert_eq!((base.max_strength, base.max_org, base.defense, base.total_required_equipment), (900, 60, 225, 900));
+        assert_eq!((base.max_strength, base.max_org, base.defense), (900, 60, 225));
+        // потребность в снаряжении по типам: 900 пехотного, 10 оснащения сапёров, 24 орудия
+        assert_eq!(
+            base.equipment_needs,
+            BTreeMap::from([
+                (EquipmentType::InfantryEquipment, 900),
+                (EquipmentType::SupportEquipment, 10),
+                (EquipmentType::Artillery, 24),
+            ])
+        );
         // артиллерия: +25 мягкой и +2 жёсткой атаки; личный состав роты: 500 + 300
         assert_eq!(base.soft_attack, plain.soft_attack + 25);
         assert_eq!(base.hard_attack, 2);
@@ -445,6 +481,27 @@ mod tests {
         assert_eq!(stats.recon, 3);
         // у танковой дивизии нет поддержки
         assert!(stats.support.is_empty() && !stats.has_engineers);
+    }
+
+    #[test]
+    fn equipment_needs_are_aggregated_by_type() {
+        // потребность батальонов: пехота 100, лёгкий танк 50, средний 50, артиллерия 24, сапёры 10
+        assert_eq!(BattalionDef::infantry().equipment_needs, (EquipmentType::InfantryEquipment, 100));
+        assert_eq!(BattalionDef::light_tank().equipment_needs, (EquipmentType::LightTank, 50));
+        assert_eq!(BattalionDef::medium_tank().equipment_needs, (EquipmentType::MediumTank, 50));
+        assert_eq!(BattalionDef::support_artillery().equipment_needs, (EquipmentType::Artillery, 24));
+        assert_eq!(BattalionDef::engineers().equipment_needs, (EquipmentType::SupportEquipment, 10));
+        // танковая дивизия: 4 лёгких танка по 50 и 2 моторизованных батальона на пехотном снаряжении
+        let panzer = stats_of("Panzer-Division");
+        assert_eq!(
+            panzer.equipment_needs,
+            BTreeMap::from([(EquipmentType::InfantryEquipment, 200), (EquipmentType::LightTank, 200)])
+        );
+        // сапёры и разведка делят один тип оснащения: 10 + 5
+        let both = template("s", &[(BattalionDef::engineers(), 1), (BattalionDef::support_recon(), 1)]).calculate_stats();
+        assert_eq!(both.equipment_needs, BTreeMap::from([(EquipmentType::SupportEquipment, 15)]));
+        // пустой шаблон ничего не требует
+        assert!(template("empty", &[]).calculate_stats().equipment_needs.is_empty());
     }
 
     #[test]

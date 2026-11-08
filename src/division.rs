@@ -16,7 +16,7 @@ use crate::camera::MainCamera;
 use crate::clock::{ClockSet, DailyTickEvent, HourTick};
 use crate::air::{air_attack_bonus_pct, air_defense_penalty_pct, air_status, side_edge, AirSuperiorityMap};
 use crate::command::SKILL_BONUS_PCT;
-use crate::economy::{update_supply_network, ArmyExperience, SupplyNetwork};
+use crate::economy::{update_supply_network, ArmyExperience, EquipmentType, SupplyNetwork};
 use crate::oob::OobDivisions;
 use crate::units::{DivisionTemplate, DivisionTemplates, BASE_TEMPLATE, INFANTRY_SPEED_KPH};
 #[cfg(test)]
@@ -98,7 +98,10 @@ pub struct Division {
     pub battalion_count: u32,
     /// Личный состав и снаряжение в полном составе (из шаблона).
     pub max_manpower: u32,
-    pub required_equipment: u32,
+    /// Потребность в снаряжении по типам для полного состава (из шаблона).
+    pub equipment_needs: BTreeMap<EquipmentType, u32>,
+    /// Типы снаряжения, которых не хватило при последнем суточном пополнении (дефицит сдерживает рост прочности).
+    pub equipment_shortage: BTreeSet<EquipmentType>,
     /// Ещё не списанный дробный урон организации, в тысячных долях очка (0..1000).
     pub org_frac: u32,
     /// Окопанность 0..=10: растёт раз в сутки на месте, сбрасывается при марше и отступлении.
@@ -152,12 +155,21 @@ impl Division {
         (u64::from(self.max_manpower) * u64::from(self.current_strength) / u64::from(self.max_strength.max(1))) as u32
     }
 
-    /// Снаряжение сейчас: пропорционально укомплектованности.
-    pub fn current_equipment(&self) -> u32 {
-        (u64::from(self.required_equipment) * u64::from(self.current_strength) / u64::from(self.max_strength.max(1)))
-            as u32
+    /// Нужно единиц снаряжения всех типов для полного состава.
+    pub fn required_equipment(&self) -> u32 {
+        self.equipment_needs.values().sum()
     }
 
+    /// Снаряжение по типу сейчас: потребность типа, умноженная на укомплектованность дивизии.
+    pub fn equipment_of(&self, equipment: EquipmentType) -> u32 {
+        let need = self.equipment_needs.get(&equipment).copied().unwrap_or(0);
+        (u64::from(need) * u64::from(self.current_strength) / u64::from(self.max_strength.max(1))) as u32
+    }
+
+    /// Снаряжение всех типов сейчас.
+    pub fn current_equipment(&self) -> u32 {
+        self.equipment_needs.keys().map(|&t| self.equipment_of(t)).sum()
+    }
     /// Урон организации в тысячных долях очка; дробный остаток копится в `org_frac`.
     fn lose_org_milli(&mut self, milli: u32) {
         let total = self.org_frac.saturating_add(milli);
@@ -195,7 +207,8 @@ impl Division {
         self.max_org = stats.max_org;
         self.max_strength = stats.max_strength;
         self.max_manpower = stats.total_manpower;
-        self.required_equipment = stats.total_required_equipment;
+        self.equipment_needs = stats.equipment_needs;
+        self.equipment_shortage.clear();
         self.soft_attack = stats.soft_attack;
         self.hard_attack = stats.hard_attack;
         self.defense = stats.defense;
@@ -237,7 +250,8 @@ impl Division {
             template_name,
             battalion_count: template.battalion_count(),
             max_manpower: stats.total_manpower,
-            required_equipment: stats.total_required_equipment,
+            equipment_needs: stats.equipment_needs,
+            equipment_shortage: BTreeSet::new(),
             org_frac: 0,
             entrenchment: 0,
             combat_width: stats.combat_width,
@@ -503,7 +517,7 @@ fn spawn_oob_divisions(
         base_stats.max_org,
         base_stats.soft_attack,
         base_stats.defense,
-        base_stats.total_required_equipment
+        base_stats.total_equipment_needs()
     );
 
     let mut next_id = 1u32;
@@ -1774,6 +1788,19 @@ fn recon_text(recon_sum: u32, active: u32) -> String {
     format!("{}.{}", tenths / 10, tenths % 10)
 }
 
+/// Статус укомплектованности техникой и оружием: `Комплектность: Винтовки 900/900 | Пушки 24/24`;
+/// типы, которых не хватило при последнем пополнении, перечисляются как дефицит.
+fn equipment_status_text(d: &Division) -> String {
+    let parts: Vec<String> =
+        d.equipment_needs.iter().map(|(&t, &need)| format!("{} {}/{}", t.label(), d.equipment_of(t), need)).collect();
+    let mut text = format!("Комплектность: {}", if parts.is_empty() { "не требуется".to_string() } else { parts.join(" | ") });
+    if !d.equipment_shortage.is_empty() {
+        let lacking: Vec<&str> = d.equipment_shortage.iter().map(|t| t.label()).collect();
+        text.push_str(&format!(" | Дефицит: {}", lacking.join(", ")));
+    }
+    text
+}
+
 /// Строка атаки в панели дивизии: `Атака: 90 мягк. / 0 твёрд. | Твёрдость: 0%`.
 fn attack_label(d: &Division) -> String {
     format!("Атака: {} мягк. / {} твёрд. | Твёрдость: {}%", d.soft_attack, d.hard_attack, d.hardness)
@@ -1951,8 +1978,9 @@ fn division_info_ui(
                 d.battalion_count,
                 d.current_manpower(),
                 d.current_equipment(),
-                d.required_equipment
+                d.required_equipment()
             ));
+            ui.label(equipment_status_text(d));
             ui.label(format!("Состояние: {status}"));
             ui.label(format!("Боевая ширина дивизии: {}", d.combat_width));
             // Смена шаблона: доступна нации, только пока дивизия стоит и не воюет
@@ -3021,7 +3049,8 @@ mod refit_tests {
         assert_eq!((d.max_org, d.max_strength, d.combat_width, d.max_speed), (stats.max_org, 600, 12, 80));
         assert_eq!((d.soft_attack, d.hard_attack, d.defense), (stats.soft_attack, stats.hard_attack, stats.defense));
         assert_eq!((d.armor, d.piercing, d.hardness, d.recon), (stats.armor, stats.piercing, 55, 3));
-        assert_eq!((d.max_manpower, d.required_equipment), (stats.total_manpower, stats.total_required_equipment));
+        assert_eq!(d.max_manpower, stats.total_manpower);
+        assert_eq!(d.equipment_needs, stats.equipment_needs);
         // поддержки у танковой дивизии нет: окопанность до 10, реки без сапёров
         assert!(d.support.is_empty());
         assert_eq!((d.max_entrenchment, d.river_penalty_reduction), (10, 0));
@@ -3143,5 +3172,77 @@ mod refit_tests {
         });
         order(&mut app, ids[0], "Panzer-Division");
         assert_eq!(template_of(&app, ids[0]), BASE_TEMPLATE, "в бою шаблон не меняется");
+    }
+}
+
+#[cfg(test)]
+mod equipment_status_tests {
+    use super::*;
+
+    fn registered(name: &str) -> Division {
+        let templates = DivisionTemplates::default();
+        Division::from_template(1, "d".into(), "GER".into(), 1, name.to_string(), templates.get_or_base(name))
+    }
+
+    #[test]
+    fn division_keeps_needs_by_type_from_its_template() {
+        let standard = registered(BASE_TEMPLATE);
+        assert_eq!(
+            standard.equipment_needs,
+            BTreeMap::from([
+                (EquipmentType::InfantryEquipment, 900),
+                (EquipmentType::SupportEquipment, 10),
+                (EquipmentType::Artillery, 24),
+            ])
+        );
+        assert_eq!(standard.required_equipment(), 934);
+        let panzer = registered("Panzer-Division");
+        assert_eq!(panzer.equipment_needs.get(&EquipmentType::LightTank), Some(&200));
+        assert_eq!(panzer.equipment_needs.get(&EquipmentType::InfantryEquipment), Some(&200));
+    }
+
+    #[test]
+    fn equipment_scales_with_strength_and_status_text_lists_types() {
+        let mut d = registered(BASE_TEMPLATE);
+        assert_eq!(d.current_equipment(), 934);
+        assert_eq!(
+            equipment_status_text(&d),
+            "Комплектность: Винтовки 900/900 | Оснащение 10/10 | Пушки 24/24"
+        );
+        // половина прочности — половина снаряжения каждого типа
+        d.current_strength = 450;
+        assert_eq!(d.equipment_of(EquipmentType::InfantryEquipment), 450);
+        assert_eq!(d.current_equipment(), 450 + 5 + 12);
+        assert_eq!(
+            equipment_status_text(&d),
+            "Комплектность: Винтовки 450/900 | Оснащение 5/10 | Пушки 12/24"
+        );
+    }
+
+    #[test]
+    fn status_text_reports_shortage_and_empty_needs() {
+        let mut panzer = registered("Panzer-Division");
+        panzer.current_strength = 300;
+        panzer.equipment_shortage.insert(EquipmentType::LightTank);
+        assert_eq!(
+            equipment_status_text(&panzer),
+            "Комплектность: Винтовки 100/200 | Лёгкие танки 100/200 | Дефицит: Лёгкие танки"
+        );
+        let mut none = registered(BASE_TEMPLATE);
+        none.equipment_needs.clear();
+        assert_eq!(equipment_status_text(&none), "Комплектность: не требуется");
+        assert_eq!((none.current_equipment(), none.required_equipment()), (0, 0));
+    }
+
+    #[test]
+    fn refit_replaces_needs_and_clears_shortage() {
+        let templates = DivisionTemplates::default();
+        let mut d = registered(BASE_TEMPLATE);
+        d.equipment_shortage.insert(EquipmentType::Artillery);
+        d.refit(templates.get("Panzer-Division").unwrap());
+        assert!(d.equipment_shortage.is_empty(), "после реорганизации прежний дефицит неактуален");
+        assert_eq!(d.equipment_needs.get(&EquipmentType::LightTank), Some(&200));
+        assert!(!d.equipment_needs.contains_key(&EquipmentType::Artillery));
+        assert_eq!(d.required_equipment(), 400);
     }
 }

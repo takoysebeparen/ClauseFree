@@ -1,8 +1,10 @@
-//! Экономика (Фаза 5): фабрики стран, национальный склад и суточное производство.
+//! Экономика (Фаза 5): фабрики стран, многотиповой национальный склад, производственные линии
+//! и адресное суточное пополнение дивизий.
 //!
 //! Всё считается целыми числами и привязано к тегу страны (`CountryEconomy`).
 //! Тяжёлая логика идёт строго на `DailyTickEvent` (00:00), а не каждый час.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use bevy::prelude::*;
@@ -17,46 +19,184 @@ const HUB_MIN_VICTORY_POINTS: u32 = 5;
 /// Радиус действия хаба в шагах по графу смежности.
 const SUPPLY_RADIUS: u32 = 3;
 
-/// Стартовый запас винтовок на складе.
-const START_INFANTRY_EQUIPMENT: i32 = 5000;
-/// Максимум единиц прочности, запрашиваемых одной дивизией в сутки (1 единица = 1 винтовка).
+/// Максимум единиц прочности, запрашиваемых одной дивизией в сутки.
 const REINFORCE_PER_DIVISION_PER_DAY: u32 = 50;
-/// Винтовок в сутки с одного военного завода.
-const RIFLES_PER_FACTORY_PER_DAY: i32 = 5;
 const DEFAULT_PLAYER_COUNTRY: &str = "GER";
+
+/// Доли военных заводов по линиям на старте, %: остаток от округления вниз достаётся пехотному снаряжению.
+const START_LINE_SHARES: [(EquipmentType, u32); 5] = [
+    (EquipmentType::InfantryEquipment, 50),
+    (EquipmentType::SupportEquipment, 10),
+    (EquipmentType::Artillery, 15),
+    (EquipmentType::LightTank, 25),
+    (EquipmentType::MediumTank, 0),
+];
+
+// ---------------------------------------------------------------------------
+// Типы снаряжения
+// ---------------------------------------------------------------------------
+
+/// Вид военного снаряжения. Ключ многотипового склада и потребностей батальонов.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EquipmentType {
+    /// Пехотное снаряжение (винтовки).
+    InfantryEquipment,
+    /// Дополнительное оснащение сапёров и разведки.
+    SupportEquipment,
+    /// Орудия.
+    Artillery,
+    LightTank,
+    MediumTank,
+}
+
+impl EquipmentType {
+    /// Все типы в фиксированном порядке (детерминированный обход).
+    pub const ALL: [EquipmentType; 5] = [
+        EquipmentType::InfantryEquipment,
+        EquipmentType::SupportEquipment,
+        EquipmentType::Artillery,
+        EquipmentType::LightTank,
+        EquipmentType::MediumTank,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EquipmentType::InfantryEquipment => "Винтовки",
+            EquipmentType::SupportEquipment => "Оснащение",
+            EquipmentType::Artillery => "Пушки",
+            EquipmentType::LightTank => "Лёгкие танки",
+            EquipmentType::MediumTank => "Средние танки",
+        }
+    }
+
+    /// Суточный выход одного военного завода: 5 винтовок, 1 орудие или 1 танк (оснащение — 3).
+    pub fn output_per_factory(self) -> u32 {
+        match self {
+            EquipmentType::InfantryEquipment => 5,
+            EquipmentType::SupportEquipment => 3,
+            EquipmentType::Artillery | EquipmentType::LightTank | EquipmentType::MediumTank => 1,
+        }
+    }
+
+    /// Стартовый запас каждой страны.
+    fn start_stock(self) -> u32 {
+        match self {
+            EquipmentType::InfantryEquipment => 5000,
+            EquipmentType::SupportEquipment => 500,
+            EquipmentType::Artillery => 300,
+            EquipmentType::LightTank => 600,
+            EquipmentType::MediumTank => 0,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Данные
 // ---------------------------------------------------------------------------
 
+/// Производственная линия: на сколько заводов назначено производство типа снаряжения.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductionLine {
+    pub equipment: EquipmentType,
+    pub assigned_factories: u32,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CountryEconomy {
     pub civilian_factories: u32,
     pub military_factories: u32,
-    pub infantry_equipment_stockpile: i32,
-    /// Винтовок в сутки (пересчитывается из `military_factories`).
-    pub daily_production: i32,
-    /// Винтовок, реально потраченных на пополнение дивизий в последние сутки.
-    pub reinforce_cost: i32,
+    /// Склад по типам снаряжения (нет записи — ноль).
+    pub stockpile: BTreeMap<EquipmentType, u32>,
+    /// Производственные линии; сумма назначенных заводов не превышает `military_factories`.
+    pub production_lines: Vec<ProductionLine>,
+    /// Суточный выход по типам (пересчитывается из линий).
+    pub daily_output: BTreeMap<EquipmentType, u32>,
+    /// Потрачено на пополнение дивизий за последние сутки, по типам.
+    pub reinforce_cost: BTreeMap<EquipmentType, u32>,
 }
 
 impl CountryEconomy {
-    fn new(civilian_factories: u32, military_factories: u32) -> Self {
+    pub(crate) fn new(civilian_factories: u32, military_factories: u32) -> Self {
         let mut eco = Self {
             civilian_factories,
             military_factories,
-            infantry_equipment_stockpile: START_INFANTRY_EQUIPMENT,
-            daily_production: 0,
-            reinforce_cost: 0,
+            stockpile: EquipmentType::ALL.iter().map(|&t| (t, t.start_stock())).collect(),
+            production_lines: default_lines(military_factories),
+            daily_output: BTreeMap::new(),
+            reinforce_cost: BTreeMap::new(),
         };
-        eco.recalc_daily_production();
+        eco.recalc_daily_output();
         eco
     }
 
-    fn recalc_daily_production(&mut self) {
-        let factories = i32::try_from(self.military_factories).unwrap_or(i32::MAX);
-        self.daily_production = factories.saturating_mul(RIFLES_PER_FACTORY_PER_DAY);
+    pub fn stock(&self, equipment: EquipmentType) -> u32 {
+        self.stockpile.get(&equipment).copied().unwrap_or(0)
     }
+
+    pub fn set_stock(&mut self, equipment: EquipmentType, amount: u32) {
+        self.stockpile.insert(equipment, amount);
+    }
+
+    pub fn output_of(&self, equipment: EquipmentType) -> u32 {
+        self.daily_output.get(&equipment).copied().unwrap_or(0)
+    }
+
+    pub fn cost_of(&self, equipment: EquipmentType) -> u32 {
+        self.reinforce_cost.get(&equipment).copied().unwrap_or(0)
+    }
+
+    /// Заводы, фактически работающие на линиях: линии идут по порядку, и каждая получает не больше,
+    /// чем осталось от `military_factories` (общий лимит не превышается никогда).
+    pub fn effective_factories(&self) -> Vec<(EquipmentType, u32)> {
+        let mut remaining = self.military_factories;
+        self.production_lines
+            .iter()
+            .map(|line| {
+                let working = line.assigned_factories.min(remaining);
+                remaining -= working;
+                (line.equipment, working)
+            })
+            .collect()
+    }
+
+    /// Свободные заводы: не назначенные ни на одну линию.
+    pub fn free_factories(&self) -> u32 {
+        let used: u32 = self.effective_factories().iter().map(|&(_, n)| n).sum();
+        self.military_factories - used
+    }
+
+    /// Назначает линии `equipment` ровно `factories` заводов, но не больше, чем позволяет лимит
+    /// (свободные заводы плюс уже стоявшие на этой линии). Возвращает фактически назначенное число.
+    pub fn assign_factories(&mut self, equipment: EquipmentType, factories: u32) -> u32 {
+        let on_line = self.effective_factories().iter().find(|(t, _)| *t == equipment).map_or(0, |&(_, n)| n);
+        let assigned = factories.min(self.free_factories() + on_line);
+        match self.production_lines.iter_mut().find(|l| l.equipment == equipment) {
+            Some(line) => line.assigned_factories = assigned,
+            None => self.production_lines.push(ProductionLine { equipment, assigned_factories: assigned }),
+        }
+        self.recalc_daily_output();
+        assigned
+    }
+
+    /// Суточный выход = заводы линии * выход завода данного типа.
+    pub(crate) fn recalc_daily_output(&mut self) {
+        let mut output = BTreeMap::new();
+        for (equipment, working) in self.effective_factories() {
+            *output.entry(equipment).or_insert(0u32) += working * equipment.output_per_factory();
+        }
+        self.daily_output = output;
+    }
+}
+
+/// Стартовые линии: доли `START_LINE_SHARES`, остаток от округления вниз — на пехотное снаряжение.
+fn default_lines(military_factories: u32) -> Vec<ProductionLine> {
+    let mut lines: Vec<ProductionLine> = START_LINE_SHARES
+        .iter()
+        .map(|&(equipment, pct)| ProductionLine { equipment, assigned_factories: military_factories * pct / 100 })
+        .collect();
+    let given: u32 = lines.iter().map(|l| l.assigned_factories).sum();
+    lines[0].assigned_factories += military_factories - given;
+    lines
 }
 
 /// Экономики всех стран по тегу. `BTreeMap` — детерминированный порядок обхода.
@@ -66,6 +206,15 @@ pub struct Economies(pub BTreeMap<String, CountryEconomy>);
 /// Страна, за которую играет пользователь (её данные показывает верхняя панель).
 #[derive(Resource)]
 pub struct PlayerCountry(pub String);
+
+/// Приказ: назначить производственной линии страны `factories` заводов.
+/// Применяется в `apply_production_orders` с учётом лимита военных заводов.
+#[derive(Event, Debug, Clone)]
+pub struct SetProductionLine {
+    pub country: String,
+    pub equipment: EquipmentType,
+    pub factories: u32,
+}
 
 /// Стартовый армейский опыт Германии и Франции.
 const START_ARMY_XP: u32 = 10;
@@ -101,7 +250,7 @@ impl ArmyExperience {
         *xp = xp.saturating_add(amount).min(MAX_ARMY_XP);
     }
 
-    /// Один час боя: ighting_divisions дивизий страны стоят на линии. Каждые 24 накопленных
+    /// Один час боя: `fighting_divisions` дивизий страны стоят на линии. Каждые 24 накопленных
     /// дивизионо-часа дают +1 опыта; остаток переносится на следующие часы.
     pub fn record_combat_hour(&mut self, country: &str, fighting_divisions: u32) {
         let pending = self.combat_hours.entry(country.to_string()).or_insert(0);
@@ -195,6 +344,7 @@ pub struct EconomyPlugin;
 impl Plugin for EconomyPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Economies>()
+            .add_event::<SetProductionLine>()
             .init_resource::<ArmyExperience>()
             .init_resource::<SupplyNetwork>()
             .insert_resource(PlayerCountry(DEFAULT_PLAYER_COUNTRY.to_string()))
@@ -208,6 +358,8 @@ impl Plugin for EconomyPlugin {
                     update_supply_network.after(ClockSet),
                     daily_reinforcement.after(daily_production).after(daily_supply),
                     economy_bar,
+                    apply_production_orders,
+                    production_panel,
                 ),
             );
     }
@@ -254,23 +406,124 @@ fn init_economies(registry: Res<StateRegistry>, mut economies: ResMut<Economies>
     );
 }
 
-/// Раз в сутки (00:00) каждый военный завод добавляет винтовки на склад своей страны.
+/// Раз в сутки (00:00) заводы каждой линии производят свой тип снаряжения на склад страны:
+/// `заводы линии * выход завода`. Заводов на линиях в сумме не больше `military_factories`.
 fn daily_production(mut events: EventReader<DailyTickEvent>, mut economies: ResMut<Economies>) {
     for event in events.read() {
         for eco in economies.0.values_mut() {
-            eco.recalc_daily_production();
-            eco.infantry_equipment_stockpile =
-                eco.infantry_equipment_stockpile.saturating_add(eco.daily_production);
+            eco.recalc_daily_output();
+            for (equipment, output) in eco.daily_output.clone() {
+                let stock = eco.stock(equipment).saturating_add(output);
+                eco.set_stock(equipment, stock);
+            }
         }
         println!("[ЭКОНОМИКА] Сутки {}.{}.{}: производство учтено", event.day, event.month, event.year);
     }
 }
 
-/// Суточное пополнение: дивизии с неполной прочностью запрашивают до 50 единиц, склад страны тратит
-/// столько же винтовок. Пополняются ТОЛЬКО снабжённые дивизии (`is_supplied`): отрезанным склад
-/// ничего не отправляет, их прочность не растёт, а в расход и запросы они не попадают.
-/// При нехватке запас делится пропорционально запросам (целочисленно, остаток раздаётся по одному
-/// в порядке id). Всё детерминировано: страны и дивизии — по порядку.
+/// Применяет приказы `SetProductionLine`: заводов на линию назначается не больше, чем свободно
+/// (общее число заводов на линиях не превышает `military_factories`).
+fn apply_production_orders(mut orders: EventReader<SetProductionLine>, mut economies: ResMut<Economies>) {
+    for order in orders.read() {
+        let Some(eco) = economies.0.get_mut(&order.country) else { continue };
+        let assigned = eco.assign_factories(order.equipment, order.factories);
+        if assigned < order.factories {
+            println!(
+                "[ЭКОНОМИКА] {}: на линию \"{}\" назначено {assigned} заводов из запрошенных {} (лимит {})",
+                order.country,
+                order.equipment.label(),
+                order.factories,
+                eco.military_factories
+            );
+        }
+    }
+}
+
+/// Делит `total` очков по типам пропорционально весам: целая часть каждого, а остаток раздаётся
+/// по одному типам с наибольшим дробным остатком (при равенстве — по порядку типов).
+/// Детерминированно; сумма результата всегда равна `total`. Пустые веса дают пустой результат.
+pub fn split_by_weights(total: u32, weights: &BTreeMap<EquipmentType, u32>) -> BTreeMap<EquipmentType, u32> {
+    let weight_sum: u64 = weights.values().map(|&w| u64::from(w)).sum();
+    if weight_sum == 0 {
+        return BTreeMap::new();
+    }
+    let mut parts: Vec<(EquipmentType, u32, u64)> = weights
+        .iter()
+        .map(|(&t, &w)| {
+            let scaled = u64::from(total) * u64::from(w);
+            (t, (scaled / weight_sum) as u32, scaled % weight_sum)
+        })
+        .collect();
+    let given: u32 = parts.iter().map(|p| p.1).sum();
+    let mut left = total - given;
+    let mut order: Vec<usize> = (0..parts.len()).collect();
+    order.sort_by_key(|&i| (Reverse(parts[i].2), parts[i].0));
+    for i in order {
+        if left == 0 {
+            break;
+        }
+        parts[i].1 += 1;
+        left -= 1;
+    }
+    parts.into_iter().map(|(t, x, _)| (t, x)).collect()
+}
+
+/// Запрос дивизии на пополнение по типам: тип -> (очков прочности, единиц снаряжения).
+/// Прочность делится по весам потребности (`needs`), цена очка у всех типов одинакова и равна
+/// `сумма потребностей / максимальная прочность`, округление вверх.
+pub fn division_request(
+    strength_request: u32,
+    needs: &BTreeMap<EquipmentType, u32>,
+    max_strength: u32,
+) -> BTreeMap<EquipmentType, (u32, u32)> {
+    let weight_sum: u64 = needs.values().map(|&n| u64::from(n)).sum();
+    split_by_weights(strength_request, needs)
+        .into_iter()
+        .filter(|&(_, points)| points > 0)
+        .map(|(t, points)| {
+            let cost = (u64::from(points) * weight_sum).div_ceil(u64::from(max_strength.max(1))) as u32;
+            (t, (points, cost))
+        })
+        .collect()
+}
+
+/// Делит запас `available` между запросами `costs`: хватает на всех — каждому его запрос, иначе доля
+/// `запрос * запас / сумма` с округлением вниз, а остаток раздаётся по одному в порядке следования.
+pub fn share_stock(costs: &[u32], available: u32) -> Vec<u32> {
+    let total: u64 = costs.iter().map(|&c| u64::from(c)).sum();
+    if total <= u64::from(available) {
+        return costs.to_vec();
+    }
+    let mut grants: Vec<u32> =
+        costs.iter().map(|&c| (u64::from(c) * u64::from(available) / total) as u32).collect();
+    let mut rest = u64::from(available) - grants.iter().map(|&g| u64::from(g)).sum::<u64>();
+    for (grant, &cost) in grants.iter_mut().zip(costs) {
+        if rest == 0 {
+            break;
+        }
+        if *grant < cost {
+            *grant += 1;
+            rest -= 1;
+        }
+    }
+    grants
+}
+
+/// Запрос одной дивизии в расчёте суток.
+struct DivisionRequest {
+    id: u32,
+    entity: Entity,
+    /// Нужды в снаряжении нет вообще (шаблон ничего не требует) — прочность восстанавливается даром.
+    free_points: u32,
+    per_type: BTreeMap<EquipmentType, (u32, u32)>,
+}
+
+/// Суточное пополнение. Снабжённые дивизии с неполной прочностью запрашивают до 50 очков в сутки.
+/// Запрос раскладывается по типам снаряжения в долях потребности шаблона; каждый тип берётся с
+/// собственного склада страны и ограничен им: если танков нет, а винтовки есть, пополняются только
+/// пехотная и моторизованная части дивизии, а нехватка танков сдерживает рост общей прочности.
+/// Отрезанные от снабжения дивизии не получают ничего. При нехватке типа его запас делится между
+/// дивизиями пропорционально запросам (остаток — по порядку id). Всё детерминировано.
 fn daily_reinforcement(
     mut events: EventReader<DailyTickEvent>,
     mut economies: ResMut<Economies>,
@@ -278,17 +531,15 @@ fn daily_reinforcement(
 ) {
     for _ in events.read() {
         for eco in economies.0.values_mut() {
-            eco.reinforce_cost = 0;
+            eco.reinforce_cost.clear();
         }
 
-        // Запросы по владельцам: (id дивизии, сущность, запрошено снаряжения, запрошено прочности).
-        // Стоимость пополнения берётся из шаблона: снаряжения на единицу прочности =
-        // total_required_equipment / max_strength (для пехоты 1:1), округление вверх.
-        let mut requests: BTreeMap<String, Vec<(u32, Entity, u32, u32)>> = BTreeMap::new();
+        let mut requests: BTreeMap<String, Vec<DivisionRequest>> = BTreeMap::new();
         let mut cut_off: BTreeMap<String, u32> = BTreeMap::new();
-        for (entity, d) in divisions.iter() {
+        for (entity, mut d) in divisions.iter_mut() {
             let deficit = d.max_strength.saturating_sub(d.current_strength);
             if deficit == 0 {
+                d.equipment_shortage.clear();
                 continue;
             }
             if !d.is_supplied {
@@ -296,9 +547,14 @@ fn daily_reinforcement(
                 continue;
             }
             let strength_request = deficit.min(REINFORCE_PER_DIVISION_PER_DAY);
-            let equipment_request = (u64::from(strength_request) * u64::from(d.required_equipment))
-                .div_ceil(u64::from(d.max_strength.max(1))) as u32;
-            requests.entry(d.owner.clone()).or_default().push((d.id, entity, equipment_request, strength_request));
+            let per_type = division_request(strength_request, &d.equipment_needs, d.max_strength);
+            let free_points = if per_type.is_empty() { strength_request } else { 0 };
+            requests.entry(d.owner.clone()).or_default().push(DivisionRequest {
+                id: d.id,
+                entity,
+                free_points,
+                per_type,
+            });
         }
 
         for (tag, skipped) in &cut_off {
@@ -307,57 +563,66 @@ fn daily_reinforcement(
 
         for (tag, mut list) in requests {
             let Some(eco) = economies.0.get_mut(&tag) else { continue };
-            list.sort_unstable_by_key(|&(id, ..)| id);
+            list.sort_unstable_by_key(|r| r.id);
 
-            let available = u64::try_from(eco.infantry_equipment_stockpile.max(0)).unwrap_or(0);
-            let total: u64 = list.iter().map(|&(_, _, r, _)| u64::from(r)).sum();
-
-            let grants: Vec<u32> = if total <= available {
-                list.iter().map(|&(_, _, r, _)| r).collect()
-            } else {
-                // Нехватка: доля = запрос * склад / сумма запросов (с округлением вниз)
-                let mut g: Vec<u32> =
-                    list.iter().map(|&(_, _, r, _)| (u64::from(r) * available / total) as u32).collect();
-                let mut rest = available - g.iter().map(|&x| u64::from(x)).sum::<u64>();
-                for (grant, &(_, _, r, _)) in g.iter_mut().zip(&list) {
-                    if rest == 0 {
-                        break;
-                    }
-                    if *grant < r {
-                        *grant += 1;
-                        rest -= 1;
-                    }
-                }
-                g
-            };
-
-            let mut spent = 0u64;
-            for (&(_, entity, request_eq, strength_request), &grant) in list.iter().zip(&grants) {
-                // Прирост прочности пропорционален выданной доле снаряжения
-                let gain = if request_eq == 0 || grant >= request_eq {
-                    strength_request
-                } else {
-                    (u64::from(grant) * u64::from(strength_request) / u64::from(request_eq)) as u32
-                };
-                if gain == 0 {
+            // Выдача по каждому типу отдельно: grants[тип][i] — единицы, выданные i-й дивизии
+            let mut grants: BTreeMap<EquipmentType, Vec<u32>> = BTreeMap::new();
+            let mut short_types: BTreeSet<EquipmentType> = BTreeSet::new();
+            for equipment in EquipmentType::ALL {
+                let costs: Vec<u32> =
+                    list.iter().map(|r| r.per_type.get(&equipment).map_or(0, |&(_, cost)| cost)).collect();
+                if costs.iter().all(|&c| c == 0) {
                     continue;
                 }
-                if let Ok((_, mut d)) = divisions.get_mut(entity) {
-                    d.current_strength = (d.current_strength + gain).min(d.max_strength);
-                    spent += u64::from(grant);
+                let given = share_stock(&costs, eco.stock(equipment));
+                if given.iter().zip(&costs).any(|(g, c)| g < c) {
+                    short_types.insert(equipment);
+                }
+                grants.insert(equipment, given);
+            }
+
+            let mut spent: BTreeMap<EquipmentType, u32> = BTreeMap::new();
+            for (i, request) in list.iter().enumerate() {
+                let mut gain = request.free_points;
+                let mut lacking = BTreeSet::new();
+                for (&equipment, &(points, cost)) in &request.per_type {
+                    let grant = grants.get(&equipment).map_or(0, |g| g[i]);
+                    // Прирост по типу пропорционален выданной доле снаряжения
+                    let part = if cost == 0 || grant >= cost {
+                        points
+                    } else {
+                        (u64::from(grant) * u64::from(points) / u64::from(cost)) as u32
+                    };
+                    if grant < cost {
+                        lacking.insert(equipment);
+                    }
+                    if part > 0 {
+                        gain += part;
+                        *spent.entry(equipment).or_default() += grant;
+                    }
+                }
+                if let Ok((_, mut d)) = divisions.get_mut(request.entity) {
+                    if gain > 0 {
+                        d.current_strength = (d.current_strength + gain).min(d.max_strength);
+                    }
+                    d.equipment_shortage = lacking;
                 }
             }
 
-            let spent_i32 = i32::try_from(spent).unwrap_or(i32::MAX);
-            eco.infantry_equipment_stockpile = eco.infantry_equipment_stockpile.saturating_sub(spent_i32);
-            eco.reinforce_cost = spent_i32;
-            if spent > 0 {
-                let note = if total > available { " (нехватка винтовок)" } else { "" };
-                println!(
-                    "[СНАБЖЕНИЕ] {tag}: пополнено дивизий: {}, винтовок: {spent}, остаток на складе: {}{note}",
-                    grants.iter().filter(|&&g| g > 0).count(),
-                    eco.infantry_equipment_stockpile
-                );
+            for (&equipment, &amount) in &spent {
+                let stock = eco.stock(equipment).saturating_sub(amount);
+                eco.set_stock(equipment, stock);
+                eco.reinforce_cost.insert(equipment, amount);
+            }
+            if !spent.is_empty() {
+                let spent_text: Vec<String> =
+                    spent.iter().map(|(t, n)| format!("{} {n}", t.label())).collect();
+                let short_text: Vec<&str> = short_types.iter().map(|t| t.label()).collect();
+                let note = if short_text.is_empty() { String::new() } else { format!(" (нехватка: {})", short_text.join(", ")) };
+                println!("[СНАБЖЕНИЕ] {tag}: пополнено, потрачено: {}{note}", spent_text.join(", "));
+            } else if !short_types.is_empty() {
+                let short_text: Vec<&str> = short_types.iter().map(|t| t.label()).collect();
+                println!("[СНАБЖЕНИЕ] {tag}: пополнение не выдано, нет на складе: {}", short_text.join(", "));
             }
         }
     }
@@ -366,6 +631,19 @@ fn daily_reinforcement(
 // ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
+
+/// Остатки ключевых типов для верхней панели: `Винтовки: 5000 (+120 / -50 день) | Танки: 600 | Пушки: 300`.
+pub fn stockpile_text(eco: &CountryEconomy) -> String {
+    let tanks = eco.stock(EquipmentType::LightTank) + eco.stock(EquipmentType::MediumTank);
+    format!(
+        "📦 Винтовки: {} (+{} / -{} день) | Танки: {} | Пушки: {}",
+        eco.stock(EquipmentType::InfantryEquipment),
+        eco.output_of(EquipmentType::InfantryEquipment),
+        eco.cost_of(EquipmentType::InfantryEquipment),
+        tanks,
+        eco.stock(EquipmentType::Artillery)
+    )
+}
 
 /// Верхняя плашка: фабрики и склад страны игрока.
 fn economy_bar(
@@ -385,18 +663,50 @@ fn economy_bar(
         .show(ctx, |ui| match economies.0.get(&player.0) {
             Some(eco) => {
                 ui.label(format!(
-                    "[{}] 🏭 Фабрики: {} | 🔨 Военные заводы: {} | 📦 Винтовки: {} (+{} / -{} день) | {}",
+                    "[{}] 🏭 Фабрики: {} | 🔨 Военные заводы: {} | {} | {}",
                     player.0,
                     eco.civilian_factories,
                     eco.military_factories,
-                    eco.infantry_equipment_stockpile,
-                    eco.daily_production,
-                    eco.reinforce_cost,
+                    stockpile_text(eco),
                     army_xp_text(experience.get(&player.0))
                 ));
             }
             None => {
                 ui.label(format!("[{}] нет данных об экономике | {}", player.0, army_xp_text(experience.get(&player.0))));
+            }
+        });
+}
+
+/// Окно производственных линий страны игрока: на каждом типе кнопки «−» и «+» меняют число заводов.
+fn production_panel(
+    mut contexts: EguiContexts,
+    economies: Res<Economies>,
+    player: Res<PlayerCountry>,
+    mut orders: EventWriter<SetProductionLine>,
+) {
+    let Some(ctx) = contexts.try_ctx_mut() else { return };
+    let Some(eco) = economies.0.get(&player.0) else { return };
+    let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
+    let working = eco.effective_factories();
+
+    egui::Window::new("Производство")
+        .anchor(egui::Align2::RIGHT_TOP, [-10.0, 52.0])
+        .resizable(false)
+        .collapsible(true)
+        .frame(frame)
+        .show(ctx, |ui| {
+            ui.label(format!("Свободных заводов: {} из {}", eco.free_factories(), eco.military_factories));
+            for equipment in EquipmentType::ALL {
+                let factories = working.iter().find(|(t, _)| *t == equipment).map_or(0, |&(_, n)| n);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(factories > 0, egui::Button::new("−")).clicked() {
+                        orders.send(SetProductionLine { country: player.0.clone(), equipment, factories: factories - 1 });
+                    }
+                    if ui.add_enabled(eco.free_factories() > 0, egui::Button::new("+")).clicked() {
+                        orders.send(SetProductionLine { country: player.0.clone(), equipment, factories: factories + 1 });
+                    }
+                    ui.label(format!("{}: {} зав. (+{}/день)", equipment.label(), factories, eco.output_of(equipment)));
+                });
             }
         });
 }
@@ -528,20 +838,27 @@ mod tests {
 #[cfg(test)]
 mod reinforcement_tests {
     use super::*;
-    use crate::units::{DivisionTemplates, BASE_TEMPLATE};
+    use crate::units::{DivisionTemplates, BASE_TEMPLATE, PLAIN_INFANTRY_TEMPLATE};
 
-    fn spawn_division(app: &mut App, id: u32, province: u32, strength: u32) -> Entity {
+    use EquipmentType::*;
+
+    fn spawn_division(app: &mut App, id: u32, province: u32, strength: u32, template: &str) -> Entity {
         let templates = DivisionTemplates::default();
         let mut d = Division::from_template(
             id,
             format!("Div {id}"),
             "GER".to_string(),
             province,
-            BASE_TEMPLATE.to_string(),
-            templates.get_or_base(BASE_TEMPLATE),
+            template.to_string(),
+            templates.get_or_base(template),
         );
         d.current_strength = strength;
         app.world_mut().spawn(d).id()
+    }
+
+    /// Пехота без поддержки: 1 винтовка на очко прочности — удобные круглые числа.
+    fn plain(app: &mut App, id: u32, province: u32, strength: u32) -> Entity {
+        spawn_division(app, id, province, strength, PLAIN_INFANTRY_TEMPLATE)
     }
 
     fn set_supplied(app: &mut App, e: Entity, supplied: bool) {
@@ -552,9 +869,12 @@ mod reinforcement_tests {
         app.world().get::<Division>(e).unwrap().current_strength
     }
 
-    fn stock(app: &App) -> (i32, i32) {
-        let eco = &app.world().resource::<Economies>().0["GER"];
-        (eco.infantry_equipment_stockpile, eco.reinforce_cost)
+    fn eco(app: &App) -> &CountryEconomy {
+        &app.world().resource::<Economies>().0["GER"]
+    }
+
+    fn stock(app: &App, equipment: EquipmentType) -> u32 {
+        eco(app).stock(equipment)
     }
 
     fn day(app: &mut App) {
@@ -562,13 +882,22 @@ mod reinforcement_tests {
         app.update();
     }
 
-    /// Приложение с одной экономикой GER и заданным запасом винтовок.
-    fn app_with_stock(stockpile: i32) -> App {
+    /// Приложение с экономикой GER: заданный запас пехотного снаряжения, остальные типы — нули.
+    fn app_with_stock(infantry: u32) -> App {
+        app_with_stocks(&[(InfantryEquipment, infantry)])
+    }
+
+    fn app_with_stocks(stocks: &[(EquipmentType, u32)]) -> App {
         let mut app = App::new();
-        let mut eco = CountryEconomy::new(10, 10);
-        eco.infantry_equipment_stockpile = stockpile;
+        let mut economy = CountryEconomy::new(10, 10);
+        for t in EquipmentType::ALL {
+            economy.set_stock(t, 0);
+        }
+        for &(t, n) in stocks {
+            economy.set_stock(t, n);
+        }
         app.add_event::<DailyTickEvent>()
-            .insert_resource(Economies(BTreeMap::from([("GER".to_string(), eco)])))
+            .insert_resource(Economies(BTreeMap::from([("GER".to_string(), economy)])))
             .add_systems(Update, daily_reinforcement);
         app
     }
@@ -576,49 +905,108 @@ mod reinforcement_tests {
     #[test]
     fn supplied_division_is_reinforced_from_the_stockpile() {
         let mut app = app_with_stock(1000);
-        let d = spawn_division(&mut app, 1, 1, 800);
+        let d = plain(&mut app, 1, 1, 800);
         day(&mut app);
         // до 50 единиц прочности в сутки, по винтовке на единицу
         assert_eq!(strength(&app, d), 850);
-        assert_eq!(stock(&app), (950, 50));
+        assert_eq!((stock(&app, InfantryEquipment), eco(&app).cost_of(InfantryEquipment)), (950, 50));
         // второй день: остаток дефицита 50 -> полностью укомплектована
         day(&mut app);
         assert_eq!(strength(&app, d), 900);
-        assert_eq!(stock(&app), (900, 50));
+        assert_eq!((stock(&app, InfantryEquipment), eco(&app).cost_of(InfantryEquipment)), (900, 50));
         // полный состав больше ничего не просит
         day(&mut app);
-        assert_eq!(stock(&app), (900, 0));
+        assert_eq!((stock(&app, InfantryEquipment), eco(&app).cost_of(InfantryEquipment)), (900, 0));
     }
 
     #[test]
     fn cut_off_division_gets_nothing_and_costs_nothing() {
         let mut app = app_with_stock(1000);
-        let d = spawn_division(&mut app, 1, 1, 700);
+        let d = plain(&mut app, 1, 1, 700);
         set_supplied(&mut app, d, false);
         let before = app.world().get::<Division>(d).unwrap().losses;
         day(&mut app);
         assert_eq!(strength(&app, d), 700, "отрезанной дивизии подкрепления не отправляются");
-        assert_eq!(stock(&app), (1000, 0), "склад не тратится");
+        assert_eq!((stock(&app, InfantryEquipment), eco(&app).cost_of(InfantryEquipment)), (1000, 0));
         assert_eq!(app.world().get::<Division>(d).unwrap().losses, before);
 
         // снабжение восстановилось — пополнение возобновляется
         set_supplied(&mut app, d, true);
         day(&mut app);
         assert_eq!(strength(&app, d), 750);
-        assert_eq!(stock(&app), (950, 50));
+        assert_eq!((stock(&app, InfantryEquipment), eco(&app).cost_of(InfantryEquipment)), (950, 50));
     }
 
     #[test]
     fn cut_off_divisions_do_not_take_a_share_of_a_short_stockpile() {
         // Запас 60 при запросах 2 x 50 от снабжённых: поровну по 30; отрезанная третья не получает ничего
         let mut app = app_with_stock(60);
-        let a = spawn_division(&mut app, 1, 1, 800);
-        let b = spawn_division(&mut app, 2, 1, 800);
-        let cut = spawn_division(&mut app, 3, 1, 800);
+        let a = plain(&mut app, 1, 1, 800);
+        let b = plain(&mut app, 2, 1, 800);
+        let cut = plain(&mut app, 3, 1, 800);
         set_supplied(&mut app, cut, false);
         day(&mut app);
         assert_eq!((strength(&app, a), strength(&app, b), strength(&app, cut)), (830, 830, 800));
-        assert_eq!(stock(&app), (0, 60));
+        assert_eq!((stock(&app, InfantryEquipment), eco(&app).cost_of(InfantryEquipment)), (0, 60));
+    }
+
+    #[test]
+    fn standard_division_draws_every_equipment_type_it_needs() {
+        // потребность стандартной дивизии: 900 пехотного, 10 оснащения, 24 орудия; запрос 50 очков
+        // раскладывается на 48 / 1 / 1, а цена очка 934 / 900 округляется вверх: 50 / 2 / 2
+        let mut app = app_with_stocks(&[(InfantryEquipment, 1000), (SupportEquipment, 100), (Artillery, 100)]);
+        let d = spawn_division(&mut app, 1, 1, 800, BASE_TEMPLATE);
+        day(&mut app);
+        assert_eq!(strength(&app, d), 850);
+        assert_eq!(stock(&app, InfantryEquipment), 950);
+        assert_eq!(stock(&app, SupportEquipment), 98);
+        assert_eq!(stock(&app, Artillery), 98);
+        assert!(app.world().get::<Division>(d).unwrap().equipment_shortage.is_empty());
+    }
+
+    #[test]
+    fn missing_tanks_hold_back_a_tank_division_but_infantry_part_is_refilled() {
+        // танковая дивизия: потребность 200 лёгких танков и 200 пехотного (моторизованные), прочность 300/600
+        let mut app = app_with_stocks(&[(InfantryEquipment, 1000), (LightTank, 0)]);
+        let d = spawn_division(&mut app, 1, 1, 300, "Panzer-Division");
+        day(&mut app);
+        // запрос 50 очков делится 25 / 25; цена очка 400 / 600, то есть по 17 на тип.
+        // Танков нет: растёт только пехотная часть (+25), а не полные +50
+        assert_eq!(strength(&app, d), 325);
+        assert_eq!(stock(&app, InfantryEquipment), 1000 - 17);
+        assert_eq!(stock(&app, LightTank), 0);
+        assert_eq!(eco(&app).cost_of(LightTank), 0, "танки не тратятся, их нет");
+        assert_eq!(app.world().get::<Division>(d).unwrap().equipment_shortage, BTreeSet::from([LightTank]));
+
+        // танки поступили на склад — следующий день пополняет обе части
+        app.world_mut().resource_mut::<Economies>().0.get_mut("GER").unwrap().set_stock(LightTank, 100);
+        day(&mut app);
+        assert_eq!(strength(&app, d), 375, "+25 пехотной части и +25 танковой");
+        assert_eq!(stock(&app, LightTank), 100 - 17);
+        assert!(app.world().get::<Division>(d).unwrap().equipment_shortage.is_empty());
+    }
+
+    #[test]
+    fn partial_tank_stock_gives_a_proportional_share() {
+        // танков 8 из нужных 17: танковая часть получает 8 * 25 / 17 = 11 очков, пехотная — полные 25
+        let mut app = app_with_stocks(&[(InfantryEquipment, 1000), (LightTank, 8)]);
+        let d = spawn_division(&mut app, 1, 1, 300, "Panzer-Division");
+        day(&mut app);
+        assert_eq!(strength(&app, d), 300 + 25 + 11);
+        assert_eq!(stock(&app, LightTank), 0);
+        assert_eq!(eco(&app).cost_of(LightTank), 8);
+    }
+
+    #[test]
+    fn empty_warehouse_reinforces_nothing_and_reports_every_shortage() {
+        let mut app = app_with_stocks(&[]);
+        let d = spawn_division(&mut app, 1, 1, 300, "Panzer-Division");
+        day(&mut app);
+        assert_eq!(strength(&app, d), 300);
+        assert_eq!(
+            app.world().get::<Division>(d).unwrap().equipment_shortage,
+            BTreeSet::from([InfantryEquipment, LightTank])
+        );
     }
 
     #[test]
@@ -626,10 +1014,10 @@ mod reinforcement_tests {
         // Хаб в провинции 1 снабжает 1 и 2; провинция 9 далеко от любого хаба
         let mut app = App::new();
         let neighbors = BTreeMap::from([(1, BTreeSet::from([2])), (2, BTreeSet::from([1]))]);
-        let mut eco = CountryEconomy::new(10, 10);
-        eco.infantry_equipment_stockpile = 1000;
+        let mut economy = CountryEconomy::new(10, 10);
+        economy.set_stock(InfantryEquipment, 1000);
         app.add_event::<DailyTickEvent>()
-            .insert_resource(Economies(BTreeMap::from([("GER".to_string(), eco)])))
+            .insert_resource(Economies(BTreeMap::from([("GER".to_string(), economy)])))
             .insert_resource(SupplyNetwork { hubs: BTreeSet::from([1]), coverage: BTreeMap::new() })
             .insert_resource(ProvinceControllers(BTreeMap::from([
                 (1, "GER".to_string()),
@@ -647,16 +1035,199 @@ mod reinforcement_tests {
                 ),
             );
 
-        let connected = spawn_division(&mut app, 1, 2, 800);
-        let isolated = spawn_division(&mut app, 2, 9, 800);
+        let connected = plain(&mut app, 1, 2, 800);
+        let isolated = plain(&mut app, 2, 9, 800);
 
         day(&mut app);
         // подключённая: снабжена, +50; изолированная в тот же день отмечена как отрезанная,
-        // теряет 2% (16) и подкрепления не получает
+        // теряет 2% (16) и подкреплений не получает
         assert_eq!(strength(&app, connected), 850);
         assert_eq!(strength(&app, isolated), 784);
         assert!(!app.world().get::<Division>(isolated).unwrap().is_supplied);
-        assert_eq!(stock(&app), (950, 50));
+        assert_eq!((stock(&app, InfantryEquipment), eco(&app).cost_of(InfantryEquipment)), (950, 50));
+    }
+}
+
+#[cfg(test)]
+mod equipment_tests {
+    use super::*;
+
+    use EquipmentType::*;
+
+    fn needs(pairs: &[(EquipmentType, u32)]) -> BTreeMap<EquipmentType, u32> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn split_by_weights_always_sums_to_total_and_is_deterministic() {
+        // 50 очков по весам 900 / 10 / 24: целые 48 / 0 / 1, остаток 1 уходит типу с наибольшим дробным остатком
+        let split = split_by_weights(50, &needs(&[(InfantryEquipment, 900), (SupportEquipment, 10), (Artillery, 24)]));
+        assert_eq!(split, needs(&[(InfantryEquipment, 48), (SupportEquipment, 1), (Artillery, 1)]));
+        // ровно пополам, нечётный остаток — по порядку типов при равных остатках
+        let tie = split_by_weights(51, &needs(&[(InfantryEquipment, 200), (LightTank, 200)]));
+        assert_eq!(tie, needs(&[(InfantryEquipment, 26), (LightTank, 25)]));
+        for total in 0..200 {
+            let parts = split_by_weights(total, &needs(&[(InfantryEquipment, 7), (Artillery, 3), (LightTank, 11)]));
+            assert_eq!(parts.values().sum::<u32>(), total);
+        }
+        assert!(split_by_weights(50, &BTreeMap::new()).is_empty());
+        assert_eq!(split_by_weights(0, &needs(&[(Artillery, 5)])), needs(&[(Artillery, 0)]));
+    }
+
+    #[test]
+    fn division_request_prices_each_type_by_the_same_ratio() {
+        // стандартная дивизия: W = 934, прочность 900 -> 50 очков = 48 / 1 / 1, цена 50 / 2 / 2
+        let request = division_request(
+            50,
+            &needs(&[(InfantryEquipment, 900), (SupportEquipment, 10), (Artillery, 24)]),
+            900,
+        );
+        assert_eq!(
+            request,
+            BTreeMap::from([(InfantryEquipment, (48, 50)), (SupportEquipment, (1, 2)), (Artillery, (1, 2))])
+        );
+        // без потребности запроса нет
+        assert!(division_request(50, &BTreeMap::new(), 900).is_empty());
+        // нулевая максимальная прочность не вызывает деления на ноль
+        assert_eq!(division_request(10, &needs(&[(Artillery, 5)]), 0), BTreeMap::from([(Artillery, (10, 50))]));
+    }
+
+    #[test]
+    fn share_stock_splits_proportionally_with_remainder_in_order() {
+        assert_eq!(share_stock(&[50, 50], 1000), vec![50, 50], "хватает всем");
+        assert_eq!(share_stock(&[50, 50, 50], 60), vec![20, 20, 20]);
+        // 100 / 3 -> по 33, остаток 1 первому из тех, у кого есть место
+        assert_eq!(share_stock(&[50, 50, 50], 100), vec![34, 33, 33]);
+        assert_eq!(share_stock(&[50, 50], 0), vec![0, 0]);
+        assert_eq!(share_stock(&[], 10), Vec::<u32>::new());
+        assert_eq!(share_stock(&[0, 30], 10), vec![0, 10], "нулевой запрос ничего не получает");
+    }
+
+    #[test]
+    fn start_stock_and_labels() {
+        let eco = CountryEconomy::new(5, 10);
+        assert_eq!(eco.stock(InfantryEquipment), 5000);
+        assert_eq!((eco.stock(SupportEquipment), eco.stock(Artillery), eco.stock(LightTank), eco.stock(MediumTank)), (500, 300, 600, 0));
+        assert_eq!(InfantryEquipment.label(), "Винтовки");
+        assert_eq!(Artillery.label(), "Пушки");
+        // выход одного завода: 5 винтовок, 1 орудие или 1 танк
+        assert_eq!(
+            (InfantryEquipment.output_per_factory(), Artillery.output_per_factory(), LightTank.output_per_factory(), MediumTank.output_per_factory()),
+            (5, 1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn start_lines_use_all_military_factories_and_never_exceed_them() {
+        for mil in [0, 1, 3, 4, 10, 37, 100] {
+            let eco = CountryEconomy::new(0, mil);
+            let assigned: u32 = eco.production_lines.iter().map(|l| l.assigned_factories).sum();
+            assert_eq!(assigned, mil, "{mil} заводов распределены без остатка");
+            assert_eq!(eco.free_factories(), 0);
+        }
+        // 10 заводов: 15% -> 1 пушки, 25% -> 2 лёгких танка, 10% -> 1 оснащения, остаток до 10 — винтовки (6)
+        let eco = CountryEconomy::new(0, 10);
+        let lines: BTreeMap<_, _> = eco.production_lines.iter().map(|l| (l.equipment, l.assigned_factories)).collect();
+        assert_eq!(lines[&InfantryEquipment], 6);
+        assert_eq!((lines[&SupportEquipment], lines[&Artillery], lines[&LightTank], lines[&MediumTank]), (1, 1, 2, 0));
+        assert_eq!((eco.output_of(InfantryEquipment), eco.output_of(LightTank), eco.output_of(Artillery)), (30, 2, 1));
+    }
+
+    #[test]
+    fn assign_factories_respects_the_military_factory_limit() {
+        let mut eco = CountryEconomy::new(0, 10);
+        // заводы все заняты: на средние танки свободных нет
+        assert_eq!(eco.assign_factories(MediumTank, 3), 0);
+        // освобождаем 4 завода на винтовках — теперь 3 уходят в средние танки, ещё 1 свободен
+        assert_eq!(eco.assign_factories(InfantryEquipment, 2), 2);
+        assert_eq!(eco.free_factories(), 4);
+        assert_eq!(eco.assign_factories(MediumTank, 3), 3);
+        assert_eq!(eco.free_factories(), 1);
+        assert_eq!(eco.output_of(MediumTank), 3);
+        // запрос больше лимита обрезается до свободного (1 свободный + 3 уже на линии)
+        assert_eq!(eco.assign_factories(MediumTank, 100), 4);
+        assert_eq!(eco.free_factories(), 0);
+        // общая сумма заводов на линиях не больше лимита
+        let total: u32 = eco.production_lines.iter().map(|l| l.assigned_factories).sum();
+        assert!(total <= eco.military_factories);
+    }
+
+    #[test]
+    fn oversubscribed_lines_are_clamped_when_producing() {
+        let mut eco = CountryEconomy::new(0, 10);
+        eco.production_lines = vec![
+            ProductionLine { equipment: InfantryEquipment, assigned_factories: 8 },
+            ProductionLine { equipment: LightTank, assigned_factories: 8 },
+        ];
+        eco.recalc_daily_output();
+        // винтовки заняли 8 из 10; на танки остаётся 2
+        assert_eq!(eco.effective_factories(), vec![(InfantryEquipment, 8), (LightTank, 2)]);
+        assert_eq!((eco.output_of(InfantryEquipment), eco.output_of(LightTank)), (40, 2));
+        assert_eq!(eco.free_factories(), 0);
+    }
+
+    fn production_app() -> App {
+        let mut app = App::new();
+        let mut eco = CountryEconomy::new(0, 10);
+        for t in EquipmentType::ALL {
+            eco.set_stock(t, 0);
+        }
+        app.add_event::<DailyTickEvent>()
+            .add_event::<SetProductionLine>()
+            .insert_resource(Economies(BTreeMap::from([("GER".to_string(), eco)])))
+            .add_systems(Update, (apply_production_orders, daily_production.after(apply_production_orders)));
+        app
+    }
+
+    fn day(app: &mut App) {
+        app.world_mut().send_event(DailyTickEvent { day: 1, month: 1, year: 1936 });
+        app.update();
+    }
+
+    #[test]
+    fn daily_production_fills_each_stockpile_from_its_line() {
+        let mut app = production_app();
+        day(&mut app);
+        let eco = &app.world().resource::<Economies>().0["GER"];
+        // линии 10 заводов: винтовки 6 * 5, оснащение 1 * 3, пушки 1 * 1, лёгкие танки 2 * 1, средние 0
+        assert_eq!(eco.stock(InfantryEquipment), 30);
+        assert_eq!(eco.stock(SupportEquipment), 3);
+        assert_eq!(eco.stock(Artillery), 1);
+        assert_eq!(eco.stock(LightTank), 2);
+        assert_eq!(eco.stock(MediumTank), 0);
+        day(&mut app);
+        assert_eq!(app.world().resource::<Economies>().0["GER"].stock(InfantryEquipment), 60, "выход накапливается");
+    }
+
+    #[test]
+    fn production_orders_move_factories_between_lines_within_the_limit() {
+        let mut app = production_app();
+        // переводим 4 завода с винтовок на средние танки; сверх свободных — не больше лимита
+        app.world_mut().send_event(SetProductionLine { country: "GER".into(), equipment: InfantryEquipment, factories: 2 });
+        app.update();
+        app.world_mut().send_event(SetProductionLine { country: "GER".into(), equipment: MediumTank, factories: 50 });
+        app.update();
+        let eco = &app.world().resource::<Economies>().0["GER"];
+        assert_eq!(eco.free_factories(), 0);
+        assert_eq!(eco.output_of(MediumTank), 4, "6 -> 2 освободило 4 завода, остальное обрезано лимитом");
+        let total: u32 = eco.production_lines.iter().map(|l| l.assigned_factories).sum();
+        assert_eq!(total, 10);
+        // неизвестная страна приказ игнорирует без паники
+        app.world_mut().send_event(SetProductionLine { country: "XXX".into(), equipment: Artillery, factories: 1 });
+        app.update();
+        day(&mut app);
+        assert_eq!(app.world().resource::<Economies>().0["GER"].stock(MediumTank), 4);
+    }
+
+    #[test]
+    fn top_panel_shows_rifles_tanks_and_guns() {
+        let mut eco = CountryEconomy::new(0, 10);
+        eco.set_stock(InfantryEquipment, 1234);
+        eco.set_stock(LightTank, 40);
+        eco.set_stock(MediumTank, 2);
+        eco.set_stock(Artillery, 77);
+        eco.reinforce_cost.insert(InfantryEquipment, 50);
+        assert_eq!(stockpile_text(&eco), "📦 Винтовки: 1234 (+30 / -50 день) | Танки: 42 | Пушки: 77");
     }
 }
 
