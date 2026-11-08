@@ -67,6 +67,58 @@ pub struct Economies(pub BTreeMap<String, CountryEconomy>);
 #[derive(Resource)]
 pub struct PlayerCountry(pub String);
 
+/// Стартовый армейский опыт Германии и Франции.
+const START_ARMY_XP: u32 = 10;
+/// Потолок армейского опыта.
+pub const MAX_ARMY_XP: u32 = 500;
+/// Сколько суммарных дивизионо-часов боя на линии даёт 1 единицу опыта.
+const COMBAT_HOURS_PER_XP: u32 = 24;
+
+/// Армейский опыт по странам. Растёт от боевого времени дивизий на линии и не превышает MAX_ARMY_XP.
+#[derive(Resource, Debug, Clone)]
+pub struct ArmyExperience {
+    /// Страна -> опыт (0..=500). BTreeMap — детерминированный порядок.
+    pub xp_by_country: BTreeMap<String, u32>,
+    /// Накопленные, ещё не превращённые в опыт дивизионо-часы боя (остаток меньше 24).
+    combat_hours: BTreeMap<String, u32>,
+}
+
+impl Default for ArmyExperience {
+    fn default() -> Self {
+        let xp_by_country = ["GER", "FRA"].into_iter().map(|c| (c.to_string(), START_ARMY_XP)).collect();
+        Self { xp_by_country, combat_hours: BTreeMap::new() }
+    }
+}
+
+impl ArmyExperience {
+    pub fn get(&self, country: &str) -> u32 {
+        self.xp_by_country.get(country).copied().unwrap_or(0)
+    }
+
+    /// Начисляет опыт с потолком MAX_ARMY_XP.
+    pub fn add(&mut self, country: &str, amount: u32) {
+        let xp = self.xp_by_country.entry(country.to_string()).or_insert(0);
+        *xp = xp.saturating_add(amount).min(MAX_ARMY_XP);
+    }
+
+    /// Один час боя: ighting_divisions дивизий страны стоят на линии. Каждые 24 накопленных
+    /// дивизионо-часа дают +1 опыта; остаток переносится на следующие часы.
+    pub fn record_combat_hour(&mut self, country: &str, fighting_divisions: u32) {
+        let pending = self.combat_hours.entry(country.to_string()).or_insert(0);
+        *pending += fighting_divisions;
+        let gained = *pending / COMBAT_HOURS_PER_XP;
+        *pending %= COMBAT_HOURS_PER_XP;
+        if gained > 0 {
+            self.add(country, gained);
+        }
+    }
+}
+
+/// Строка опыта для верхней панели.
+pub fn army_xp_text(xp: u32) -> String {
+    format!("XP Армии: {xp}")
+}
+
 /// Сеть снабжения: хабы и зона покрытия.
 /// Хаб снабжает нацию, которая контролирует его провинцию сейчас: волна идёт по графу смежности
 /// на `SUPPLY_RADIUS` шагов только по суше под контролем той же нации, провинции противника
@@ -143,6 +195,7 @@ pub struct EconomyPlugin;
 impl Plugin for EconomyPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Economies>()
+            .init_resource::<ArmyExperience>()
             .init_resource::<SupplyNetwork>()
             .insert_resource(PlayerCountry(DEFAULT_PLAYER_COUNTRY.to_string()))
             .add_systems(Startup, (init_economies, init_supply_network))
@@ -315,7 +368,12 @@ fn daily_reinforcement(
 // ---------------------------------------------------------------------------
 
 /// Верхняя плашка: фабрики и склад страны игрока.
-fn economy_bar(mut contexts: EguiContexts, economies: Res<Economies>, player: Res<PlayerCountry>) {
+fn economy_bar(
+    mut contexts: EguiContexts,
+    economies: Res<Economies>,
+    player: Res<PlayerCountry>,
+    experience: Res<ArmyExperience>,
+) {
     let Some(ctx) = contexts.try_ctx_mut() else { return };
     let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
 
@@ -327,17 +385,18 @@ fn economy_bar(mut contexts: EguiContexts, economies: Res<Economies>, player: Re
         .show(ctx, |ui| match economies.0.get(&player.0) {
             Some(eco) => {
                 ui.label(format!(
-                    "[{}] 🏭 Фабрики: {} | 🔨 Военные заводы: {} | 📦 Винтовки: {} (+{} / -{} день)",
+                    "[{}] 🏭 Фабрики: {} | 🔨 Военные заводы: {} | 📦 Винтовки: {} (+{} / -{} день) | {}",
                     player.0,
                     eco.civilian_factories,
                     eco.military_factories,
                     eco.infantry_equipment_stockpile,
                     eco.daily_production,
-                    eco.reinforce_cost
+                    eco.reinforce_cost,
+                    army_xp_text(experience.get(&player.0))
                 ));
             }
             None => {
-                ui.label(format!("[{}] нет данных об экономике", player.0));
+                ui.label(format!("[{}] нет данных об экономике | {}", player.0, army_xp_text(experience.get(&player.0))));
             }
         });
 }
@@ -598,5 +657,59 @@ mod reinforcement_tests {
         assert_eq!(strength(&app, isolated), 784);
         assert!(!app.world().get::<Division>(isolated).unwrap().is_supplied);
         assert_eq!(stock(&app), (950, 50));
+    }
+}
+
+#[cfg(test)]
+mod experience_tests {
+    use super::*;
+
+    #[test]
+    fn army_experience_starts_at_ten_for_germany_and_france() {
+        let xp = ArmyExperience::default();
+        assert_eq!((xp.get("GER"), xp.get("FRA")), (10, 10));
+        assert_eq!(xp.get("ITA"), 0, "прочие страны начинают с нуля");
+    }
+
+    #[test]
+    fn experience_is_capped_at_five_hundred() {
+        let mut xp = ArmyExperience::default();
+        xp.add("GER", 489);
+        assert_eq!(xp.get("GER"), 499);
+        xp.add("GER", 1);
+        assert_eq!(xp.get("GER"), MAX_ARMY_XP);
+        xp.add("GER", 1_000_000);
+        assert_eq!(xp.get("GER"), 500, "потолок 500");
+        xp.add("ITA", 3);
+        assert_eq!(xp.get("ITA"), 3, "новая страна появляется при первом начислении");
+    }
+
+    #[test]
+    fn every_twenty_four_division_hours_give_one_xp_with_carry() {
+        let mut xp = ArmyExperience::default();
+        // 23 дивизионо-часа — опыта ещё нет
+        for _ in 0..23 {
+            xp.record_combat_hour("GER", 1);
+        }
+        assert_eq!(xp.get("GER"), 10);
+        xp.record_combat_hour("GER", 1);
+        assert_eq!(xp.get("GER"), 11);
+        // несколько дивизий на линии копят быстрее: 100 дивизионо-часов за раз = +4, остаток 4
+        xp.record_combat_hour("FRA", 100);
+        assert_eq!(xp.get("FRA"), 14);
+        xp.record_combat_hour("FRA", 20); // остаток 4 + 20 = 24 -> ещё +1
+        assert_eq!(xp.get("FRA"), 15);
+        // страны копят независимо
+        assert_eq!(xp.get("GER"), 11);
+        // на потолке счётчик не переполняется и опыт не растёт
+        xp.add("FRA", 1_000);
+        xp.record_combat_hour("FRA", 480);
+        assert_eq!(xp.get("FRA"), 500);
+    }
+
+    #[test]
+    fn army_xp_text_matches_the_panel_format() {
+        assert_eq!(army_xp_text(10), "XP Армии: 10");
+        assert_eq!(army_xp_text(500), "XP Армии: 500");
     }
 }

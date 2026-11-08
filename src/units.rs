@@ -310,6 +310,15 @@ impl Default for DivisionTemplates {
     }
 }
 
+/// Шаблоны, доступные нации, в порядке показа в интерфейсе. У прочих стран — только базовая пехотная дивизия.
+fn available_template_names(country: &str) -> &'static [&'static str] {
+    match country {
+        "GER" => &[BASE_TEMPLATE, "Infanterie-Division (mot.)", "Panzer-Division"],
+        "FRA" => &[BASE_TEMPLATE, "Infanterie-Division (mot.)"],
+        _ => &[BASE_TEMPLATE],
+    }
+}
+
 impl DivisionTemplates {
     /// Шаблон по имени или базовый, если такого нет в реестре.
     pub fn get_or_base(&self, name: &str) -> &DivisionTemplate {
@@ -317,6 +326,21 @@ impl DivisionTemplates {
             .get(name)
             .or_else(|| self.templates.get(BASE_TEMPLATE))
             .expect("базовый шаблон всегда зарегистрирован")
+    }
+
+    /// Шаблон строго по имени (без подстановки базового): имя -> набор батальонов attalions.
+    pub fn get(&self, name: &str) -> Option<&DivisionTemplate> {
+        self.templates.get(name)
+    }
+
+    /// Имена шаблонов, которые нация может применить к своим дивизиям (только зарегистрированные).
+    pub fn available_names(&self, country: &str) -> Vec<&'static str> {
+        available_template_names(country).iter().copied().filter(|n| self.templates.contains_key(*n)).collect()
+    }
+
+    /// Доступен ли шаблон нации.
+    pub fn is_available(&self, country: &str, name: &str) -> bool {
+        self.available_names(country).contains(&name)
     }
 }
 
@@ -444,6 +468,23 @@ mod tests {
         assert_eq!(template("tanks", &[(BattalionDef::light_tank(), 4)]).calculate_stats().recon, 2);
         assert_eq!(template("medium", &[(BattalionDef::medium_tank(), 3)]).calculate_stats().recon, 1);
         assert_eq!(template("empty", &[]).calculate_stats().recon, 0);
+    }
+
+    #[test]
+    fn registry_maps_names_to_battalions_and_limits_templates_per_nation() {
+        let registry = DivisionTemplates::default();
+        // имя -> набор батальонов: 9 пехотных + сапёры + артиллерия = 11 записей
+        assert_eq!(registry.get(BASE_TEMPLATE).map(|t| t.battalions.len()), Some(11));
+        assert_eq!(registry.get("Panzer-Division").map(|t| t.battalions.len()), Some(6));
+        assert!(registry.get("Нет такого").is_none(), "get не подставляет базовый шаблон");
+        // у Германии есть танковая дивизия, у Франции — нет; прочим странам доступна только пехота
+        assert_eq!(registry.available_names("GER"), vec![BASE_TEMPLATE, "Infanterie-Division (mot.)", "Panzer-Division"]);
+        assert_eq!(registry.available_names("FRA"), vec![BASE_TEMPLATE, "Infanterie-Division (mot.)"]);
+        assert_eq!(registry.available_names("ITA"), vec![BASE_TEMPLATE]);
+        assert!(registry.is_available("GER", "Panzer-Division"));
+        assert!(!registry.is_available("FRA", "Panzer-Division"));
+        // тестовый шаблон без поддержки в списки наций не попадает
+        assert!(!registry.is_available("GER", PLAIN_INFANTRY_TEMPLATE));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::camera::MainCamera;
 use crate::clock::{ClockSet, DailyTickEvent, HourTick};
 use crate::air::{air_attack_bonus_pct, air_defense_penalty_pct, air_status, side_edge, AirSuperiorityMap};
 use crate::command::SKILL_BONUS_PCT;
-use crate::economy::{update_supply_network, SupplyNetwork};
+use crate::economy::{update_supply_network, ArmyExperience, SupplyNetwork};
 use crate::oob::OobDivisions;
 use crate::units::{DivisionTemplate, DivisionTemplates, BASE_TEMPLATE, INFANTRY_SPEED_KPH};
 #[cfg(test)]
@@ -177,6 +177,39 @@ impl Division {
         self.losses = self.losses.saturating_add(lost);
     }
 
+    /// Переформирование по новому шаблону: характеристики берутся из `calculate_stats()`,
+    /// окопанность обнуляется, текущая организация делится пополам (и не выше нового максимума),
+    /// а прочность сохраняет свою долю от максимума. Накопленные потери, планирование и снабжение остаются.
+    pub fn refit(&mut self, template: &DivisionTemplate) {
+        let stats = template.calculate_stats();
+        let old_max = u64::from(self.max_strength.max(1));
+        let scaled = (u64::from(self.current_strength) * u64::from(stats.max_strength) / old_max) as u32;
+        self.current_strength = if self.current_strength == 0 { 0 } else { scaled.max(1).min(stats.max_strength) };
+        self.current_org = (self.current_org / 2).min(stats.max_org);
+        self.org_frac = 0;
+        self.entrenchment = 0;
+        self.path.clear();
+
+        self.template_name = template.name.clone();
+        self.battalion_count = template.battalion_count();
+        self.max_org = stats.max_org;
+        self.max_strength = stats.max_strength;
+        self.max_manpower = stats.total_manpower;
+        self.required_equipment = stats.total_required_equipment;
+        self.soft_attack = stats.soft_attack;
+        self.hard_attack = stats.hard_attack;
+        self.defense = stats.defense;
+        self.combat_width = stats.combat_width;
+        self.max_speed = stats.max_speed;
+        self.armor = stats.armor;
+        self.piercing = stats.piercing;
+        self.hardness = stats.hardness;
+        self.recon = stats.recon;
+        self.max_entrenchment = stats.max_entrenchment;
+        self.river_penalty_reduction = stats.river_penalty_reduction;
+        self.support = stats.support;
+    }
+
     /// Дивизия в полном составе; все характеристики считает `DivisionTemplate::calculate_stats()`.
     pub fn from_template(
         id: u32,
@@ -265,6 +298,41 @@ pub struct OrderMove {
     pub target: u32,
 }
 
+/// Команда: переформировать дивизию по другому шаблону (Refit). Выдаётся из интерфейса,
+/// применяется в pply_refits.
+#[derive(Event, Debug, Clone)]
+pub struct RefitDivision {
+    pub division: Entity,
+    pub template: String,
+}
+
+/// Применяет команды `RefitDivision`. Шаблон должен быть доступен нации дивизии, а сама дивизия —
+/// стоять на месте и не участвовать в бою: смена ширины посреди боя нарушила бы его учёт.
+fn apply_refits(
+    mut events: EventReader<RefitDivision>,
+    templates: Res<DivisionTemplates>,
+    mut divisions: Query<&mut Division>,
+    combats: Query<&ActiveCombat>,
+) {
+    for event in events.read() {
+        let Ok(mut d) = divisions.get_mut(event.division) else { continue };
+        let Some(template) = templates.get(&event.template) else {
+            println!("[ПЕРЕФОРМИРОВАНИЕ] Шаблон \"{}\" не найден", event.template);
+            continue;
+        };
+        if !templates.is_available(&d.owner, &event.template) {
+            println!("[ПЕРЕФОРМИРОВАНИЕ] Шаблон \"{}\" недоступен для {}", event.template, d.owner);
+            continue;
+        }
+        if d.movement.is_some() || combats.iter().any(|c| c.involves(event.division)) {
+            println!("[ПЕРЕФОРМИРОВАНИЕ] Дивизия #{} в бою или на марше — шаблон не сменён", d.id);
+            continue;
+        }
+        d.refit(template);
+        println!("[ПЕРЕФОРМИРОВАНИЕ] Дивизия #{} переформирована в \"{}\"", d.id, template.name);
+    }
+}
+
 /// Раз в сутки (00:00), строго после пересчёта сети снабжения (`update_supply_network`):
 /// - дивизия в зоне покрытия хаба своей нации снабжена, счётчик истощения обнуляется; стоящая вне боя
 ///   снабжённая дивизия отдыхает и восстанавливает организацию;
@@ -344,6 +412,7 @@ impl Plugin for DivisionPlugin {
         app.init_resource::<SelectedDivision>()
             .init_resource::<DivisionTemplates>()
             .add_event::<OrderMove>()
+            .add_event::<RefitDivision>()
             // метрики графа считаются сразу после того, как setup_map построил граф смежности
             .add_systems(Startup, (spawn_oob_divisions, init_graph_metrics.after(setup_map)))
             .add_systems(
@@ -365,6 +434,8 @@ impl Plugin for DivisionPlugin {
             )
             .add_systems(Update, (combat_ui, division_info_ui))
             .add_systems(Update, daily_entrenchment.after(ClockSet))
+            // переформирование применяется до боевой цепочки кадра
+            .add_systems(Update, apply_refits.before(CombatSet))
             .add_systems(Update, daily_supply.after(update_supply_network));
     }
 }
@@ -1255,6 +1326,7 @@ fn resolve_combats(
     rivers: Res<ProvinceRivers>,
     registry: Res<StateRegistry>,
     air: Res<AirSuperiorityMap>,
+    mut experience: ResMut<ArmyExperience>,
     mut controllers: ResMut<ProvinceControllers>,
     mut controller_changed: EventWriter<ProvinceControllerChanged>,
 ) {
@@ -1367,6 +1439,9 @@ fn resolve_combats(
             };
 
             if !att_line.is_empty() && !def_line.is_empty() {
+                // Час боя на линии: каждые 24 дивизионо-часа дают стране +1 опыта (резерв не воюет и не считается)
+                experience.record_combat_hour(&state.attacker_owner, att_line.len() as u32);
+                experience.record_combat_hour(&state.defender_owner, def_line.len() as u32);
                 // Все удары считаются по значениям до боя, затем применяются
                 let mut hits: Vec<(Entity, u32, u32)> = Vec::new();
                 let terrain = terrain_modifiers(map.terrain_of(province));
@@ -1814,6 +1889,8 @@ fn division_info_ui(
     divisions: Query<&Division>,
     combats: Query<&ActiveCombat>,
     map: Res<ProvinceMap>,
+    templates: Res<DivisionTemplates>,
+    mut refit_out: EventWriter<RefitDivision>,
 ) {
     let Some(entity) = selected.0 else { return };
     let Ok(d) = divisions.get(entity) else { return };
@@ -1878,6 +1955,21 @@ fn division_info_ui(
             ));
             ui.label(format!("Состояние: {status}"));
             ui.label(format!("Боевая ширина дивизии: {}", d.combat_width));
+            // Смена шаблона: доступна нации, только пока дивизия стоит и не воюет
+            ui.separator();
+            ui.label("Сменить шаблон:");
+            let can_refit = d.movement.is_none() && combat.is_none();
+            ui.horizontal_wrapped(|ui| {
+                for name in templates.available_names(&d.owner) {
+                    if name == d.template_name {
+                        continue;
+                    }
+                    if ui.add_enabled(can_refit, egui::Button::new(name)).clicked() {
+                        refit_out.send(RefitDivision { division: entity, template: name.to_string() });
+                    }
+                }
+            });
+            ui.separator();
             ui.label(format!("Разведка: {}", d.recon));
             if d.is_supplied {
                 ui.label("Снабжение: В норме");
@@ -1986,6 +2078,7 @@ mod tests {
             .init_resource::<ProvinceRivers>()
             .init_resource::<StateRegistry>()
             .init_resource::<AirSuperiorityMap>()
+            .init_resource::<ArmyExperience>()
             .insert_resource(ProvinceAdjacency { neighbors })
             .insert_resource(controllers)
             .add_systems(Update, resolve_combats);
@@ -2296,6 +2389,31 @@ mod tests {
         assert!(soft_vs_armor > soft_vs_soft, "мягкая атака почти не вредит полностью бронированной цели");
         assert!(hard_vs_armor < soft_vs_armor, "жёсткая атака по технике сильнее мягкой");
         assert!(hard_vs_soft > soft_vs_soft, "жёсткая атака по живой силе слабее мягкой");
+    }
+
+    #[test]
+    fn combat_hours_on_the_line_grant_army_experience() {
+        let xp = |app: &App, country: &str| app.world().resource::<ArmyExperience>().get(country);
+        // 4 против 4 на линии: 24 часа по 4 дивизии = 96 дивизионо-часов = +4 опыта каждой стороне
+        let (mut app, _att, _def) = scenario(&[1; 4], 4, 1);
+        assert_eq!((xp(&app, "GER"), xp(&app, "FRA")), (10, 10), "старт: по 10 XP");
+        for _ in 0..23 {
+            tick(&mut app);
+        }
+        assert_eq!((xp(&app, "GER"), xp(&app, "FRA")), (13, 13), "23 часа * 4 = 92 -> +3, остаток 20");
+        tick(&mut app);
+        assert_eq!((xp(&app, "GER"), xp(&app, "FRA")), (14, 14), "остаток переносится: 96 -> +4");
+    }
+
+    #[test]
+    fn reserves_do_not_earn_experience() {
+        // 6 атакующих и 5 защитников, но на линии по 4 (лимит ширины 80): опыт считают только линия
+        let (mut app, _att, _def) = scenario(&[1; 6], 5, 1);
+        for _ in 0..24 {
+            tick(&mut app);
+        }
+        let xp = app.world().resource::<ArmyExperience>();
+        assert_eq!((xp.get("GER"), xp.get("FRA")), (14, 14), "резерв не воюет и опыт не приносит");
     }
 
     #[test]
@@ -2868,5 +2986,162 @@ mod hardness_tests {
         // атака 40: 800 * 40 / 265 = 120; с планированием 30%: 40 * 130 / 100 = 52 -> 800 * 52 / 277 = 150
         assert_eq!(combat_bp(&infantry, &armored, 0), 120);
         assert_eq!(combat_bp(&infantry, &armored, 30), 150);
+    }
+}
+
+#[cfg(test)]
+mod refit_tests {
+    use super::*;
+    use crate::units::BattalionDef;
+
+    fn registered(name: &str) -> Division {
+        let templates = DivisionTemplates::default();
+        Division::from_template(1, "d".into(), "GER".into(), 1, name.to_string(), templates.get_or_base(name))
+    }
+
+    #[test]
+    fn refit_applies_new_stats_resets_entrenchment_and_halves_org() {
+        let templates = DivisionTemplates::default();
+        let panzer = templates.get("Panzer-Division").unwrap();
+
+        let mut d = registered(BASE_TEMPLATE);
+        d.entrenchment = 12;
+        d.current_org = 50;
+        d.current_strength = 450; // половина от 900
+        d.org_frac = 300;
+        d.losses = 77;
+        d.planning = 20;
+        d.path = vec![5, 6];
+        d.refit(panzer);
+
+        // все характеристики пришли из calculate_stats() нового шаблона
+        let stats = panzer.calculate_stats();
+        assert_eq!(d.template_name, "Panzer-Division");
+        assert_eq!(d.battalion_count, 6);
+        assert_eq!((d.max_org, d.max_strength, d.combat_width, d.max_speed), (stats.max_org, 600, 12, 80));
+        assert_eq!((d.soft_attack, d.hard_attack, d.defense), (stats.soft_attack, stats.hard_attack, stats.defense));
+        assert_eq!((d.armor, d.piercing, d.hardness, d.recon), (stats.armor, stats.piercing, 55, 3));
+        assert_eq!((d.max_manpower, d.required_equipment), (stats.total_manpower, stats.total_required_equipment));
+        // поддержки у танковой дивизии нет: окопанность до 10, реки без сапёров
+        assert!(d.support.is_empty());
+        assert_eq!((d.max_entrenchment, d.river_penalty_reduction), (10, 0));
+
+        // реорганизация: окопанность 0, организация вдвое меньше (50 -> 25), дробный остаток сброшен
+        assert_eq!((d.entrenchment, d.current_org, d.org_frac), (0, 25, 0));
+        // прочность сохраняет долю от максимума: 450 / 900 -> 300 / 600
+        assert_eq!(d.current_strength, 300);
+        // потери и планирование не пропадают, отложенный маршрут снят
+        assert_eq!((d.losses, d.planning), (77, 20));
+        assert!(d.path.is_empty());
+    }
+
+    #[test]
+    fn refit_round_trip_restores_template_stats() {
+        let templates = DivisionTemplates::default();
+        let mut d = registered(BASE_TEMPLATE);
+        d.refit(templates.get("Panzer-Division").unwrap());
+        d.refit(templates.get(BASE_TEMPLATE).unwrap());
+        let fresh = registered(BASE_TEMPLATE);
+        assert_eq!(
+            (d.max_org, d.max_strength, d.soft_attack, d.hard_attack, d.combat_width, d.max_speed, d.support.clone()),
+            (fresh.max_org, fresh.max_strength, fresh.soft_attack, fresh.hard_attack, fresh.combat_width, fresh.max_speed, fresh.support.clone())
+        );
+        assert_eq!((d.max_entrenchment, d.river_penalty_reduction), (15, 20), "сапёры вернулись");
+        // но организация дважды урезана пополам: 60 -> 30 -> 15
+        assert_eq!(d.current_org, 15);
+    }
+
+    #[test]
+    fn refit_clamps_org_to_the_new_maximum_and_keeps_empty_divisions_empty() {
+        let weak_org = DivisionTemplate {
+            name: "low-org".into(),
+            battalions: vec![BattalionDef { max_org: 20, ..BattalionDef::infantry() }; 9],
+        };
+        let mut d = registered(PLAIN_INFANTRY_TEMPLATE);
+        assert_eq!(d.current_org, 60);
+        d.refit(&weak_org);
+        assert_eq!((d.max_org, d.current_org), (20, 20), "60 / 2 = 30, но новый максимум 20");
+
+        let mut empty = registered(BASE_TEMPLATE);
+        empty.current_strength = 0;
+        empty.refit(&weak_org);
+        assert_eq!(empty.current_strength, 0, "пустая дивизия остаётся пустой");
+        // непустая не обнуляется из-за округления
+        let mut tiny = registered(BASE_TEMPLATE);
+        tiny.current_strength = 1;
+        tiny.refit(&weak_org);
+        assert_eq!(tiny.current_strength, 1);
+    }
+
+    fn app_with(divisions: &[(&str, bool)]) -> (App, Vec<Entity>) {
+        let mut app = App::new();
+        app.add_event::<RefitDivision>()
+            .init_resource::<DivisionTemplates>()
+            .add_systems(Update, apply_refits);
+        let ids = divisions
+            .iter()
+            .enumerate()
+            .map(|(i, &(owner, marching))| {
+                let mut d = registered(BASE_TEMPLATE);
+                d.id = i as u32 + 1;
+                d.owner = owner.to_string();
+                d.entrenchment = 7;
+                if marching {
+                    d.movement = Some(MovementProgress { from: 1, to: 2, hours_left: 5, total_hours: 24 });
+                }
+                app.world_mut().spawn(d).id()
+            })
+            .collect();
+        (app, ids)
+    }
+
+    fn order(app: &mut App, division: Entity, template: &str) {
+        app.world_mut().send_event(RefitDivision { division, template: template.to_string() });
+        app.update();
+    }
+
+    fn template_of(app: &App, e: Entity) -> String {
+        app.world().get::<Division>(e).unwrap().template_name.clone()
+    }
+
+    #[test]
+    fn refit_system_validates_nation_template_and_state() {
+        let (mut app, ids) = app_with(&[("GER", false), ("FRA", false), ("GER", true), ("GER", false)]);
+        // 1. Германия переводит стоящую дивизию в танковую
+        order(&mut app, ids[0], "Panzer-Division");
+        assert_eq!(template_of(&app, ids[0]), "Panzer-Division");
+        assert_eq!(app.world().get::<Division>(ids[0]).unwrap().entrenchment, 0);
+        // 2. у Франции такого шаблона нет
+        order(&mut app, ids[1], "Panzer-Division");
+        assert_eq!(template_of(&app, ids[1]), BASE_TEMPLATE);
+        assert_eq!(app.world().get::<Division>(ids[1]).unwrap().entrenchment, 7, "отклонённый приказ ничего не меняет");
+        // 3. на марше сменить шаблон нельзя
+        order(&mut app, ids[2], "Panzer-Division");
+        assert_eq!(template_of(&app, ids[2]), BASE_TEMPLATE);
+        // 4. неизвестный шаблон и тестовый шаблон вне списка нации отклоняются
+        order(&mut app, ids[3], "Нет такого");
+        order(&mut app, ids[3], PLAIN_INFANTRY_TEMPLATE);
+        assert_eq!(template_of(&app, ids[3]), BASE_TEMPLATE);
+        // французам доступна моторизованная пехота
+        order(&mut app, ids[1], "Infanterie-Division (mot.)");
+        assert_eq!(template_of(&app, ids[1]), "Infanterie-Division (mot.)");
+        assert_eq!(app.world().get::<Division>(ids[1]).unwrap().max_speed, 120);
+    }
+
+    #[test]
+    fn refit_system_rejects_divisions_in_combat() {
+        let (mut app, ids) = app_with(&[("GER", false), ("FRA", false)]);
+        app.world_mut().spawn(ActiveCombat {
+            province_id: 2,
+            attacker_owner: "GER".into(),
+            defender_owner: "FRA".into(),
+            attackers: vec![ids[0]],
+            defenders: vec![ids[1]],
+            max_width: 80,
+            combat_progress: 0,
+            elapsed_hours: 0,
+        });
+        order(&mut app, ids[0], "Panzer-Division");
+        assert_eq!(template_of(&app, ids[0]), BASE_TEMPLATE, "в бою шаблон не меняется");
     }
 }
