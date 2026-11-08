@@ -14,20 +14,21 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::camera::MainCamera;
 use crate::clock::{ClockSet, DailyTickEvent, HourTick};
+use crate::air::{air_attack_bonus_pct, air_defense_penalty_pct, air_status, side_edge, AirSuperiorityMap};
 use crate::command::SKILL_BONUS_PCT;
 use crate::economy::{update_supply_network, SupplyNetwork};
 use crate::oob::OobDivisions;
 use crate::units::{DivisionTemplate, DivisionTemplates, BASE_TEMPLATE, INFANTRY_SPEED_KPH};
+#[cfg(test)]
+use crate::units::PLAIN_INFANTRY_TEMPLATE;
 use crate::map::{
     country_color, pick_province, setup_map, HoveredProvince, ProvinceAdjacency, ProvinceCenters, ProvinceControllerChanged,
-    ProvinceControllers, ProvinceMap, ProvinceRivers,
+    ProvinceControllers, ProvinceMap, ProvinceRivers, StateRegistry,
 };
 
 /// Интенсивность боя: доля организации цели, снимаемая за час, в сотых долях процента (bp),
 /// при равных атаке и защите. Подобрана так, чтобы равные дивизии дрались около суток.
 const COMBAT_INTENSITY_BP: u32 = 800;
-/// Максимальная окопанность; каждый пункт даёт +2% к эффективной защите.
-pub const MAX_ENTRENCHMENT: u32 = 10;
 /// Максимум планирования: +30% к атаке наступающей дивизии.
 pub const MAX_PLANNING: u32 = 30;
 /// Небоевые потери отрезанной дивизии: доля текущей прочности в сутки, %.
@@ -112,6 +113,16 @@ pub struct Division {
     pub piercing: u32,
     /// Твердость, %.
     pub hardness: u32,
+    /// Разведка: максимум среди батальонов. Сторона с лучшей разведкой в бою получает тактическое преимущество.
+    pub recon: u32,
+    /// Жёсткая атака (сумма по батальонам и ротам обеспечения); пока только показывается в интерфейсе.
+    pub hard_attack: u32,
+    /// Предел окопанности: 10, с сапёрами 15. Каждый пункт даёт +2% к защите.
+    pub max_entrenchment: u32,
+    /// На сколько пунктов сапёры снижают штраф форсирования реки (0 или 20).
+    pub river_penalty_reduction: u32,
+    /// Роты обеспечения для интерфейса: «Сапёры», «Арт», «Разведка».
+    pub support: Vec<&'static str>,
     /// Планирование 0..=`MAX_PLANNING` (%): копится на рубеже фронта, тратится на марше и в бою.
     pub planning: u32,
     /// Навыки командира фронта, на который назначена дивизия (+2% за уровень), иначе 0.
@@ -202,6 +213,11 @@ impl Division {
             armor: stats.armor,
             piercing: stats.piercing,
             hardness: stats.hardness,
+            recon: stats.recon,
+            hard_attack: stats.hard_attack,
+            max_entrenchment: stats.max_entrenchment,
+            river_penalty_reduction: stats.river_penalty_reduction,
+            support: stats.support,
             planning: 0,
             command_attack_skill: 0,
             command_defense_skill: 0,
@@ -305,7 +321,7 @@ fn daily_entrenchment(
             if d.movement.is_none()
                 && d.path.is_empty()
                 && !in_combat.contains(&entity)
-                && d.entrenchment < MAX_ENTRENCHMENT
+                && d.entrenchment < d.max_entrenchment
             {
                 d.entrenchment += 1;
             }
@@ -952,6 +968,31 @@ fn advance_marches(
     }
 }
 
+/// Тактическое преимущество стороны с лучшей разведкой: +5% к наносимому урону.
+pub const TACTICAL_ADVANTAGE_PCT: u32 = 5;
+
+/// Сторона с более высокой средней разведкой на линии боя: `Some(true)` — атакующие,
+/// `Some(false)` — защитники, `None` — равенство или пустая линия. Средние сравниваются без деления
+/// (`сумма_а * число_в` против `сумма_в * число_а`), поэтому дробные различия не теряются.
+pub fn recon_advantage(attackers: &[u32], defenders: &[u32]) -> Option<bool> {
+    if attackers.is_empty() || defenders.is_empty() {
+        return None;
+    }
+    let sum = |side: &[u32]| side.iter().map(|&r| u64::from(r)).sum::<u64>();
+    let (left, right) = (sum(attackers) * defenders.len() as u64, sum(defenders) * attackers.len() as u64);
+    match left.cmp(&right) {
+        std::cmp::Ordering::Greater => Some(true),
+        std::cmp::Ordering::Less => Some(false),
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
+/// Шанс (%) выхода дивизии из резерва за час: 2..=5 по id, вдвое выше у стороны с преимуществом в разведке.
+fn reserve_chance_pct(division_id: u32, has_recon_advantage: bool) -> u64 {
+    let base = u64::from(RESERVE_MIN_CHANCE_PCT + division_id % 4);
+    if has_recon_advantage { base * 2 } else { base }
+}
+
 /// Штраф к атаке при форсировании реки (между провинцией атакующего и обороняемой есть река), %.
 pub const RIVER_PENALTY_PCT: u32 = 30;
 /// Твёрдость, выше которой часть считается бронированной (для штрафов горам и болоту).
@@ -981,26 +1022,46 @@ pub fn terrain_modifiers(terrain: Option<&str>) -> TerrainModifiers {
     TerrainModifiers { defense_bonus, attack_penalty, armored_attack_penalty }
 }
 
+/// Штраф форсирования реки для дивизии: -30%, с сапёрами -10%.
+pub fn river_penalty_for(division: &Division) -> u32 {
+    RIVER_PENALTY_PCT.saturating_sub(division.river_penalty_reduction)
+}
+
 /// Условия конкретного удара: штраф атаки бьющего и бонус защиты цели, %.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HitContext {
     pub attack_penalty: u32,
     pub defense_bonus: u32,
+    /// Бонус к атаке бьющего от превосходства в воздухе (до +10%).
+    pub air_attack_bonus: u32,
+    /// Штраф к защите цели под вражеским воздушным давлением (до -15%).
+    pub air_defense_penalty: u32,
 }
 
 impl HitContext {
     /// Без модификаторов (удары обороняющихся и тесты без рельефа).
-    pub const NONE: HitContext = HitContext { attack_penalty: 0, defense_bonus: 0 };
+    pub const NONE: HitContext =
+        HitContext { attack_penalty: 0, defense_bonus: 0, air_attack_bonus: 0, air_defense_penalty: 0 };
+
+    /// Добавляет влияние неба: бонус атаки бьющему и штраф защиты цели, %.
+    pub fn with_air(self, attack_bonus: u32, defense_penalty: u32) -> Self {
+        HitContext { air_attack_bonus: attack_bonus, air_defense_penalty: defense_penalty, ..self }
+    }
 
     /// Удар наступающей дивизии: штраф рельефа (бронированным — повышенный) и реки, защитникам — бонус рельефа.
     pub fn for_attack(terrain: &TerrainModifiers, striker: &Division, over_river: bool) -> Self {
         let armored = if striker.hardness > ARMORED_HARDNESS_PCT { terrain.armored_attack_penalty } else { 0 };
-        let river = if over_river { RIVER_PENALTY_PCT } else { 0 };
-        HitContext { attack_penalty: terrain.attack_penalty + armored + river, defense_bonus: terrain.defense_bonus }
+        let river = if over_river { river_penalty_for(striker) } else { 0 };
+        HitContext {
+            attack_penalty: terrain.attack_penalty + armored + river,
+            defense_bonus: terrain.defense_bonus,
+            ..HitContext::NONE
+        }
     }
 }
 
-/// Интенсивность удара без модификаторов рельефа (обороняющиеся и сценарии без местности).
+/// Интенсивность удара без модификаторов рельефа и неба (для тестов формулы).
+#[cfg(test)]
 fn combat_bp(att: &Division, def: &Division, planning: u32) -> u32 {
     combat_bp_ctx(att, def, planning, HitContext::NONE)
 }
@@ -1023,10 +1084,11 @@ fn combat_bp_ctx(att: &Division, def: &Division, planning: u32, ctx: HitContext)
 
     // Рельеф обороняемой провинции и переправа через реку режут атаку наступающих
     attack = attack * (100 - ctx.attack_penalty.min(100)) / 100;
+    attack = attack * (100 + ctx.air_attack_bonus) / 100; // превосходство в воздухе: до +10%
 
     let base_defense = def.defense * def.current_strength / def.max_strength.max(1);
     // Окопанность: +2% защиты за пункт (у наступающих она всегда 0 — марш её сбрасывает)
-    let mut defense = base_defense * (100 + def.entrenchment.min(MAX_ENTRENCHMENT) * 2) / 100;
+    let mut defense = base_defense * (100 + def.entrenchment.min(def.max_entrenchment) * 2) / 100;
     defense = defense * (100 + def.command_defense_skill * SKILL_BONUS_PCT) / 100;
     if def.over_command_limit {
         defense = defense * 50 / 100;
@@ -1035,6 +1097,7 @@ fn combat_bp_ctx(att: &Division, def: &Division, planning: u32, ctx: HitContext)
         defense = defense * UNSUPPLIED_STAT_PCT / 100; // отрезан от снабжения: -33%
     }
     defense = defense * (100 + ctx.defense_bonus) / 100; // бонус рельефа обороняющимся
+    defense = defense * (100 - ctx.air_defense_penalty.min(100)) / 100; // вражеская авиация: до -15%
     (COMBAT_INTENSITY_BP * attack / (attack + defense).max(1)).max(1)
 }
 
@@ -1181,6 +1244,8 @@ fn resolve_combats(
     adjacency: Res<ProvinceAdjacency>,
     map: Res<ProvinceMap>,
     rivers: Res<ProvinceRivers>,
+    registry: Res<StateRegistry>,
+    air: Res<AirSuperiorityMap>,
     mut controllers: ResMut<ProvinceControllers>,
     mut controller_changed: EventWriter<ProvinceControllerChanged>,
 ) {
@@ -1277,6 +1342,21 @@ fn resolve_combats(
             };
             let att_line = snapshot(&divisions, &state.attackers);
             let def_line = snapshot(&divisions, &state.defenders);
+
+            // Разведка: сторона с лучшей средней разведкой на линии получает тактическое преимущество
+            // (+5% к урону, вдвое выше шанс выхода резерва)
+            let recon_adv = recon_advantage(
+                &att_line.iter().map(|(_, d)| d.recon).collect::<Vec<_>>(),
+                &def_line.iter().map(|(_, d)| d.recon).collect::<Vec<_>>(),
+            );
+            // Небо над стейтом провинции: перевес даёт до +10% к атаке, давление врага — до -15% к защите
+            let air_value = registry.state_of(province).map_or(0, |s| air.get(s.id));
+            let (att_air, def_air) =
+                (side_edge(air_value, &state.attacker_owner), side_edge(air_value, &state.defender_owner));
+            let advantage = |damage: u32, has_advantage: bool| {
+                if has_advantage { damage * (100 + TACTICAL_ADVANTAGE_PCT) / 100 } else { damage }
+            };
+
             if !att_line.is_empty() && !def_line.is_empty() {
                 // Все удары считаются по значениям до боя, затем применяются
                 let mut hits: Vec<(Entity, u32, u32)> = Vec::new();
@@ -1285,21 +1365,26 @@ fn resolve_combats(
                     let (target_e, target) = &def_line[k % def_line.len()];
                     // Река между провинцией отправления этой дивизии и обороняемой — форсирование
                     let over_river = striker.movement.is_some_and(|m| rivers.crosses(m.from, province));
-                    let ctx = HitContext::for_attack(&terrain, striker, over_river);
+                    let ctx = HitContext::for_attack(&terrain, striker, over_river)
+                        .with_air(air_attack_bonus_pct(att_air), air_defense_penalty_pct(def_air));
                     // Наступающая дивизия получает бонус планирования к атаке
                     let bp = combat_bp_ctx(striker, target, striker.planning, ctx);
-                    // Броня меняет урон и по организации, и по прочности
+                    // Броня меняет урон и по организации, и по прочности; разведка добавляет +5%
                     let org_milli = apply_armor_rule(target.max_org * bp / 10, striker, target).max(1);
                     let strength = apply_armor_rule(target.max_strength * bp / 50_000, striker, target).max(1);
-                    hits.push((*target_e, org_milli, strength));
+                    let tactical = recon_adv == Some(true);
+                    hits.push((*target_e, advantage(org_milli, tactical), advantage(strength, tactical)));
                 }
                 for (k, (_, striker)) in def_line.iter().enumerate() {
                     let (target_e, target) = &att_line[k % att_line.len()];
-                    let bp = combat_bp(striker, target, 0); // обороняющиеся бонуса планирования не имеют
-                    // Броня меняет урон и по организации, и по прочности
+                    // обороняющиеся бонуса планирования и рельефа не имеют, небо действует на обе стороны
+                    let ctx = HitContext::NONE.with_air(air_attack_bonus_pct(def_air), air_defense_penalty_pct(att_air));
+                    let bp = combat_bp_ctx(striker, target, 0, ctx);
+                    // Броня меняет урон и по организации, и по прочности; разведка добавляет +5%
                     let org_milli = apply_armor_rule(target.max_org * bp / 10, striker, target).max(1);
                     let strength = apply_armor_rule(target.max_strength * bp / 50_000, striker, target).max(1);
-                    hits.push((*target_e, org_milli, strength));
+                    let tactical = recon_adv == Some(false);
+                    hits.push((*target_e, advantage(org_milli, tactical), advantage(strength, tactical)));
                 }
                 for (target, org_milli, strength) in hits {
                     if let Ok((_, mut t)) = divisions.get_mut(target) {
@@ -1359,7 +1444,7 @@ fn resolve_combats(
             }
 
             // 6. Резерв: детерминированный бросок 2..=5% в час на освободившуюся ширину
-            for side in [state.attackers.clone(), state.defenders.clone()] {
+            for (is_attacker, side) in [(true, state.attackers.clone()), (false, state.defenders.clone())] {
                 let info = side_info(&divisions, &side);
                 let mut used: u32 =
                     info.iter().filter(|i| i.3 == CombatState::Active).map(|i| i.2).sum();
@@ -1367,7 +1452,8 @@ fn resolve_combats(
                     if st != CombatState::Reserve || used + width > state.max_width {
                         continue;
                     }
-                    let chance = u64::from(RESERVE_MIN_CHANCE_PCT + id % 4);
+                    // Сторона с лучшей разведкой быстрее реагирует на бреши в линии: шанс вдвое выше
+                    let chance = reserve_chance_pct(id, recon_adv == Some(is_attacker));
                     let roll = det_rand(province as u64, id as u64, u64::from(state.elapsed_hours)) % 100;
                     if roll < chance {
                         used += width;
@@ -1572,16 +1658,21 @@ struct SideStats {
     /// Организация дивизий на линии: сумма текущей / сумма максимальной.
     org: u32,
     org_max: u32,
+    /// Сумма разведки и число дивизий на линии — для средней разведки стороны.
+    recon_sum: u32,
+    active: u32,
 }
 
 fn side_stats(divisions: &Query<&Division>, list: &[Entity]) -> SideStats {
-    let mut stats = SideStats { used_width: 0, reserves: 0, org: 0, org_max: 0 };
+    let mut stats = SideStats { used_width: 0, reserves: 0, org: 0, org_max: 0, recon_sum: 0, active: 0 };
     for d in list.iter().filter_map(|&e| divisions.get(e).ok()) {
         match d.combat_state {
             CombatState::Active => {
                 stats.used_width += d.combat_width;
                 stats.org += d.current_org;
                 stats.org_max += d.max_org;
+                stats.recon_sum += d.recon;
+                stats.active += 1;
             }
             CombatState::Reserve => stats.reserves += 1,
             CombatState::None => {}
@@ -1590,11 +1681,32 @@ fn side_stats(divisions: &Query<&Division>, list: &[Entity]) -> SideStats {
     stats
 }
 
+/// Средняя разведка стороны с одним знаком после запятой, без чисел с плавающей точкой: `2.5`.
+fn recon_text(recon_sum: u32, active: u32) -> String {
+    if active == 0 {
+        return "0.0".to_string();
+    }
+    let tenths = recon_sum * 10 / active;
+    format!("{}.{}", tenths / 10, tenths % 10)
+}
+
+/// Строка разведки и неба в окне боя: `Разведка: 3.0 vs 1.0 | Небо: Германия +40`.
+fn recon_air_label(att: &SideStats, def: &SideStats, air_value: i32) -> String {
+    format!(
+        "Разведка: {} vs {} | Небо: {}",
+        recon_text(att.recon_sum, att.active),
+        recon_text(def.recon_sum, def.active),
+        air_status(air_value)
+    )
+}
+
 /// Строка модификаторов боя: `Местность: forest (Защ: +20%, Атк: -10%)`.
-/// В штраф атаки входит форсирование реки (-30%), о котором напоминает пометка `[река]`.
-fn terrain_label(terrain: Option<&str>, river_crossing: bool) -> String {
+/// В штраф атаки входит форсирование реки (`river_penalty`, обычно -30%, с сапёрами -10%),
+/// о котором напоминает пометка `[река]`.
+fn terrain_label(terrain: Option<&str>, river_penalty: Option<u32>) -> String {
     let mods = terrain_modifiers(terrain);
-    let river = if river_crossing { RIVER_PENALTY_PCT } else { 0 };
+    let river_crossing = river_penalty.is_some();
+    let river = river_penalty.unwrap_or(0);
     format!(
         "Местность: {} (Защ: +{}%, Атк: -{}%){}",
         terrain.unwrap_or("unknown"),
@@ -1612,6 +1724,8 @@ fn combat_ui(
     centers: Res<ProvinceCenters>,
     map: Res<ProvinceMap>,
     rivers: Res<ProvinceRivers>,
+    registry: Res<StateRegistry>,
+    air: Res<AirSuperiorityMap>,
     cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
 ) {
     let Ok((camera, cam_tf)) = cameras.get_single() else { return };
@@ -1623,12 +1737,17 @@ fn combat_ui(
         let att = side_stats(&divisions, &combat.attackers);
         let def = side_stats(&divisions, &combat.defenders);
         // Рельеф обороняемой провинции и форсирование реки хотя бы одной атакующей дивизией
-        let crossing = combat
+        // (в плашке — самый тяжёлый штраф среди форсирующих: сапёры его снижают)
+        let river_penalty = combat
             .attackers
             .iter()
             .filter_map(|&e| divisions.get(e).ok())
-            .any(|d| d.movement.is_some_and(|m| rivers.crosses(m.from, combat.province_id)));
-        let terrain_text = terrain_label(map.terrain_of(combat.province_id), crossing);
+            .filter(|d| d.movement.is_some_and(|m| rivers.crosses(m.from, combat.province_id)))
+            .map(river_penalty_for)
+            .max();
+        let terrain_text = terrain_label(map.terrain_of(combat.province_id), river_penalty);
+        let air_value = registry.state_of(combat.province_id).map_or(0, |s| air.get(s.id));
+        let recon_text = recon_air_label(&att, &def, air_value);
 
         egui::Area::new(egui::Id::new(("combat_plate", ce)))
             .fixed_pos(egui::pos2(screen.x - 28.0, screen.y - 70.0))
@@ -1649,6 +1768,7 @@ fn combat_ui(
                     egui::Color32::WHITE,
                 );
                 ui.label(egui::RichText::new(&terrain_text).small());
+                ui.label(egui::RichText::new(&recon_text).small());
                 // Организация линии: атакующие (синий) и защитники (красный), ширина фронта и резерв
                 let sides = [
                     ("АТК", &att, egui::Color32::from_rgb(70, 160, 220)),
@@ -1721,12 +1841,18 @@ fn division_info_ui(
                 "Укомплектованность: {}/{} (Потери: {})",
                 d.current_strength, d.max_strength, d.losses
             ));
-            ui.label(format!("Атака: {} | Защита: {}", d.soft_attack, d.defense));
+            ui.label(format!("Атака: {} (жёсткая: {}) | Защита: {}", d.soft_attack, d.hard_attack, d.defense));
             ui.label(format!(
-                "Окопанность: {}/{MAX_ENTRENCHMENT} (+{}% защиты)",
+                "Окопанность: {}/{} (+{}% защиты)",
                 d.entrenchment,
+                d.max_entrenchment,
                 d.entrenchment * 2
             ));
+            if d.support.is_empty() {
+                ui.label("Поддержка: нет");
+            } else {
+                ui.label(format!("Поддержка: [{}]", d.support.join(", ")));
+            }
             ui.label(format!(
                 "Шаблон: \"{}\" ({} батальонов) | Личный состав: {} чел. | Снаряжение: {}/{} шт.",
                 d.template_name,
@@ -1737,6 +1863,7 @@ fn division_info_ui(
             ));
             ui.label(format!("Состояние: {status}"));
             ui.label(format!("Боевая ширина дивизии: {}", d.combat_width));
+            ui.label(format!("Разведка: {}", d.recon));
             if d.is_supplied {
                 ui.label("Снабжение: В норме");
             } else {
@@ -1843,6 +1970,8 @@ mod tests {
             .init_resource::<SelectedDivision>()
             .insert_resource(ProvinceMap::empty_for_test())
             .init_resource::<ProvinceRivers>()
+            .init_resource::<StateRegistry>()
+            .init_resource::<AirSuperiorityMap>()
             .insert_resource(ProvinceAdjacency { neighbors })
             .insert_resource(controllers)
             .add_systems(Update, resolve_combats);
@@ -1983,7 +2112,7 @@ mod tests {
     fn commander_skills_and_limit_penalty_scale_combat_power() {
         let templates = DivisionTemplates::default();
         let make = |id| {
-            Division::from_template(id, "d".into(), "GER".into(), 1, BASE_TEMPLATE.to_string(), templates.get_or_base(BASE_TEMPLATE))
+            Division::from_template(id, "d".into(), "GER".into(), 1, PLAIN_INFANTRY_TEMPLATE.to_string(), templates.get_or_base(PLAIN_INFANTRY_TEMPLATE))
         };
         let (mut attacker, mut defender) = (make(1), make(2));
         // база: атака 90, защита 225 -> 800 * 90 / 315 = 228
@@ -2020,7 +2149,7 @@ mod tests {
     fn unsupplied_division_loses_a_third_of_attack_and_defense() {
         let templates = DivisionTemplates::default();
         let make = |id| {
-            Division::from_template(id, "d".into(), "GER".into(), 1, BASE_TEMPLATE.to_string(), templates.get_or_base(BASE_TEMPLATE))
+            Division::from_template(id, "d".into(), "GER".into(), 1, PLAIN_INFANTRY_TEMPLATE.to_string(), templates.get_or_base(PLAIN_INFANTRY_TEMPLATE))
         };
         let (mut attacker, mut defender) = (make(1), make(2));
         assert_eq!(combat_bp(&attacker, &defender, 0), 228);
@@ -2070,6 +2199,66 @@ mod tests {
         assert!(mountain_river > mountain, "форсирование реки ослабляет атаку ещё сильнее");
     }
     #[test]
+    fn better_recon_adds_five_percent_damage_for_that_side_only() {
+        let run = |attacker_recon: u32| {
+            let (mut app, att, def) = scenario(&[1; 4], 4, 1);
+            for &e in &att {
+                app.world_mut().get_mut::<Division>(e).unwrap().recon = attacker_recon;
+            }
+            for _ in 0..5 {
+                tick(&mut app);
+            }
+            (totals(&app, &att).0, totals(&app, &def).0)
+        };
+        // защитники с разведкой 1: равенство (1 vs 1) и превосходство атакующих (3 vs 1)
+        let (att_equal, def_equal) = run(1);
+        let (att_better, def_better) = run(3);
+        assert!(def_better < def_equal, "атакующие с лучшей разведкой бьют сильнее");
+        assert_eq!(att_better, att_equal, "потери атакующих не зависят от их же разведки");
+        // обратный случай: атакующие слабее в разведке — преимущество у защитников
+        let (att_worse, _) = run(0);
+        assert!(att_worse < att_equal, "защитники с лучшей разведкой бьют сильнее");
+    }
+
+    fn air_scenario(air_value: i32) -> (App, Vec<Entity>, Vec<Entity>) {
+        let (mut app, att, def) = scenario(&[1; 4], 4, 1);
+        // провинция 2 принадлежит стейту 7 с заданным небом (плюс — Германия)
+        let state = std::sync::Arc::new(crate::map::StateDef {
+            id: 7,
+            name: "S7".into(),
+            owner: "FRA".into(),
+            provinces: vec![2],
+            victory_points: vec![],
+            civilian_factories: 0,
+            military_factories: 0,
+        });
+        let mut registry = StateRegistry::default();
+        registry.province_to_state.insert(2, state);
+        app.insert_resource(registry);
+        app.insert_resource(AirSuperiorityMap { air_superiority: BTreeMap::from([(7, air_value)]) });
+        (app, att, def)
+    }
+
+    #[test]
+    fn air_superiority_helps_the_stronger_sky_side_in_combat() {
+        let run = |air_value: i32| {
+            let (mut app, att, def) = air_scenario(air_value);
+            for _ in 0..5 {
+                tick(&mut app);
+            }
+            (totals(&app, &att).0, totals(&app, &def).0)
+        };
+        let (att_neutral, def_neutral) = run(0);
+        // небо за Германией (атакующие GER): защитники FRA теряют больше, атакующие — не больше
+        let (att_german_sky, def_german_sky) = run(80);
+        assert!(def_german_sky < def_neutral, "перевес в воздухе усиливает атаку и ослабляет защиту врага");
+        assert!(att_german_sky >= att_neutral, "атакующим не хуже");
+        // небо за Францией: теперь французские защитники бьют сильнее, германские теряют больше
+        let (att_french_sky, def_french_sky) = run(-80);
+        assert!(att_french_sky < att_neutral, "под вражеским небом атакующие теряют больше");
+        assert!(def_french_sky >= def_neutral, "защитникам не хуже");
+    }
+    #[test]
     fn planning_scales_effective_attack() {
         let templates = DivisionTemplates::default();
         let make = |id| {
@@ -2078,8 +2267,8 @@ mod tests {
                 "d".into(),
                 "GER".into(),
                 1,
-                BASE_TEMPLATE.to_string(),
-                templates.get_or_base(BASE_TEMPLATE),
+                PLAIN_INFANTRY_TEMPLATE.to_string(),
+                templates.get_or_base(PLAIN_INFANTRY_TEMPLATE),
             )
         };
         let (attacker, defender) = (make(1), make(2));
@@ -2302,36 +2491,38 @@ mod terrain_tests {
         assert_eq!(HitContext::for_attack(&marsh, &panzer, false).attack_penalty, 55);
         // лес броню не штрафует; защитный бонус всегда берётся из рельефа
         let forest = terrain_modifiers(Some("forest"));
-        assert_eq!(HitContext::for_attack(&forest, &panzer, false), HitContext { attack_penalty: 10, defense_bonus: 20 });
+        assert_eq!(HitContext::for_attack(&forest, &panzer, false), HitContext { attack_penalty: 10, defense_bonus: 20, ..HitContext::NONE });
         // река добавляет -30% поверх рельефа
         assert_eq!(HitContext::for_attack(&mountain, &panzer, true).attack_penalty, 80);
     }
 
     #[test]
     fn terrain_and_river_scale_attack_and_defense() {
-        let (attacker, defender) = (division(BASE_TEMPLATE), division(BASE_TEMPLATE));
+        let (attacker, defender) = (division(PLAIN_INFANTRY_TEMPLATE), division(PLAIN_INFANTRY_TEMPLATE));
         // база: атака 90, защита 225 -> 800 * 90 / 315 = 228
         assert_eq!(combat_bp_ctx(&attacker, &defender, 0, HitContext::NONE), 228);
         // лес: атака 90 * 90 / 100 = 81, защита 225 * 120 / 100 = 270 -> 800 * 81 / 351 = 184
-        let forest = HitContext { attack_penalty: 10, defense_bonus: 20 };
+        let forest = HitContext { attack_penalty: 10, defense_bonus: 20, ..HitContext::NONE };
         assert_eq!(combat_bp_ctx(&attacker, &defender, 0, forest), 184);
         // горы: атака 63, защита 337 -> 800 * 63 / 400 = 126
-        let mountain = HitContext { attack_penalty: 30, defense_bonus: 50 };
+        let mountain = HitContext { attack_penalty: 30, defense_bonus: 50, ..HitContext::NONE };
         assert_eq!(combat_bp_ctx(&attacker, &defender, 0, mountain), 126);
         // только река: атака 63, защита 225 -> 800 * 63 / 288 = 175
-        let river = HitContext { attack_penalty: RIVER_PENALTY_PCT, defense_bonus: 0 };
+        let river = HitContext { attack_penalty: RIVER_PENALTY_PCT, defense_bonus: 0, ..HitContext::NONE };
         assert_eq!(combat_bp_ctx(&attacker, &defender, 0, river), 175);
         // штрафы свыше 100% не уводят атаку в отрицательные значения (остаётся минимальный урон)
-        let absurd = HitContext { attack_penalty: 250, defense_bonus: 0 };
+        let absurd = HitContext { attack_penalty: 250, defense_bonus: 0, ..HitContext::NONE };
         assert_eq!(combat_bp_ctx(&attacker, &defender, 0, absurd), 1);
     }
 
     #[test]
     fn combat_label_shows_terrain_modifiers() {
-        assert_eq!(terrain_label(Some("forest"), false), "Местность: forest (Защ: +20%, Атк: -10%)");
-        assert_eq!(terrain_label(Some("plains"), false), "Местность: plains (Защ: +0%, Атк: -0%)");
-        assert_eq!(terrain_label(Some("hills"), true), "Местность: hills (Защ: +25%, Атк: -45%) [река]");
-        assert_eq!(terrain_label(None, false), "Местность: unknown (Защ: +0%, Атк: -0%)");
+        assert_eq!(terrain_label(Some("forest"), None), "Местность: forest (Защ: +20%, Атк: -10%)");
+        assert_eq!(terrain_label(Some("plains"), None), "Местность: plains (Защ: +0%, Атк: -0%)");
+        assert_eq!(terrain_label(Some("hills"), Some(RIVER_PENALTY_PCT)), "Местность: hills (Защ: +25%, Атк: -45%) [река]");
+        // с сапёрами река штрафует слабее: 15 + 10
+        assert_eq!(terrain_label(Some("hills"), Some(10)), "Местность: hills (Защ: +25%, Атк: -25%) [река]");
+        assert_eq!(terrain_label(None, None), "Местность: unknown (Защ: +0%, Атк: -0%)");
     }
 
     /// Реки из `map/rivers.bmp` на реальных данных (пропускается без игры).
@@ -2351,5 +2542,176 @@ mod terrain_tests {
         // каждая речная граница — реальная пара соседей
         assert!(rivers.0.iter().all(|&(a, b)| adjacency.neighbors.get(&a).is_some_and(|s| s.contains(&b))));
         assert!(rivers.crosses(rivers.0.iter().next().unwrap().1, rivers.0.iter().next().unwrap().0));
+    }
+}
+
+#[cfg(test)]
+mod recon_air_tests {
+    use super::*;
+
+    fn division(template: &str) -> Division {
+        let templates = DivisionTemplates::default();
+        Division::from_template(1, "d".into(), "GER".into(), 1, template.to_string(), templates.get_or_base(template))
+    }
+
+    #[test]
+    fn division_recon_comes_from_its_battalions() {
+        assert_eq!(division(BASE_TEMPLATE).recon, 1);
+        assert_eq!(division("Infanterie-Division (mot.)").recon, 3);
+        assert_eq!(division("Panzer-Division").recon, 3); // максимум: моторизованные 3 > лёгкие танки 2
+    }
+
+    #[test]
+    fn recon_advantage_compares_average_recon() {
+        assert_eq!(recon_advantage(&[3, 3], &[1, 1]), Some(true));
+        assert_eq!(recon_advantage(&[1], &[2]), Some(false));
+        assert_eq!(recon_advantage(&[2, 2], &[2]), None, "равные средние — преимущества нет");
+        // дробные средние не теряются: (1+2)/2 = 1.5 против 1
+        assert_eq!(recon_advantage(&[1, 2], &[1]), Some(true));
+        // число дивизий не важно, важна средняя: 4 слабых против 1 сильной
+        assert_eq!(recon_advantage(&[1, 1, 1, 1], &[3]), Some(false));
+        // пустая линия — не сравниваем
+        assert_eq!(recon_advantage(&[], &[3]), None);
+        assert_eq!(recon_advantage(&[3], &[]), None);
+    }
+
+    #[test]
+    fn recon_advantage_doubles_reserve_chance() {
+        // шанс 2..=5% по id; с преимуществом в разведке — вдвое выше
+        assert_eq!(reserve_chance_pct(4, false), 2);
+        assert_eq!(reserve_chance_pct(4, true), 4);
+        assert_eq!(reserve_chance_pct(7, false), 5);
+        assert_eq!(reserve_chance_pct(7, true), 10);
+    }
+
+    #[test]
+    fn air_bonus_and_penalty_enter_the_damage_formula() {
+        let (attacker, defender) = (division(PLAIN_INFANTRY_TEMPLATE), division(PLAIN_INFANTRY_TEMPLATE));
+        // база: 800 * 90 / 315 = 228
+        assert_eq!(combat_bp_ctx(&attacker, &defender, 0, HitContext::NONE), 228);
+        // перевес 40: +4% атаки -> 93, 800 * 93 / 318 = 233
+        assert_eq!(combat_bp_ctx(&attacker, &defender, 0, HitContext::NONE.with_air(4, 0)), 233);
+        // давление врага: -6% защиты -> 211, 800 * 90 / 301 = 239
+        assert_eq!(combat_bp_ctx(&attacker, &defender, 0, HitContext::NONE.with_air(0, 6)), 239);
+        // вместе: 800 * 93 / 304 = 244
+        assert_eq!(combat_bp_ctx(&attacker, &defender, 0, HitContext::NONE.with_air(4, 6)), 244);
+        // штраф защиты не уходит ниже нуля
+        assert!(combat_bp_ctx(&attacker, &defender, 0, HitContext::NONE.with_air(0, 500)) >= 228);
+    }
+
+    #[test]
+    fn combat_plate_shows_recon_and_sky() {
+        let side = |recon_sum, active| SideStats { used_width: 0, reserves: 0, org: 0, org_max: 0, recon_sum, active };
+        assert_eq!(recon_text(3, 1), "3.0");
+        assert_eq!(recon_text(5, 2), "2.5");
+        assert_eq!(recon_text(0, 0), "0.0");
+        assert_eq!(recon_air_label(&side(9, 3), &side(4, 4), 40), "Разведка: 3.0 vs 1.0 | Небо: Германия +40");
+        assert_eq!(recon_air_label(&side(1, 1), &side(1, 1), -15), "Разведка: 1.0 vs 1.0 | Небо: Франция +15");
+        assert_eq!(recon_air_label(&side(1, 1), &side(1, 1), 0), "Разведка: 1.0 vs 1.0 | Небо: паритет");
+    }
+}
+
+#[cfg(test)]
+mod support_tests {
+    use super::*;
+
+    fn division(template: &str) -> Division {
+        let templates = DivisionTemplates::default();
+        Division::from_template(1, "d".into(), "GER".into(), 1, template.to_string(), templates.get_or_base(template))
+    }
+
+    fn day(app: &mut App) {
+        app.world_mut().send_event(DailyTickEvent { day: 1, month: 1, year: 1936 });
+        app.update();
+    }
+
+    #[test]
+    fn standard_division_carries_engineers_and_artillery() {
+        let d = division(BASE_TEMPLATE);
+        assert_eq!(d.support, vec!["Сапёры", "Арт"]);
+        assert_eq!((d.max_entrenchment, d.river_penalty_reduction, d.hard_attack), (15, 20, 2));
+        assert_eq!(d.battalion_count, 9, "роты обеспечения не считаются батальонами");
+        let plain = division(PLAIN_INFANTRY_TEMPLATE);
+        assert!(plain.support.is_empty());
+        assert_eq!((plain.max_entrenchment, plain.river_penalty_reduction), (10, 0));
+        // поддержка не занимает ширину фронта
+        assert_eq!(d.combat_width, plain.combat_width);
+        assert_eq!(d.combat_width, 18);
+    }
+
+    #[test]
+    fn engineers_raise_the_entrenchment_cap_to_fifteen() {
+        let mut app = App::new();
+        app.add_event::<DailyTickEvent>().add_systems(Update, daily_entrenchment);
+        let engineers = app.world_mut().spawn(division(BASE_TEMPLATE)).id();
+        let plain = app.world_mut().spawn(division(PLAIN_INFANTRY_TEMPLATE)).id();
+        for _ in 0..20 {
+            day(&mut app);
+        }
+        assert_eq!(app.world().get::<Division>(engineers).unwrap().entrenchment, 15);
+        assert_eq!(app.world().get::<Division>(plain).unwrap().entrenchment, 10);
+    }
+
+    #[test]
+    fn fifteen_entrenchment_gives_thirty_percent_defense_and_cap_is_enforced_in_combat() {
+        let attacker = division(BASE_TEMPLATE); // атака 90 + 25 артиллерии = 115
+        assert_eq!(attacker.soft_attack, 115);
+
+        let mut dug_in = division(BASE_TEMPLATE);
+        dug_in.entrenchment = 15; // 225 * 130 / 100 = 292 -> 800 * 115 / 407 = 226
+        assert_eq!(combat_bp_ctx(&attacker, &dug_in, 0, HitContext::NONE), 226);
+
+        // у дивизии без сапёров 15 пунктов упираются в предел 10 (+20%): 225 * 120 / 100 = 270 -> 800 * 115 / 385 = 238
+        let mut plain = division(PLAIN_INFANTRY_TEMPLATE);
+        plain.entrenchment = 15;
+        assert_eq!(combat_bp_ctx(&attacker, &plain, 0, HitContext::NONE), 238);
+
+        // сапёры в обороне дают меньше урона по себе, чем при пределе 10
+        assert!(combat_bp_ctx(&attacker, &dug_in, 0, HitContext::NONE) < combat_bp_ctx(&attacker, &plain, 0, HitContext::NONE));
+    }
+
+    #[test]
+    fn engineers_cut_the_river_penalty_from_thirty_to_ten() {
+        let (sappers, plain) = (division(BASE_TEMPLATE), division(PLAIN_INFANTRY_TEMPLATE));
+        assert_eq!(river_penalty_for(&sappers), 10);
+        assert_eq!(river_penalty_for(&plain), 30);
+
+        let flat = terrain_modifiers(Some("plains"));
+        assert_eq!(HitContext::for_attack(&flat, &sappers, true).attack_penalty, 10);
+        assert_eq!(HitContext::for_attack(&flat, &plain, true).attack_penalty, 30);
+        // без реки штрафа нет ни у кого
+        assert_eq!(HitContext::for_attack(&flat, &sappers, false).attack_penalty, 0);
+        // рельеф складывается с рекой: горы -30% и река -10% с сапёрами = -40%
+        let mountain = terrain_modifiers(Some("mountain"));
+        assert_eq!(HitContext::for_attack(&mountain, &sappers, true).attack_penalty, 40);
+
+        // сила удара: атака 115 * 90 / 100 = 103 -> 800 * 103 / 328 = 251 (с обычной рекой было бы 115 * 70 / 100 = 80 -> 800 * 80 / 305 = 209)
+        let target = division(PLAIN_INFANTRY_TEMPLATE);
+        assert_eq!(combat_bp_ctx(&sappers, &target, 0, HitContext::for_attack(&flat, &sappers, true)), 251);
+        let mut no_engineers = sappers.clone();
+        no_engineers.river_penalty_reduction = 0;
+        assert_eq!(combat_bp_ctx(&no_engineers, &target, 0, HitContext::for_attack(&flat, &no_engineers, true)), 209);
+    }
+
+    #[test]
+    fn artillery_company_adds_attack_without_using_front_width() {
+        let standard = division(BASE_TEMPLATE);
+        let plain = division(PLAIN_INFANTRY_TEMPLATE);
+        let target = division(PLAIN_INFANTRY_TEMPLATE);
+        // прямая прибавка к атаке: 115 против 90 -> удар сильнее (270 против 228)
+        assert_eq!(combat_bp(&plain, &target, 0), 228);
+        assert_eq!(combat_bp(&standard, &target, 0), 800 * 115 / (115 + 225));
+        assert!(combat_bp(&standard, &target, 0) > combat_bp(&plain, &target, 0));
+        // а ширина прежняя: 18 на дивизию, то есть на линию 80 по-прежнему помещается 4 дивизии
+        assert_eq!(standard.combat_width, plain.combat_width);
+    }
+
+    #[test]
+    fn support_label_line_for_the_panel() {
+        let line = |d: &Division| {
+            if d.support.is_empty() { "Поддержка: нет".to_string() } else { format!("Поддержка: [{}]", d.support.join(", ")) }
+        };
+        assert_eq!(line(&division(BASE_TEMPLATE)), "Поддержка: [Сапёры, Арт]");
+        assert_eq!(line(&division(PLAIN_INFANTRY_TEMPLATE)), "Поддержка: нет");
     }
 }
