@@ -850,7 +850,7 @@ fn click_to_command(
     mut contexts: EguiContexts,
 ) {
     // Клик по GUI не должен проваливаться на карту
-    if contexts.ctx_mut().wants_pointer_input() {
+    if contexts.try_ctx_mut().is_none_or(|ctx| ctx.wants_pointer_input()) {
         return;
     }
     if mouse.just_pressed(MouseButton::Left) {
@@ -899,7 +899,7 @@ fn ui_state_panel(
     controllers: Res<ProvinceControllers>,
 ) {
     let Some(id) = selected.id else { return };
-    let ctx = contexts.ctx_mut();
+    let Some(ctx) = contexts.try_ctx_mut() else { return };
 
     let terrain = map.terrain_of(id).unwrap_or("unknown");
     let state = states.state_of(id);

@@ -436,7 +436,7 @@ fn frontline_panel(
     mut commands_out: EventWriter<CreateFrontline>,
     mut attack_out: EventWriter<ExecuteFrontlineAttack>,
 ) {
-    let ctx = contexts.ctx_mut();
+    let Some(ctx) = contexts.try_ctx_mut() else { return };
     let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
 
     egui::Window::new("Управление")

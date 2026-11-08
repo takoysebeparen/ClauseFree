@@ -316,7 +316,7 @@ fn daily_reinforcement(
 
 /// Верхняя плашка: фабрики и склад страны игрока.
 fn economy_bar(mut contexts: EguiContexts, economies: Res<Economies>, player: Res<PlayerCountry>) {
-    let ctx = contexts.ctx_mut();
+    let Some(ctx) = contexts.try_ctx_mut() else { return };
     let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
 
     egui::Window::new("economy_bar")

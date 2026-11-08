@@ -467,7 +467,7 @@ fn select_division_input(
     mut selected: ResMut<SelectedDivision>,
     mut contexts: EguiContexts,
 ) {
-    if !mouse.just_pressed(MouseButton::Left) || contexts.ctx_mut().wants_pointer_input() {
+    if !mouse.just_pressed(MouseButton::Left) || contexts.try_ctx_mut().is_none_or(|ctx| ctx.wants_pointer_input()) {
         return;
     }
     selected.0 = hovered.id.and_then(|province| {
@@ -515,7 +515,7 @@ fn order_move_input(
         return;
     }
     let start = press_pos.take();
-    if contexts.ctx_mut().wants_pointer_input() {
+    if contexts.try_ctx_mut().is_none_or(|ctx| ctx.wants_pointer_input()) {
         return;
     }
     let (Some(start), Some(end)) = (start, window.cursor_position()) else { return };
@@ -1615,7 +1615,7 @@ fn combat_ui(
     cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
 ) {
     let Ok((camera, cam_tf)) = cameras.get_single() else { return };
-    let ctx = contexts.ctx_mut();
+    let Some(ctx) = contexts.try_ctx_mut() else { return };
 
     for (ce, combat) in &combats {
         let Some(center) = centers.centers.get(&combat.province_id) else { continue };
@@ -1683,7 +1683,7 @@ fn division_info_ui(
 ) {
     let Some(entity) = selected.0 else { return };
     let Ok(d) = divisions.get(entity) else { return };
-    let ctx = contexts.ctx_mut();
+    let Some(ctx) = contexts.try_ctx_mut() else { return };
 
     let combat = combats.iter().find(|c| c.involves(entity));
     let status = match combat {

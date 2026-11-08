@@ -201,7 +201,7 @@ fn country_name_genitive(tag: &str) -> &str {
 }
 
 fn surrender_ui(mut contexts: EguiContexts, mut state: ResMut<NationalSurrenderState>) {
-    let ctx = contexts.ctx_mut();
+    let Some(ctx) = contexts.try_ctx_mut() else { return };
     let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
 
     // Прогресс капитуляции под верхней панелью экономики
