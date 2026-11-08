@@ -10,7 +10,8 @@ use std::path::Path;
 
 use bevy::prelude::*;
 
-use crate::map::tokenize;
+use crate::map::{tokenize, StateRegistry};
+use crate::units::{DivisionTemplates, BASE_TEMPLATE};
 
 /// Страны, чей OOB загружается, в порядке спавна.
 pub const OOB_COUNTRIES: [&str; 2] = ["GER", "FRA"];
@@ -23,6 +24,10 @@ pub struct OobDivision {
     pub location: u32,
     /// Имя `division_template` из файла OOB (пустое, если не указано).
     pub template: String,
+    /// `start_experience_factor` в процентах 0..=100 (нет поля — 0).
+    pub experience_pct: u32,
+    /// `start_equipment_factor` в процентах 0..=100 (нет поля — 100: полностью оснащена).
+    pub equipment_pct: u32,
 }
 
 /// Все распарсенные дивизии (до фильтрации по морю / центрам — она в `division.rs`).
@@ -41,6 +46,28 @@ struct RawDivision {
     location: Option<u32>,
     template: Option<String>,
     order: Option<u32>,
+    experience_pct: Option<u32>,
+    equipment_pct: Option<u32>,
+}
+
+/// Доля Paradox (`0.3`, `1`, `.25`) -> целые проценты 0..=100 без чисел с плавающей точкой.
+/// Знаки после второго отбрасываются, больше 1.0 — 100. Мусор и отрицательные значения — `None`.
+pub fn parse_factor_pct(text: &str) -> Option<u32> {
+    let (int_part, frac_part) = text.split_once('.').unwrap_or((text, ""));
+    if (int_part.is_empty() && frac_part.is_empty())
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let whole: u32 = if int_part.is_empty() { 0 } else { int_part.parse().unwrap_or(u32::MAX) };
+    if whole >= 1 {
+        return Some(100);
+    }
+    let mut digits = frac_part.bytes().take(2).map(|b| u32::from(b - b'0'));
+    let tens = digits.next().unwrap_or(0);
+    let ones = digits.next().unwrap_or(0);
+    Some(tens * 10 + ones)
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +116,8 @@ fn load_country_oob(root: &Path, tag: &str) -> Result<Vec<OobDivision>, String> 
             owner: tag.to_string(),
             location,
             template: raw.template.clone().unwrap_or_default(),
+            experience_pct: raw.experience_pct.unwrap_or(0),
+            equipment_pct: raw.equipment_pct.unwrap_or(100),
         });
     }
     Ok(out)
@@ -153,6 +182,12 @@ fn parse_oob(text: &str) -> (BTreeMap<String, Option<String>>, Vec<RawDivision>)
                     ([u, d], "location") if u == "units" && d == "division" => current.location = value.parse().ok(),
                     ([u, d], "division_template") if u == "units" && d == "division" => {
                         current.template = Some(value.clone())
+                    }
+                    ([u, d], "start_experience_factor") if u == "units" && d == "division" => {
+                        current.experience_pct = parse_factor_pct(value)
+                    }
+                    ([u, d], "start_equipment_factor") if u == "units" && d == "division" => {
+                        current.equipment_pct = parse_factor_pct(value)
                     }
                     ([u, d, n], "name_order") if u == "units" && d == "division" && n == "division_name" => {
                         current.order = value.parse().ok()
@@ -250,7 +285,7 @@ fn resolve_name(
 }
 
 #[cfg(test)]
-mod tests {
+mod real_oob_tests {
     use super::*;
 
     /// Проверка на реальных файлах игры; без установленной игры тест пропускается.
@@ -269,5 +304,262 @@ mod tests {
             }
             assert!(!list.is_empty(), "{tag}: нет дивизий");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Размещение и сопоставление шаблонов
+// ---------------------------------------------------------------------------
+
+/// Куда ставится дивизия из OOB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// Как в файле.
+    Exact(u32),
+    /// Файловая провинция непригодна — дивизия переезжает в крупнейший город страны.
+    Relocated { to: u32, reason: &'static str },
+    /// Поставить некуда.
+    Skipped(&'static str),
+}
+
+/// Крупнейший город страны: провинция с наибольшими победными очками в стейте страны с наибольшей
+/// суммой очков (при равенстве — меньший id). `usable` отсеивает провинции без центра и море.
+pub fn largest_city(registry: &StateRegistry, owner: &str, usable: &dyn Fn(u32) -> bool) -> Option<u32> {
+    registry
+        .states
+        .iter()
+        .filter(|s| s.owner == owner)
+        .filter_map(|s| {
+            let best = s
+                .victory_points
+                .iter()
+                .filter(|&&(p, _)| usable(p))
+                .max_by_key(|&&(p, vp)| (vp, std::cmp::Reverse(p)))?;
+            let total: u32 = s.victory_points.iter().map(|&(_, vp)| vp).sum();
+            Some((total, std::cmp::Reverse(s.id), best.0))
+        })
+        .max()
+        .map(|(_, _, province)| province)
+}
+
+/// Определяет стартовую провинцию дивизии. Непригодная (нет на карте / море / чужой стейт) заменяется
+/// на крупнейший город владельца; если и его нет — дивизия пропускается. Паник нет.
+pub fn resolve_placement(entry: &OobDivision, registry: &StateRegistry, usable: &dyn Fn(u32) -> bool) -> Placement {
+    let reason = if !usable(entry.location) {
+        "провинции нет на карте или это море"
+    } else if registry.state_of(entry.location).map(|s| s.owner.as_str()) != Some(entry.owner.as_str()) {
+        "провинция не принадлежит стране"
+    } else {
+        return Placement::Exact(entry.location);
+    };
+    match largest_city(registry, &entry.owner, usable) {
+        Some(to) => Placement::Relocated { to, reason },
+        None => Placement::Skipped(reason),
+    }
+}
+
+/// Шаблон из OOB -> зарегистрированный шаблон, доступный нации. Точное совпадение берётся как есть; иначе по
+/// ключевым словам: бронетехника -> `Panzer-Division`, моторизованные и кавалерия -> `Infanterie-Division (mot.)`,
+/// если нация их имеет; всё прочее (горные, колониальные, неизвестные) -> базовая пехота.
+pub fn resolve_template(templates: &DivisionTemplates, owner: &str, requested: &str) -> &'static str {
+    const PANZER: &str = "Panzer-Division";
+    const MOT: &str = "Infanterie-Division (mot.)";
+    if let Some(exact) = templates.available_names(owner).into_iter().find(|n| *n == requested) {
+        return exact;
+    }
+    let lower = requested.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| lower.contains(w));
+    let armored = has(&["panzer", "chars", "char ", "tank", "blind", "mécanique", "mecanique", "armo"]);
+    let fast = has(&["mot", "cavaler", "kavaller", "cavalry", "schnell"]);
+    if armored && templates.is_available(owner, PANZER) {
+        PANZER
+    } else if (armored || fast) && templates.is_available(owner, MOT) {
+        MOT
+    } else {
+        BASE_TEMPLATE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::map::StateDef;
+    use std::sync::Arc;
+
+    const SAMPLE: &str = "\
+units = {
+    division = { # первая
+        name = \"1. Infanterie-Division\"   # явное имя
+        location = 6451 # Königsberg
+        division_template = \"Infanterie-Division\"
+        start_experience_factor = 0.3
+        start_equipment_factor = 1.0
+    }
+    division =
+    {
+        division_name = { is_name_ordered = yes name_order = 25 }
+        location   =   6334
+        division_template =   \"Panzer-Division\"   # танки
+    }
+    division = { name = \"Без места\" division_template = \"Infanterie-Division\" }
+    division = { location = abc name = \"Мусор\" }
+}
+";
+
+    fn state(id: u32, owner: &str, vps: Vec<(u32, u32)>) -> Arc<StateDef> {
+        Arc::new(StateDef {
+            id,
+            name: format!("S{id}"),
+            owner: owner.into(),
+            provinces: vps.iter().map(|&(p, _)| p).collect(),
+            victory_points: vps,
+            civilian_factories: 0,
+            military_factories: 0,
+            resources: Default::default(),
+        })
+    }
+
+    fn registry() -> StateRegistry {
+        let states = vec![
+            state(1, "GER", vec![(10, 5), (11, 30)]),
+            state(2, "GER", vec![(20, 40), (21, 1)]), // сумма 41 > 35 — главный город отсюда
+            state(3, "FRA", vec![(30, 50)]),
+        ];
+        let mut registry = StateRegistry::default();
+        for s in &states {
+            for p in &s.provinces {
+                registry.province_to_state.insert(*p, s.clone());
+            }
+        }
+        registry.states = states;
+        registry
+    }
+
+    fn entry(owner: &str, location: u32) -> OobDivision {
+        OobDivision {
+            name: "d".into(),
+            owner: owner.into(),
+            location,
+            template: String::new(),
+            experience_pct: 0,
+            equipment_pct: 100,
+        }
+    }
+
+    #[test]
+    fn parser_survives_comments_odd_whitespace_and_garbage() {
+        let (_, raws) = parse_oob(SAMPLE);
+        assert_eq!(raws.len(), 4);
+        assert_eq!(raws[0].name.as_deref(), Some("1. Infanterie-Division"));
+        assert_eq!(raws[0].location, Some(6451));
+        assert_eq!(raws[0].template.as_deref(), Some("Infanterie-Division"));
+        assert_eq!((raws[1].location, raws[1].order), (Some(6334), Some(25)), "блок с переносами и лишними пробелами");
+        assert_eq!(raws[1].template.as_deref(), Some("Panzer-Division"));
+        assert_eq!(raws[2].location, None);
+        assert_eq!(raws[3].location, None, "нечисловая провинция не паникует");
+    }
+
+    #[test]
+    fn broken_scripts_never_panic() {
+        for text in ["", "}", "{{{", "units = { division = { location =", "units = { division = { name = \"x", "= = ="] {
+            let (_, raws) = parse_oob(text);
+            let _ = raws.len();
+        }
+    }
+
+    #[test]
+    fn largest_city_is_the_top_vp_province_of_the_top_state() {
+        let r = registry();
+        assert_eq!(largest_city(&r, "GER", &|_| true), Some(20));
+        assert_eq!(largest_city(&r, "GER", &|p| p != 20), Some(21), "недоступная провинция пропускается");
+        assert_eq!(largest_city(&r, "ITA", &|_| true), None);
+    }
+
+    #[test]
+    fn placement_keeps_valid_and_relocates_invalid_locations() {
+        let r = registry();
+        let usable = |p: u32| p != 11; // 11 — море / без центра
+        assert_eq!(resolve_placement(&entry("GER", 10), &r, &usable), Placement::Exact(10));
+        assert!(matches!(resolve_placement(&entry("GER", 11), &r, &usable), Placement::Relocated { to: 20, .. }), "нет центра");
+        assert!(matches!(resolve_placement(&entry("GER", 999), &r, &|p| p != 999), Placement::Relocated { to: 20, .. }), "нет такой провинции");
+        assert!(matches!(resolve_placement(&entry("GER", 30), &r, &|_| true), Placement::Relocated { to: 20, .. }), "чужая провинция");
+        assert!(matches!(resolve_placement(&entry("ITA", 10), &r, &|_| true), Placement::Skipped(_)), "у страны нет городов");
+    }
+
+    #[test]
+    fn templates_map_to_the_nearest_registered_one() {
+        let t = DivisionTemplates::default();
+        assert_eq!(resolve_template(&t, "GER", "Infanterie-Division"), "Infanterie-Division");
+        assert_eq!(resolve_template(&t, "GER", "Panzer-Division"), "Panzer-Division");
+        assert_eq!(resolve_template(&t, "GER", "Infanterie-Division (mot.)"), "Infanterie-Division (mot.)");
+        assert_eq!(resolve_template(&t, "GER", "Kavallerie-Brigade"), "Infanterie-Division (mot.)");
+        assert_eq!(resolve_template(&t, "GER", "Gebirgs-Brigade"), "Infanterie-Division");
+        assert_eq!(resolve_template(&t, "GER", "Panzer-Brigade Neu"), "Panzer-Division");
+        // у Франции танковой дивизии нет: бронетехника -> моторизованная, колониальные -> пехота
+        assert_eq!(resolve_template(&t, "FRA", "Division Légère Mécanique"), "Infanterie-Division (mot.)");
+        assert_eq!(resolve_template(&t, "FRA", "Brigade de Chars de Combat"), "Infanterie-Division (mot.)");
+        assert_eq!(resolve_template(&t, "FRA", "Division d'Infanterie Motorisée"), "Infanterie-Division (mot.)");
+        assert_eq!(resolve_template(&t, "FRA", "Division Coloniale"), "Infanterie-Division");
+        assert_eq!(resolve_template(&t, "ITA", "Panzer-Division"), "Infanterie-Division", "чужая нация без шаблона");
+        assert_eq!(resolve_template(&t, "GER", ""), "Infanterie-Division");
+    }
+
+    /// Реальный GER_1936: дивизии читаются, имена и провинции заполнены, шаблоны сопоставляются.
+    #[test]
+    fn real_data_ger_1936_is_parsed() {
+        let root = Path::new("D:\\SteamLibrary\\steamapps\\common\\Hearts of Iron IV");
+        if !root.exists() {
+            return;
+        }
+        let divisions = load_country_oob(root, "GER").expect("GER_1936.txt");
+        assert!(divisions.len() >= 20, "найдено {}", divisions.len());
+        assert!(divisions.iter().all(|d| d.location > 0 && !d.name.is_empty() && d.owner == "GER"));
+        assert!(divisions.iter().any(|d| d.name.contains("Infanterie-Division")));
+        let templates = DivisionTemplates::default();
+        for d in &divisions {
+            let mapped = resolve_template(&templates, "GER", &d.template);
+            assert!(templates.is_available("GER", mapped), "{} -> {mapped}", d.template);
+        }
+    }
+}
+
+#[cfg(test)]
+mod start_factor_tests {
+    use super::*;
+
+    #[test]
+    fn factors_become_integer_percent() {
+        assert_eq!(parse_factor_pct("0.3"), Some(30));
+        assert_eq!(parse_factor_pct("0.25"), Some(25));
+        assert_eq!(parse_factor_pct(".5"), Some(50));
+        assert_eq!(parse_factor_pct("0.999"), Some(99), "лишние знаки отбрасываются");
+        assert_eq!(parse_factor_pct("1"), Some(100));
+        assert_eq!(parse_factor_pct("1.0"), Some(100));
+        assert_eq!(parse_factor_pct("2.5"), Some(100), "потолок 100%");
+        assert_eq!(parse_factor_pct("0"), Some(0));
+        assert_eq!(parse_factor_pct("-0.3"), None);
+        assert_eq!(parse_factor_pct("abc"), None);
+        assert_eq!(parse_factor_pct(""), None);
+        assert_eq!(parse_factor_pct("."), None);
+    }
+
+    #[test]
+    fn parser_reads_start_factors_and_applies_defaults() {
+        let text = "units = {\n division = { # a\n  location = 1\n  division_template = \"Panzer-Division\"\n  start_experience_factor = 0.3\n  start_equipment_factor = 0.75\n }\n division = {\n  location = 2\n  division_template = \"Infanterie-Division\"\n }\n division = {\n  location = 3\n  start_experience_factor = oops\n  start_equipment_factor = 9\n }\n}";
+        let (_, raws) = parse_oob(text);
+        assert_eq!(raws.len(), 3);
+        assert_eq!((raws[0].experience_pct, raws[0].equipment_pct), (Some(30), Some(75)));
+        assert_eq!((raws[1].experience_pct, raws[1].equipment_pct), (None, None));
+        assert_eq!((raws[2].experience_pct, raws[2].equipment_pct), (None, Some(100)), "мусор игнорируется, избыток режется");
+    }
+
+    #[test]
+    fn real_data_has_start_experience_30_percent() {
+        let root = Path::new("D:\\SteamLibrary\\steamapps\\common\\Hearts of Iron IV");
+        if !root.exists() {
+            return;
+        }
+        let divisions = load_country_oob(root, "GER").expect("GER_1936.txt");
+        assert!(divisions.iter().all(|d| d.experience_pct == 30 && d.equipment_pct == 100));
     }
 }

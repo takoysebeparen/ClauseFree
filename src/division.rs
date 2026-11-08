@@ -9,6 +9,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
 
 use bevy::prelude::*;
+use bevy::sprite::Anchor;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts};
 
@@ -18,7 +19,7 @@ use crate::air::{air_attack_bonus_pct, air_defense_penalty_pct, air_status, side
 use crate::colors::CountryColors;
 use crate::command::SKILL_BONUS_PCT;
 use crate::economy::{update_supply_network, ArmyExperience, EquipmentType, SupplyNetwork};
-use crate::oob::OobDivisions;
+use crate::oob::{resolve_placement, resolve_template, OobDivisions, Placement};
 use crate::units::{DivisionTemplate, DivisionTemplates, BASE_TEMPLATE, INFANTRY_SPEED_KPH};
 #[cfg(test)]
 use crate::units::PLAIN_INFANTRY_TEMPLATE;
@@ -50,8 +51,10 @@ const FLANK_WIDTH_BONUS: u32 = 40;
 const RESERVE_MIN_CHANCE_PCT: u32 = 2;
 
 const DIVISION_SIZE: Vec2 = Vec2::new(24.0, 14.0);
-/// Сдвиг каждой следующей дивизии в стеке, экранные пиксели (по диагонали вправо-вниз).
-const STACK_STEP_PX: Vec2 = Vec2::new(10.0, -8.0);
+/// Ширина полоски организации / прочности на фишке при 100%, пиксели.
+const BAR_MAX_WIDTH: f32 = 12.0;
+const ORG_BAR_COLOR: Color = Color::srgb(0.25, 0.6, 0.95);
+const STRENGTH_BAR_COLOR: Color = Color::srgb(0.35, 0.8, 0.35);
 const FRAME_COLOR: Color = Color::srgb(0.9, 0.9, 0.86);
 const SELECTED_FRAME_COLOR: Color = Color::srgb(1.0, 0.85, 0.1);
 const FILL_COLOR: Color = Color::srgb(0.14, 0.16, 0.2);
@@ -103,6 +106,10 @@ pub struct Division {
     pub equipment_needs: BTreeMap<EquipmentType, u32>,
     /// Типы снаряжения, которых не хватило при последнем суточном пополнении (дефицит сдерживает рост прочности).
     pub equipment_shortage: BTreeSet<EquipmentType>,
+    /// Стартовый опыт дивизии из OOB (`start_experience_factor`), %; справочное значение.
+    pub start_experience_pct: u32,
+    /// Стартовая оснащённость из OOB (`start_equipment_factor`), %; справочное значение.
+    pub start_equipment_pct: u32,
     /// Ещё не списанный дробный урон организации, в тысячных долях очка (0..1000).
     pub org_frac: u32,
     /// Окопанность 0..=10: растёт раз в сутки на месте, сбрасывается при марше и отступлении.
@@ -253,6 +260,8 @@ impl Division {
             max_manpower: stats.total_manpower,
             equipment_needs: stats.equipment_needs,
             equipment_shortage: BTreeSet::new(),
+            start_experience_pct: 0,
+            start_equipment_pct: 100,
             org_frac: 0,
             entrenchment: 0,
             combat_width: stats.combat_width,
@@ -305,6 +314,97 @@ impl ActiveCombat {
 
 #[derive(Resource, Default)]
 pub struct SelectedDivision(pub Option<Entity>);
+
+/// Режим выбора: `whole` — выбран весь стек провинции (ПКМ командует всеми стоящими в ней дивизиями
+/// того же владельца), иначе — только `SelectedDivision` (выбор строки в инспекторе).
+#[derive(Resource, Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedGroup {
+    pub whole: bool,
+}
+
+/// Полоска организации на фишке (дочерний спрайт).
+#[derive(Component)]
+struct OrgBar;
+/// Полоска прочности на фишке (дочерний спрайт).
+#[derive(Component)]
+struct StrengthBar;
+
+/// Стек стоящих дивизий одной провинции: главная фишка и члены по возрастанию id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackInfo {
+    pub head: Entity,
+    pub members: Vec<(u32, Entity)>,
+}
+
+/// Текущий вид стеков по провинциям (обновляется каждый кадр; нужен значкам и тестам).
+#[derive(Resource, Default)]
+pub struct StackView(pub BTreeMap<u32, StackInfo>);
+
+/// Собирает стеки стоящих дивизий: `(сущность, id дивизии, провинция)`. Главная фишка — выбранная дивизия
+/// стека, иначе с наименьшим id. Порядок членов и результат детерминированы.
+pub fn stack_layout(items: impl IntoIterator<Item = (Entity, u32, u32)>, selected: Option<Entity>) -> BTreeMap<u32, StackInfo> {
+    let mut grouped: BTreeMap<u32, Vec<(u32, Entity)>> = BTreeMap::new();
+    for (entity, id, province) in items {
+        grouped.entry(province).or_default().push((id, entity));
+    }
+    grouped
+        .into_iter()
+        .map(|(province, mut members)| {
+            members.sort_unstable_by_key(|&(id, _)| id);
+            let head = selected
+                .filter(|sel| members.iter().any(|&(_, e)| e == *sel))
+                .unwrap_or(members[0].1);
+            (province, StackInfo { head, members })
+        })
+        .collect()
+}
+
+/// Процент `cur / max` целыми числами (0 при нулевом максимуме), не больше 100.
+pub fn percent(cur: u32, max: u32) -> u32 {
+    if max == 0 {
+        return 0;
+    }
+    (u64::from(cur) * 100 / u64::from(max)).min(100) as u32
+}
+
+/// Среднее арифметическое процентов (целое, вниз); пустой набор — 0.
+pub fn average_percent(values: &[u32]) -> u32 {
+    if values.is_empty() {
+        return 0;
+    }
+    (values.iter().map(|&v| u64::from(v)).sum::<u64>() / values.len() as u64) as u32
+}
+
+/// Значок количества дивизий в стеке в квадратной рамке: `[3]`.
+pub fn stack_badge_text(count: usize) -> String {
+    format!("[{count}]")
+}
+
+/// Строка инспектора: `1. Infanterie-Division | Орг: 100% | HP: 100%`.
+pub fn stack_row_text(index: usize, d: &Division) -> String {
+    format!(
+        "{index}. {} | Орг: {}% | HP: {}%",
+        d.name,
+        percent(d.current_org, d.max_org),
+        percent(d.current_strength, d.max_strength)
+    )
+}
+
+/// Кому отдаётся приказ ПКМ: вся группа (стоящие дивизии провинции выбранной, того же владельца, по id)
+/// либо только выбранная дивизия.
+pub fn order_targets(divisions: &Query<(Entity, &Division)>, selected: Entity, whole: bool) -> Vec<Entity> {
+    let Ok((_, sel)) = divisions.get(selected) else { return Vec::new() };
+    if !whole || sel.movement.is_some() {
+        return vec![selected];
+    }
+    let mut group: Vec<(u32, Entity)> = divisions
+        .iter()
+        .filter(|(_, d)| d.current_province == sel.current_province && d.movement.is_none() && d.owner == sel.owner)
+        .map(|(e, d)| (d.id, e))
+        .collect();
+    group.sort_unstable();
+    group.into_iter().map(|(_, e)| e).collect()
+}
 
 /// Приказ на перемещение дивизии в соседнюю провинцию.
 #[derive(Event, Debug, Clone, Copy)]
@@ -425,6 +525,8 @@ pub struct DivisionPlugin;
 impl Plugin for DivisionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SelectedDivision>()
+            .init_resource::<SelectedGroup>()
+            .init_resource::<StackView>()
             .init_resource::<DivisionTemplates>()
             .add_event::<OrderMove>()
             .add_event::<RefitDivision>()
@@ -441,13 +543,14 @@ impl Plugin for DivisionPlugin {
                     update_division_positions,
                     scale_divisions_to_zoom,
                     update_selection_visual,
+                    update_stack_visuals,
                 )
                     .chain()
                     .after(pick_province)
                     .after(ClockSet)
                     .in_set(CombatSet),
             )
-            .add_systems(Update, (combat_ui, division_info_ui))
+            .add_systems(Update, (combat_ui, division_info_ui, stack_badges_ui))
             .add_systems(Update, daily_entrenchment.after(ClockSet))
             // переформирование применяется до боевой цепочки кадра
             .add_systems(Update, apply_refits.before(CombatSet))
@@ -491,6 +594,24 @@ fn spawn_division_entity(commands: &mut Commands, division: Division, center: Ve
                 transform: Transform::from_xyz(-6.0, 0.0, 0.2),
                 ..default()
             });
+            // полоски: организация (сверху) и прочность (снизу), растут вправо от левого края
+            for (y, color, is_org) in [(2.5_f32, ORG_BAR_COLOR, true), (-2.5_f32, STRENGTH_BAR_COLOR, false)] {
+                let bar = SpriteBundle {
+                    sprite: Sprite {
+                        color,
+                        custom_size: Some(Vec2::new(BAR_MAX_WIDTH, 3.0)),
+                        anchor: Anchor::CenterLeft,
+                        ..default()
+                    },
+                    transform: Transform::from_xyz(-1.0, y, 0.3),
+                    ..default()
+                };
+                if is_org {
+                    p.spawn((bar, OrgBar));
+                } else {
+                    p.spawn((bar, StrengthBar));
+                }
+            }
         });
 }
 
@@ -505,6 +626,7 @@ fn spawn_oob_divisions(
     oob: Res<OobDivisions>,
     centers: Res<ProvinceCenters>,
     map: Res<ProvinceMap>,
+    registry: Res<StateRegistry>,
     templates: Res<DivisionTemplates>,
     colors: Res<CountryColors>,
 ) {
@@ -527,32 +649,64 @@ fn spawn_oob_divisions(
     // Счётчики по странам, порядок вывода детерминирован
     let mut per_owner: BTreeMap<&str, u32> = BTreeMap::new();
 
+    // Провинция пригодна, если у неё есть центр и это не море
+    let usable = |province: u32| centers.centers.contains_key(&province) && !is_water(&map, province);
+    let mut relocated = 0u32;
+    let mut remapped: BTreeMap<(String, String), u32> = BTreeMap::new();
+
     for entry in &oob.0 {
-        let Some(center) = centers.centers.get(&entry.location) else {
+        let location = match resolve_placement(entry, &registry, &usable) {
+            Placement::Exact(province) => province,
+            Placement::Relocated { to, reason } => {
+                eprintln!(
+                    "[ПРЕДУПРЕЖДЕНИЕ] OOB {}: \"{}\" в провинции {}: {reason}; перенесена в {to}",
+                    entry.owner, entry.name, entry.location
+                );
+                relocated += 1;
+                to
+            }
+            Placement::Skipped(reason) => {
+                eprintln!(
+                    "[ПРЕДУПРЕЖДЕНИЕ] OOB {}: \"{}\" в провинции {}: {reason}; города для переноса нет, пропущена",
+                    entry.owner, entry.name, entry.location
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+        let Some(center) = centers.centers.get(&location) else {
             skipped += 1;
             continue;
         };
-        if is_water(&map, entry.location) {
-            skipped += 1;
-            continue;
+        // Шаблон из реестра нации; остальные сопоставляются с ближайшим доступным
+        let template = resolve_template(&templates, &entry.owner, &entry.template);
+        if template != entry.template {
+            *remapped.entry((entry.template.clone(), template.to_string())).or_default() += 1;
         }
-        // Шаблон из реестра; незарегистрированные (французские и т.п.) пока считаются базовым.
-        let division = Division::from_template(
+        let mut division = Division::from_template(
             next_id,
             entry.name.clone(),
             entry.owner.clone(),
-            entry.location,
-            entry.template.clone(),
-            templates.get_or_base(&entry.template),
+            location,
+            template.to_string(),
+            templates.get_or_base(template),
         );
+        division.start_experience_pct = entry.experience_pct;
+        division.start_equipment_pct = entry.equipment_pct;
         spawn_division_entity(&mut commands, division, *center, &colors);
         *per_owner.entry(entry.owner.as_str()).or_default() += 1;
         next_id += 1;
     }
 
+    for ((from, to), count) in &remapped {
+        println!("[OOB] Шаблон \"{from}\" -> \"{to}\" ({count} шт.)");
+    }
+    for (tag, count) in &per_owner {
+        println!("[OOB] Армия {tag}_1936 развёрнута: {count} дивизий размещено на карте.");
+    }
     let breakdown: Vec<String> = per_owner.iter().map(|(tag, n)| format!("{tag} {n}")).collect();
     println!(
-        "[OOB] Заспавнено дивизий: {} ({}), пропущено (море / нет центра): {skipped}",
+        "[OOB] Заспавнено дивизий: {} ({}), перенесено в крупнейший город: {relocated}, пропущено: {skipped}",
         next_id - 1,
         breakdown.join(", ")
     );
@@ -562,40 +716,36 @@ fn spawn_oob_divisions(
 // Ввод (формирует только выбор / события)
 // ---------------------------------------------------------------------------
 
-/// ЛКМ: выбрать дивизию в провинции под курсором; клик в другое место снимает выбор.
+/// ЛКМ по провинции: выбирает весь стек стоящих в ней дивизий (активна дивизия с наименьшим id,
+/// инспектор показывает список). Клик в другое место снимает выбор.
 fn select_division_input(
     mouse: Res<ButtonInput<MouseButton>>,
     hovered: Res<HoveredProvince>,
     divisions: Query<(Entity, &Division)>,
     mut selected: ResMut<SelectedDivision>,
+    mut group: ResMut<SelectedGroup>,
     mut contexts: EguiContexts,
 ) {
     if !mouse.just_pressed(MouseButton::Left) || contexts.try_ctx_mut().is_none_or(|ctx| ctx.wants_pointer_input()) {
         return;
     }
+    group.whole = false;
     selected.0 = hovered.id.and_then(|province| {
         // Стек провинции: стоящие дивизии по возрастанию id — детерминированный порядок
-        let mut stack: Vec<(u32, Entity)> = divisions
-            .iter()
-            .filter(|(_, d)| d.current_province == province && d.movement.is_none())
-            .map(|(e, d)| (d.id, e))
-            .collect();
-        stack.sort_unstable();
-
-        if stack.is_empty() {
-            // Остались только идущие в марше (их фишки вне центра): выбираем с наименьшим id
-            return divisions
-                .iter()
-                .filter(|(_, d)| d.current_province == province)
-                .min_by_key(|(_, d)| d.id)
-                .map(|(e, _)| e);
+        let standing = stack_layout(
+            divisions.iter().filter(|(_, d)| d.current_province == province && d.movement.is_none()).map(|(e, d)| (e, d.id, province)),
+            None,
+        );
+        if let Some(stack) = standing.get(&province) {
+            group.whole = true;
+            return Some(stack.members[0].1);
         }
-        // Циклический выбор: если выбрана дивизия этой провинции — следующая, после последней — первая
-        let next = match selected.0.and_then(|cur| stack.iter().position(|&(_, e)| e == cur)) {
-            Some(i) => (i + 1) % stack.len(),
-            None => 0,
-        };
-        Some(stack[next].1)
+        // Остались только идущие в марше (их фишки вне центра): выбираем с наименьшим id
+        divisions
+            .iter()
+            .filter(|(_, d)| d.current_province == province)
+            .min_by_key(|(_, d)| d.id)
+            .map(|(e, _)| e)
     });
 }
 
@@ -605,6 +755,8 @@ fn order_move_input(
     windows: Query<&Window, With<PrimaryWindow>>,
     hovered: Res<HoveredProvince>,
     selected: Res<SelectedDivision>,
+    group: Res<SelectedGroup>,
+    divisions: Query<(Entity, &Division)>,
     mut orders: EventWriter<OrderMove>,
     mut press_pos: Local<Option<Vec2>>,
     mut contexts: EguiContexts,
@@ -625,8 +777,11 @@ fn order_move_input(
     if start.distance(end) > CLICK_MAX_DRAG {
         return; // это была панорама
     }
-    if let (Some(division), Some(target)) = (selected.0, hovered.id) {
-        orders.send(OrderMove { division, target });
+    if let (Some(selected), Some(target)) = (selected.0, hovered.id) {
+        // вся группа стека или одна дивизия, выбранная в инспекторе
+        for division in order_targets(&divisions, selected, group.whole) {
+            orders.send(OrderMove { division, target });
+        }
     }
 }
 
@@ -1678,18 +1833,9 @@ fn resolve_combats(
 fn update_division_positions(
     time: Res<Time>,
     centers: Res<ProvinceCenters>,
-    cameras: Query<&OrthographicProjection, With<MainCamera>>,
-    mut stationary: Local<Vec<(u32, u32)>>,
     mut query: Query<(&Division, &mut Transform)>,
 ) {
     let smooth = (VISUAL_SMOOTHING * time.delta_seconds()).min(1.0);
-    let zoom = cameras.get_single().map_or(1.0, |p| p.scale);
-
-    // Стоящие дивизии (провинция, id) в отсортированном виде: слот в стеке = номер среди дивизий
-    // той же провинции. Сдвиг только визуальный, на симуляцию не влияет.
-    stationary.clear();
-    stationary.extend(query.iter().filter(|(d, _)| d.movement.is_none()).map(|(d, _)| (d.current_province, d.id)));
-    stationary.sort_unstable();
 
     for (division, mut transform) in &mut query {
         let target = match division.movement {
@@ -1704,14 +1850,9 @@ fn update_division_positions(
                 };
                 a.lerp(*b, done)
             }
+            // Стоящие дивизии провинции сходятся в её центр: на экране видна одна фишка стека
             None => match centers.centers.get(&division.current_province) {
-                Some(c) => {
-                    let key = (division.current_province, division.id);
-                    let first = stationary.partition_point(|&(p, _)| p < division.current_province);
-                    let slot = stationary.binary_search(&key).map_or(0, |pos| pos - first);
-                    // Шаг сдвига задан в экранных пикселях, поэтому масштабируется вместе с зумом
-                    *c + STACK_STEP_PX * (slot as f32) * zoom
-                }
+                Some(c) => *c,
                 None => continue,
             },
         };
@@ -1732,6 +1873,76 @@ fn scale_divisions_to_zoom(
         if transform.scale != scale {
             transform.scale = scale;
         }
+    }
+}
+
+/// Агрегация стеков (только визуал): в провинции видна одна фишка стоящего стека, остальные скрыты.
+/// Полоски организации и прочности на видимой фишке — среднее арифметическое процентов всех дивизий
+/// стека. Марширующие дивизии рисуются отдельно, со своими значениями.
+fn update_stack_visuals(
+    selected: Res<SelectedDivision>,
+    mut view: ResMut<StackView>,
+    mut divisions: Query<(Entity, &Division, &mut Visibility)>,
+    mut bars: Query<(&Parent, &mut Sprite, Has<OrgBar>), (Or<(With<OrgBar>, With<StrengthBar>)>, Without<Division>)>,
+) {
+    view.0 = stack_layout(
+        divisions.iter().filter(|(_, d, _)| d.movement.is_none()).map(|(e, d, _)| (e, d.id, d.current_province)),
+        selected.0,
+    );
+    // Значения полосок для главных фишек стеков: среднее по членам
+    let mut averages: BTreeMap<Entity, (u32, u32)> = BTreeMap::new();
+    for stack in view.0.values() {
+        let (mut orgs, mut hps) = (Vec::new(), Vec::new());
+        for &(_, e) in &stack.members {
+            if let Ok((_, d, _)) = divisions.get(e) {
+                orgs.push(percent(d.current_org, d.max_org));
+                hps.push(percent(d.current_strength, d.max_strength));
+            }
+        }
+        averages.insert(stack.head, (average_percent(&orgs), average_percent(&hps)));
+    }
+
+    let heads: BTreeSet<Entity> = view.0.values().map(|s| s.head).collect();
+    for (entity, d, mut visibility) in &mut divisions {
+        let shown = d.movement.is_some() || heads.contains(&entity);
+        let wanted = if shown { Visibility::Inherited } else { Visibility::Hidden };
+        if *visibility != wanted {
+            *visibility = wanted;
+        }
+    }
+    for (parent, mut sprite, is_org) in &mut bars {
+        let Ok((_, d, _)) = divisions.get(parent.get()) else { continue };
+        let (org, hp) = averages
+            .get(&parent.get())
+            .copied()
+            .unwrap_or((percent(d.current_org, d.max_org), percent(d.current_strength, d.max_strength)));
+        let value = if is_org { org } else { hp };
+        let size = Some(Vec2::new(BAR_MAX_WIDTH * value as f32 / 100.0, 3.0));
+        if sprite.custom_size != size {
+            sprite.custom_size = size;
+        }
+    }
+}
+
+/// Значок `[N]` в углу фишки стека (рисуется egui под окнами, мимо мыши).
+fn stack_badges_ui(
+    mut contexts: EguiContexts,
+    view: Res<StackView>,
+    cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
+    transforms: Query<&Transform, With<Division>>,
+) {
+    let Some(ctx) = contexts.try_ctx_mut() else { return };
+    let Ok((camera, camera_transform)) = cameras.get_single() else { return };
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("stack_badges")));
+    for stack in view.0.values().filter(|s| s.members.len() > 1) {
+        let Ok(transform) = transforms.get(stack.head) else { continue };
+        let Some(screen) = camera.world_to_viewport(camera_transform, transform.translation) else { continue };
+        // правый верхний угол фишки: размер на экране постоянен (billboard)
+        let anchor = egui::pos2(screen.x + DIVISION_SIZE.x * 0.5, screen.y - DIVISION_SIZE.y * 0.5);
+        let text = stack_badge_text(stack.members.len());
+        let rect = egui::Rect::from_min_size(anchor + egui::vec2(-2.0, -8.0), egui::vec2(8.0 * text.len() as f32 + 4.0, 13.0));
+        painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(20, 25, 35));
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(11.0), egui::Color32::from_rgb(255, 220, 90));
     }
 }
 
@@ -1918,8 +2129,10 @@ fn combat_ui(
 /// Окно выбранной дивизии: организация, прочность и статус.
 fn division_info_ui(
     mut contexts: EguiContexts,
-    selected: Res<SelectedDivision>,
+    mut selected: ResMut<SelectedDivision>,
+    mut group: ResMut<SelectedGroup>,
     divisions: Query<&Division>,
+    all: Query<(Entity, &Division)>,
     combats: Query<&ActiveCombat>,
     map: Res<ProvinceMap>,
     templates: Res<DivisionTemplates>,
@@ -1930,6 +2143,20 @@ fn division_info_ui(
     let Some(entity) = selected.0 else { return };
     let Ok(d) = divisions.get(entity) else { return };
     let Some(ctx) = contexts.try_ctx_mut() else { return };
+
+    // Строки стека: стоящие дивизии той же провинции по id (для марширующей дивизии список пуст)
+    let rows: Vec<(Entity, String)> = if d.movement.is_none() {
+        let mut standing: Vec<(u32, Entity, &Division)> = all
+            .iter()
+            .filter(|(_, o)| o.current_province == d.current_province && o.movement.is_none())
+            .map(|(e, o)| (o.id, e, o))
+            .collect();
+        standing.sort_unstable_by_key(|&(id, _, _)| id);
+        standing.iter().enumerate().map(|(i, &(_, e, o))| (e, stack_row_text(i + 1, o))).collect()
+    } else {
+        Vec::new()
+    };
+    let mut clicked: Option<Entity> = None;
 
     let combat = combats.iter().find(|c| c.involves(entity));
     let status = match combat {
@@ -1957,17 +2184,28 @@ fn division_info_ui(
                 ui.label(format!("Дивизия: \"{}\"", d.name));
                 ui.label(egui::RichText::new(format!("[{}]", d.owner)).color(owner_color).strong());
             });
-            // Позиция в стеке провинции (клик по провинции переключает дивизии по кругу)
-            let mut stack: Vec<u32> = divisions
-                .iter()
-                .filter(|o| o.current_province == d.current_province && o.movement.is_none())
-                .map(|o| o.id)
-                .collect();
-            stack.sort_unstable();
-            if let Some(i) = stack.iter().position(|&id| id == d.id).filter(|_| d.movement.is_none()) {
-                ui.label(format!("Дивизия {} из {} в провинции #{}", i + 1, stack.len(), d.current_province));
+            // Стек провинции: кликабельные строки; ПКМ командует всей группой, пока она выбрана целиком
+            if rows.len() > 1 {
+                ui.label(format!(
+                    "Стек в провинции #{} ({}). {}",
+                    d.current_province,
+                    stack_badge_text(rows.len()),
+                    if group.whole { "Выбрана вся группа" } else { "Выбрана одна дивизия" }
+                ));
+                for (row_entity, text) in &rows {
+                    if ui.selectable_label(*row_entity == entity && !group.whole, text).clicked() {
+                        clicked = Some(*row_entity);
+                    }
+                }
+                if ui.add_enabled(!group.whole, egui::Button::new("Выбрать всю группу")).clicked() {
+                    group.whole = true;
+                }
+                ui.separator();
             }
-            ui.label(format!("ID: {}", d.id));
+            ui.label(format!(
+                "ID: {} | Старт: опыт {}%, оснащённость {}%",
+                d.id, d.start_experience_pct, d.start_equipment_pct
+            ));
             ui.label(format!("Провинция: {}", d.current_province));
             ui.label(format!("Организация: {}/{}", d.current_org, d.max_org));
             ui.label(format!(
@@ -2069,6 +2307,11 @@ fn division_info_ui(
                 }
             }
         });
+    // выбор строки инспектора переключает управление на одну дивизию
+    if let Some(row) = clicked {
+        selected.0 = Some(row);
+        group.whole = false;
+    }
 }
 
 #[cfg(test)]
@@ -3260,5 +3503,160 @@ mod equipment_status_tests {
         assert_eq!(d.equipment_needs.get(&EquipmentType::LightTank), Some(&200));
         assert!(!d.equipment_needs.contains_key(&EquipmentType::Artillery));
         assert_eq!(d.required_equipment(), 400);
+    }
+}
+
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+
+    fn division(id: u32, owner: &str, province: u32, org_pct: u32, moving: bool) -> Division {
+        let templates = DivisionTemplates::default();
+        let mut d = Division::from_template(
+            id,
+            format!("Infanterie-Division {id}"),
+            owner.to_string(),
+            province,
+            BASE_TEMPLATE.to_string(),
+            templates.get_or_base(BASE_TEMPLATE),
+        );
+        d.current_org = d.max_org * org_pct / 100;
+        if moving {
+            d.movement = Some(MovementProgress { from: province, to: province + 1, hours_left: 10, total_hours: 24 });
+        }
+        d
+    }
+
+    fn spawn(app: &mut App, d: Division) -> Entity {
+        app.world_mut()
+            .spawn((d, Visibility::default(), Transform::default()))
+            .with_children(|p| {
+                p.spawn((Sprite::default(), OrgBar));
+                p.spawn((Sprite::default(), StrengthBar));
+            })
+            .id()
+    }
+
+    fn visibility(app: &App, e: Entity) -> Visibility {
+        *app.world().get::<Visibility>(e).expect("видимость")
+    }
+
+    fn bar_width(app: &mut App, parent: Entity, org: bool) -> f32 {
+        let mut query = app.world_mut().query::<(&Parent, &Sprite, Has<OrgBar>)>();
+        query
+            .iter(app.world())
+            .find(|(p, _, is_org)| p.get() == parent && *is_org == org)
+            .and_then(|(_, s, _)| s.custom_size)
+            .map_or(-1.0, |size| size.x)
+    }
+
+    fn visuals_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<SelectedDivision>().init_resource::<StackView>().add_systems(Update, update_stack_visuals);
+        app
+    }
+
+    #[test]
+    fn layout_groups_by_province_and_picks_lowest_id_as_head() {
+        let mut world = World::new();
+        let (a, b, c, d) = (world.spawn_empty().id(), world.spawn_empty().id(), world.spawn_empty().id(), world.spawn_empty().id());
+        let layout = stack_layout([(a, 7, 1), (b, 3, 1), (c, 5, 1), (d, 9, 2)], None);
+        assert_eq!(layout.len(), 2);
+        assert_eq!(layout[&1].head, b, "наименьший id = 3");
+        assert_eq!(layout[&1].members.iter().map(|m| m.0).collect::<Vec<_>>(), vec![3, 5, 7]);
+        assert_eq!(layout[&2].members.len(), 1);
+        // выбранная дивизия стека становится главной фишкой; выбранная из другой провинции — нет
+        assert_eq!(stack_layout([(a, 7, 1), (b, 3, 1)], Some(a))[&1].head, a);
+        assert_eq!(stack_layout([(a, 7, 1), (b, 3, 1)], Some(d))[&1].head, b);
+        assert!(stack_layout([], None).is_empty());
+    }
+
+    #[test]
+    fn percent_and_average_are_integer() {
+        assert_eq!(percent(95, 100), 95);
+        assert_eq!(percent(1, 3), 33);
+        assert_eq!(percent(5, 0), 0);
+        assert_eq!(percent(200, 100), 100);
+        assert_eq!(average_percent(&[100, 50, 0]), 50);
+        assert_eq!(average_percent(&[100, 95]), 97);
+        assert_eq!(average_percent(&[]), 0);
+    }
+
+    #[test]
+    fn badge_and_inspector_row_texts() {
+        assert_eq!(stack_badge_text(3), "[3]");
+        let d = division(1, "GER", 5, 95, false);
+        assert_eq!(stack_row_text(2, &d), "2. Infanterie-Division 1 | Орг: 95% | HP: 100%");
+    }
+
+    #[test]
+    fn only_one_token_is_visible_per_stack_and_marching_divisions_stay_visible() {
+        let mut app = visuals_app();
+        let e1 = spawn(&mut app, division(1, "GER", 5, 100, false));
+        let e2 = spawn(&mut app, division(2, "GER", 5, 100, false));
+        let e3 = spawn(&mut app, division(3, "GER", 5, 100, false));
+        let marching = spawn(&mut app, division(4, "GER", 5, 100, true));
+        let solo = spawn(&mut app, division(5, "GER", 6, 100, false));
+        app.update();
+        assert_eq!(visibility(&app, e1), Visibility::Inherited);
+        assert_eq!(visibility(&app, e2), Visibility::Hidden);
+        assert_eq!(visibility(&app, e3), Visibility::Hidden);
+        assert_eq!(visibility(&app, marching), Visibility::Inherited, "марш рисуется отдельно");
+        assert_eq!(visibility(&app, solo), Visibility::Inherited);
+        assert_eq!(app.world().resource::<StackView>().0[&5].members.len(), 3, "марширующая в стек не входит");
+        // выбранная дивизия берёт главную фишку на себя
+        app.world_mut().resource_mut::<SelectedDivision>().0 = Some(e3);
+        app.update();
+        assert_eq!(visibility(&app, e3), Visibility::Inherited);
+        assert_eq!(visibility(&app, e1), Visibility::Hidden);
+    }
+
+    #[test]
+    fn stack_bars_show_the_arithmetic_mean_of_all_divisions() {
+        let mut app = visuals_app();
+        let e1 = spawn(&mut app, division(1, "GER", 5, 100, false));
+        let _e2 = spawn(&mut app, division(2, "GER", 5, 50, false));
+        let _e3 = spawn(&mut app, division(3, "GER", 5, 0, false));
+        let solo = spawn(&mut app, division(4, "GER", 6, 40, false));
+        app.update();
+        assert_eq!(bar_width(&mut app, e1, true), 6.0, "орг (100 + 50 + 0) / 3 = 50% от 12 px");
+        assert_eq!(bar_width(&mut app, e1, false), 12.0, "прочность у всех 100%");
+        assert_eq!(bar_width(&mut app, solo, true), 4.8, "одиночная фишка показывает свою организацию 40%");
+    }
+
+    #[test]
+    fn standing_divisions_share_the_province_center_without_offset() {
+        let mut app = App::new();
+        let mut time = Time::<()>::default();
+        time.advance_by(std::time::Duration::from_secs(1)); // сглаживание = 1: сразу в цель
+        app.insert_resource(time)
+            .insert_resource(ProvinceCenters { centers: [(5, Vec2::new(100.0, 50.0))].into_iter().collect() })
+            .add_systems(Update, update_division_positions);
+        let ents: Vec<Entity> = (1..=3).map(|id| spawn(&mut app, division(id, "GER", 5, 100, false))).collect();
+        app.update();
+        for e in ents {
+            let t = app.world().get::<Transform>(e).expect("позиция").translation;
+            assert_eq!((t.x, t.y), (100.0, 50.0), "никакого диагонального веера");
+        }
+    }
+
+    #[test]
+    fn rmb_orders_the_whole_group_or_only_the_picked_division() {
+        let mut app = App::new();
+        let e1 = spawn(&mut app, division(1, "GER", 5, 100, false));
+        let e2 = spawn(&mut app, division(2, "GER", 5, 100, false));
+        let foreign = spawn(&mut app, division(3, "FRA", 5, 100, false));
+        let marching = spawn(&mut app, division(4, "GER", 5, 100, true));
+        let other = spawn(&mut app, division(5, "GER", 6, 100, false));
+        let targets = |app: &mut App, sel: Entity, whole: bool| {
+            app.world_mut().run_system_once(move |q: Query<(Entity, &Division)>| order_targets(&q, sel, whole))
+        };
+        assert_eq!(targets(&mut app, e2, true), vec![e1, e2], "вся группа по id; чужой, марширующий и из другой провинции — нет");
+        assert_eq!(targets(&mut app, e2, false), vec![e2], "одна выбранная");
+        assert_eq!(targets(&mut app, marching, true), vec![marching]);
+        assert_eq!(targets(&mut app, other, true), vec![other]);
+        assert_eq!(targets(&mut app, foreign, true), vec![foreign]);
+        assert!(targets(&mut app, Entity::PLACEHOLDER, true).is_empty(), "несуществующая сущность — без паники");
     }
 }
