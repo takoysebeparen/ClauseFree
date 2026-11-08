@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
+use crate::colors::CountryColors;
 use crate::division::{Division, SelectedDivision};
 use crate::frontline::Frontline;
 use crate::map::{ProvinceControllerChanged, ProvinceControllers, StateRegistry};
@@ -200,7 +201,11 @@ fn country_name_genitive(tag: &str) -> &str {
     }
 }
 
-fn surrender_ui(mut contexts: EguiContexts, mut state: ResMut<NationalSurrenderState>) {
+fn surrender_ui(
+    mut contexts: EguiContexts,
+    mut state: ResMut<NationalSurrenderState>,
+    colors: Res<CountryColors>,
+) {
     let Some(ctx) = contexts.try_ctx_mut() else { return };
     let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
 
@@ -217,7 +222,7 @@ fn surrender_ui(mut contexts: EguiContexts, mut state: ResMut<NationalSurrenderS
                 if state.capitulated.contains_key(tag) {
                     ui.label(egui::RichText::new(text).color(egui::Color32::from_rgb(230, 90, 80)).strong());
                 } else {
-                    ui.label(text);
+                    ui.label(egui::RichText::new(text).color(colors.ui_color32(tag)));
                 }
             }
         });

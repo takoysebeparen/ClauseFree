@@ -11,6 +11,7 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::clock::{ClockSet, DailyTickEvent};
+use crate::colors::CountryColors;
 use crate::command::Commander;
 use crate::division::{
     ActiveCombat, Division, OrderMove, MAX_PLANNING, PLANNING_DECAY_PER_DAY, PLANNING_GAIN_PER_DAY,
@@ -433,11 +434,14 @@ fn frontline_panel(
     divisions: Query<(Entity, &Division)>,
     combats: Query<&ActiveCombat>,
     commanders: Query<&Commander>,
+    colors: Res<CountryColors>,
     mut commands_out: EventWriter<CreateFrontline>,
     mut attack_out: EventWriter<ExecuteFrontlineAttack>,
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else { return };
-    let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
+    let frame = egui::Frame::window(&ctx.style())
+        .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200))
+        .stroke(egui::Stroke::new(2.0_f32, colors.ui_color32(&player.0)));
 
     egui::Window::new("Управление")
         .anchor(egui::Align2::RIGHT_BOTTOM, [-10.0, -10.0])
@@ -472,13 +476,13 @@ fn frontline_panel(
 
             for (_, f) in &frontlines {
                 let avg = average_planning(f, &divisions);
-                ui.label(format!(
-                    "Фронт {} vs {}: участков {}, дивизий {}",
-                    f.owner,
-                    f.enemy,
-                    f.provinces.len(),
-                    f.assigned_divisions.len()
-                ));
+                ui.horizontal(|ui| {
+                    ui.label("Фронт");
+                    ui.label(egui::RichText::new(&f.owner).color(colors.ui_color32(&f.owner)).strong());
+                    ui.label("vs");
+                    ui.label(egui::RichText::new(&f.enemy).color(colors.ui_color32(&f.enemy)).strong());
+                    ui.label(format!(": участков {}, дивизий {}", f.provinces.len(), f.assigned_divisions.len()));
+                });
                 match f.commander.and_then(|e| commanders.get(e).ok()) {
                     Some(c) => {
                         ui.label(format!(

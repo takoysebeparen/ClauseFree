@@ -2,6 +2,7 @@ mod ai;
 mod air;
 mod camera;
 mod clock;
+mod colors;
 mod command;
 mod division;
 mod economy;

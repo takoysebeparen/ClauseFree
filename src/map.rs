@@ -15,6 +15,7 @@ use bevy_egui::{egui, EguiContexts};
 use image::RgbaImage;
 
 use crate::camera::{CameraSet, MainCamera};
+use crate::colors::CountryColors;
 use crate::WINDOW_TITLE;
 
 // ---------------------------------------------------------------------------
@@ -270,6 +271,9 @@ impl Plugin for MapPlugin {
         // Order of Battle 1936 (GER, FRA): читается на лету, спавн — в division.rs
         app.insert_resource(crate::oob::load_oob(&self.root));
 
+        // Аутентичные цвета стран из common/countries/colors.txt и файлов стран
+        app.insert_resource(crate::colors::load_country_colors(&self.root));
+
         // Стартовые контроллеры = владельцы стейтов
         let controllers = ProvinceControllers(
             registry.province_to_state.iter().map(|(&province, state)| (province, state.owner.clone())).collect(),
@@ -307,55 +311,6 @@ impl Plugin for MapPlugin {
 /// Цвет воды / морских и нейтральных зон.
 const WATER_COLOR: [u8; 3] = [20, 40, 70];
 
-/// Базовые цвета ключевых стран (теги HOI4).
-fn known_country_color(tag: &str) -> Option<[u8; 3]> {
-    Some(match tag {
-        "GER" => [80, 80, 80],
-        "SOV" => [160, 40, 40],
-        "FRA" => [45, 95, 170],
-        "ENG" => [180, 50, 50],
-        "USA" => [60, 110, 170],
-        "ITA" => [80, 130, 80],
-        "JAP" => [220, 220, 210],
-        "POL" => [200, 110, 140],
-        "CHI" => [190, 170, 60],
-        "CAN" => [200, 90, 90],
-        "AST" => [70, 140, 150],
-        "SPR" => [200, 160, 60],
-        "TUR" => [150, 110, 60],
-        "ROM" => [200, 180, 80],
-        "YUG" => [90, 120, 170],
-        "HUN" => [120, 160, 100],
-        "CZE" => [110, 140, 200],
-        "SWE" => [70, 120, 190],
-        "FIN" => [150, 190, 220],
-        "POR" => [60, 130, 110],
-        "BRA" => [90, 170, 90],
-        "ARG" => [130, 180, 220],
-        "MEX" => [100, 140, 70],
-        "RAJ" => [210, 130, 160],
-        "SAF" => [120, 150, 60],
-        "PER" => [120, 150, 110],
-        _ => return None,
-    })
-}
-
-/// Детерминированный цвет из тега: FNV-1a (не зависит от версии Rust / случайных ключей).
-fn hashed_country_color(tag: &str) -> [u8; 3] {
-    let mut h: u32 = 0x811c_9dc5;
-    for b in tag.bytes() {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x0100_0193);
-    }
-    // Диапазон 70..=219: ярче воды и не белый
-    let ch = |shift: u32| 70 + ((h >> shift) & 0xFF) as u8 % 150;
-    [ch(0), ch(8), ch(16)]
-}
-
-pub fn country_color(tag: &str) -> [u8; 3] {
-    known_country_color(tag).unwrap_or_else(|| hashed_country_color(tag))
-}
-
 // ---------------------------------------------------------------------------
 // Рендер политической карты на GPU: текстура id провинций + палитра контроллеров
 // ---------------------------------------------------------------------------
@@ -390,10 +345,10 @@ pub struct MapPaint {
 }
 
 /// Цвет контроллера в палитре. Альфа 255 — суша, 0 — вода / без стейта (границы не рисуются).
-fn palette_texel(controller: Option<&str>) -> [u8; 4] {
+fn palette_texel(controller: Option<&str>, colors: &CountryColors) -> [u8; 4] {
     match controller {
         Some(tag) => {
-            let [r, g, b] = country_color(tag);
+            let [r, g, b] = colors.map_rgb(tag);
             [r, g, b, 255]
         }
         None => [WATER_COLOR[0], WATER_COLOR[1], WATER_COLOR[2], 0],
@@ -481,6 +436,7 @@ pub fn setup_map(
     mut commands: Commands,
     map: Res<ProvinceMap>,
     controllers: Res<ProvinceControllers>,
+    colors: Res<CountryColors>,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<PoliticalMaterial>>,
@@ -494,12 +450,12 @@ pub fn setup_map(
     let rows = max_id / PALETTE_WIDTH + 1;
     let mut palette = Vec::with_capacity(PALETTE_WIDTH * rows * 4);
     for _ in 0..PALETTE_WIDTH * rows {
-        palette.extend_from_slice(&palette_texel(None));
+        palette.extend_from_slice(&palette_texel(None, &colors));
     }
     for (&id, tag) in &controllers.0 {
         let off = id as usize * 4;
         if let Some(px) = palette.get_mut(off..off + 4) {
-            px.copy_from_slice(&palette_texel(Some(tag)));
+            px.copy_from_slice(&palette_texel(Some(tag), &colors));
         }
     }
 
@@ -536,6 +492,7 @@ pub fn setup_map(
 fn repaint_changed_provinces(
     mut events: EventReader<ProvinceControllerChanged>,
     paint: Option<Res<MapPaint>>,
+    colors: Res<CountryColors>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<PoliticalMaterial>>,
 ) {
@@ -548,7 +505,7 @@ fn repaint_changed_provinces(
         for change in &changes {
             let off = change.province_id as usize * 4;
             if let Some(px) = image.data.get_mut(off..off + 4) {
-                px.copy_from_slice(&palette_texel(Some(&change.new_controller)));
+                px.copy_from_slice(&palette_texel(Some(&change.new_controller), &colors));
             }
         }
     }
@@ -897,6 +854,7 @@ fn ui_state_panel(
     states: Res<StateRegistry>,
     adjacency: Res<ProvinceAdjacency>,
     controllers: Res<ProvinceControllers>,
+    colors: Res<CountryColors>,
 ) {
     let Some(id) = selected.id else { return };
     let Some(ctx) = contexts.try_ctx_mut() else { return };
@@ -921,10 +879,12 @@ fn ui_state_panel(
                     let controller = controllers.0.get(&id).unwrap_or(&s.owner);
                     ui.horizontal(|ui| {
                         ui.label("Контролирует:");
-                        let [r, g, b] = country_color(controller);
                         let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 3.0, egui::Color32::from_rgb(r, g, b));
-                        ui.label(format!("{controller} (Владелец: {})", s.owner));
+                        ui.painter().rect_filled(rect, 3.0, colors.ui_color32(controller));
+                        ui.label(egui::RichText::new(controller).color(colors.ui_color32(controller)).strong());
+                        ui.label("(Владелец:");
+                        ui.label(egui::RichText::new(&s.owner).color(colors.ui_color32(&s.owner)).strong());
+                        ui.label(")");
                     });
                 }
                 None => {
@@ -949,5 +909,37 @@ fn ui_state_panel(
 
     if deselect {
         selected.id = None;
+    }
+}
+
+#[cfg(test)]
+mod palette_color_tests {
+    use super::*;
+    use crate::colors::{CountryColor, FALLBACK_COLOR};
+
+    fn colors() -> CountryColors {
+        CountryColors(BTreeMap::from([
+            ("FRA".to_string(), CountryColor { map: [57, 113, 228], ui: [74, 147, 255] }),
+            ("GER".to_string(), CountryColor { map: [102, 96, 87], ui: [138, 155, 116] }),
+        ]))
+    }
+
+    #[test]
+    fn map_palette_uses_authentic_country_colors() {
+        let colors = colors();
+        // карта красится цветом `color`, не цветом интерфейса
+        assert_eq!(palette_texel(Some("FRA"), &colors), [57, 113, 228, 255]);
+        assert_eq!(palette_texel(Some("GER"), &colors), [102, 96, 87, 255]);
+    }
+
+    #[test]
+    fn unknown_controller_is_painted_neutral_gray_and_water_stays_water() {
+        let colors = colors();
+        let [r, g, b, a] = palette_texel(Some("XXX"), &colors);
+        assert_eq!([r, g, b], FALLBACK_COLOR);
+        assert_eq!(a, 255, "неизвестная страна остаётся сушей");
+        assert_eq!(palette_texel(None, &colors), [WATER_COLOR[0], WATER_COLOR[1], WATER_COLOR[2], 0]);
+        // пустой ресурс не приводит к панике
+        assert_eq!(palette_texel(Some("FRA"), &CountryColors::default())[..3], FALLBACK_COLOR);
     }
 }

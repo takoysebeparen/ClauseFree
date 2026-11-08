@@ -11,6 +11,7 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use crate::clock::{ClockSet, DailyTickEvent};
+use crate::colors::CountryColors;
 use crate::division::{daily_supply, is_water, Division};
 use crate::map::{ProvinceAdjacency, ProvinceControllers, ProvinceMap, StateRegistry};
 
@@ -835,9 +836,14 @@ fn economy_bar(
     economies: Res<Economies>,
     player: Res<PlayerCountry>,
     experience: Res<ArmyExperience>,
+    colors: Res<CountryColors>,
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else { return };
-    let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
+    // Рамка и тег нации — в её настоящем цвете
+    let country_color = colors.ui_color32(&player.0);
+    let frame = egui::Frame::window(&ctx.style())
+        .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200))
+        .stroke(egui::Stroke::new(2.0_f32, country_color));
 
     egui::Window::new("economy_bar")
         .title_bar(false)
@@ -846,17 +852,22 @@ fn economy_bar(
         .frame(frame)
         .show(ctx, |ui| match economies.0.get(&player.0) {
             Some(eco) => {
-                ui.label(format!(
-                    "[{}] 🏭 {} | 🔨 Военные заводы: {} | {} | {}",
-                    player.0,
-                    civilian_text(eco),
-                    eco.military_factories,
-                    stockpile_text(eco),
-                    army_xp_text(experience.get(&player.0))
-                ));
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("[{}]", player.0)).color(country_color).strong());
+                    ui.label(format!(
+                        "🏭 {} | 🔨 Военные заводы: {} | {} | {}",
+                        civilian_text(eco),
+                        eco.military_factories,
+                        stockpile_text(eco),
+                        army_xp_text(experience.get(&player.0))
+                    ));
+                });
             }
             None => {
-                ui.label(format!("[{}] нет данных об экономике | {}", player.0, army_xp_text(experience.get(&player.0))));
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("[{}]", player.0)).color(country_color).strong());
+                    ui.label(format!("нет данных об экономике | {}", army_xp_text(experience.get(&player.0))));
+                });
             }
         });
 }

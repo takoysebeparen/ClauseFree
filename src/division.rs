@@ -15,6 +15,7 @@ use bevy_egui::{egui, EguiContexts};
 use crate::camera::MainCamera;
 use crate::clock::{ClockSet, DailyTickEvent, HourTick};
 use crate::air::{air_attack_bonus_pct, air_defense_penalty_pct, air_status, side_edge, AirSuperiorityMap};
+use crate::colors::CountryColors;
 use crate::command::SKILL_BONUS_PCT;
 use crate::economy::{update_supply_network, ArmyExperience, EquipmentType, SupplyNetwork};
 use crate::oob::OobDivisions;
@@ -22,7 +23,7 @@ use crate::units::{DivisionTemplate, DivisionTemplates, BASE_TEMPLATE, INFANTRY_
 #[cfg(test)]
 use crate::units::PLAIN_INFANTRY_TEMPLATE;
 use crate::map::{
-    country_color, pick_province, setup_map, HoveredProvince, ProvinceAdjacency, ProvinceCenters, ProvinceControllerChanged,
+    pick_province, setup_map, HoveredProvince, ProvinceAdjacency, ProvinceCenters, ProvinceControllerChanged,
     ProvinceControllers, ProvinceMap, ProvinceRivers, StateRegistry,
 };
 
@@ -458,8 +459,8 @@ impl Plugin for DivisionPlugin {
 // Спавн
 // ---------------------------------------------------------------------------
 
-fn spawn_division_entity(commands: &mut Commands, division: Division, center: Vec2) {
-    let [r, g, b] = country_color(&division.owner);
+fn spawn_division_entity(commands: &mut Commands, division: Division, center: Vec2, colors: &CountryColors) {
+    let [r, g, b] = colors.map_rgb(&division.owner);
 
     // Корень — рамка; внутри тёмная заливка и цветной бейдж страны.
     commands
@@ -505,6 +506,7 @@ fn spawn_oob_divisions(
     centers: Res<ProvinceCenters>,
     map: Res<ProvinceMap>,
     templates: Res<DivisionTemplates>,
+    colors: Res<CountryColors>,
 ) {
     let base = templates.get_or_base(BASE_TEMPLATE);
     let base_stats = base.calculate_stats();
@@ -543,7 +545,7 @@ fn spawn_oob_divisions(
             entry.template.clone(),
             templates.get_or_base(&entry.template),
         );
-        spawn_division_entity(&mut commands, division, *center);
+        spawn_division_entity(&mut commands, division, *center, &colors);
         *per_owner.entry(entry.owner.as_str()).or_default() += 1;
         next_id += 1;
     }
@@ -1842,6 +1844,7 @@ fn combat_ui(
     rivers: Res<ProvinceRivers>,
     registry: Res<StateRegistry>,
     air: Res<AirSuperiorityMap>,
+    colors: Res<CountryColors>,
     cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
 ) {
     let Ok((camera, cam_tf)) = cameras.get_single() else { return };
@@ -1861,6 +1864,8 @@ fn combat_ui(
             .filter(|d| d.movement.is_some_and(|m| rivers.crosses(m.from, combat.province_id)))
             .map(river_penalty_for)
             .max();
+        let attacker_color = colors.ui_color32(&combat.attacker_owner);
+        let defender_color = colors.ui_color32(&combat.defender_owner);
         let terrain_text = terrain_label(map.terrain_of(combat.province_id), river_penalty);
         let air_value = registry.state_of(combat.province_id).map_or(0, |s| air.get(s.id));
         let recon_text = recon_air_label(&att, &def, air_value);
@@ -1887,10 +1892,10 @@ fn combat_ui(
                 ui.label(egui::RichText::new(&recon_text).small());
                 // Организация линии: атакующие (синий) и защитники (красный), ширина фронта и резерв
                 let sides = [
-                    ("АТК", &att, egui::Color32::from_rgb(70, 160, 220)),
-                    ("ЗАЩ", &def, egui::Color32::from_rgb(220, 90, 70)),
+                    ("АТК", &att, egui::Color32::from_rgb(70, 160, 220), attacker_color),
+                    ("ЗАЩ", &def, egui::Color32::from_rgb(220, 90, 70), defender_color),
                 ];
-                for (tag, side, color) in sides {
+                for (tag, side, color, country_color) in sides {
                     ui.add(
                         egui::ProgressBar::new(side.org as f32 / side.org_max.max(1) as f32)
                             .desired_width(56.0)
@@ -1902,6 +1907,7 @@ fn combat_ui(
                             "{tag} Ширина фронта: {}/{} | В резерве: {} див.",
                             side.used_width, combat.max_width, side.reserves
                         ))
+                        .color(country_color)
                         .small(),
                     );
                 }
@@ -1917,6 +1923,7 @@ fn division_info_ui(
     combats: Query<&ActiveCombat>,
     map: Res<ProvinceMap>,
     templates: Res<DivisionTemplates>,
+    colors: Res<CountryColors>,
     mut refit_out: EventWriter<RefitDivision>,
 ) {
     let Some(entity) = selected.0 else { return };
@@ -1933,7 +1940,10 @@ fn division_info_ui(
             None => "В обороне".to_string(),
         },
     };
-    let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
+    let owner_color = colors.ui_color32(&d.owner);
+    let frame = egui::Frame::window(&ctx.style())
+        .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200))
+        .stroke(egui::Stroke::new(2.0_f32, owner_color));
 
     egui::Window::new("Дивизия")
         .anchor(egui::Align2::LEFT_TOP, [10.0, 10.0])
@@ -1941,7 +1951,10 @@ fn division_info_ui(
         .collapsible(false)
         .frame(frame)
         .show(ctx, |ui| {
-            ui.label(format!("Дивизия: \"{}\" [{}]", d.name, d.owner));
+            ui.horizontal(|ui| {
+                ui.label(format!("Дивизия: \"{}\"", d.name));
+                ui.label(egui::RichText::new(format!("[{}]", d.owner)).color(owner_color).strong());
+            });
             // Позиция в стеке провинции (клик по провинции переключает дивизии по кругу)
             let mut stack: Vec<u32> = divisions
                 .iter()
