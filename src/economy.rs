@@ -24,6 +24,17 @@ const SUPPLY_RADIUS: u32 = 3;
 const REINFORCE_PER_DIVISION_PER_DAY: u32 = 50;
 const DEFAULT_PLAYER_COUNTRY: &str = "GER";
 
+/// Стартовая эффективность линии, %.
+pub const START_EFFICIENCY: u32 = 20;
+/// Эффективность после смены типа снаряжения на линии, %.
+pub const SWITCH_EFFICIENCY: u32 = 10;
+/// Потолок эффективности новой линии, %.
+pub const DEFAULT_MAX_EFFICIENCY: u32 = 50;
+/// Прирост эффективности линии в сутки, %.
+const EFFICIENCY_GAIN_PER_DAY: u32 = 1;
+/// Стоимость конверсии фабрики (гражданская <-> военная) в очках стройки.
+pub const CONVERSION_COST: u32 = 4000;
+
 /// Доля гражданских фабрик, занятых товарами народного потребления, %.
 pub const CONSUMER_GOODS_SHARE_PCT: u32 = 20;
 /// Стоимость военного завода в очках стройки.
@@ -109,12 +120,58 @@ impl EquipmentType {
 pub struct ProductionLine {
     pub equipment: EquipmentType,
     pub assigned_factories: u32,
+    /// Текущая эффективность, % (10..=100): выпуск умножается на неё. Растёт на 1% в сутки до потолка.
+    pub efficiency: u32,
+    /// Потолок эффективности, % (базово 50).
+    pub max_efficiency: u32,
+}
+
+impl ProductionLine {
+    /// Новая линия с начальной эффективностью 20% и потолком 50%.
+    pub fn new(equipment: EquipmentType, assigned_factories: u32) -> Self {
+        Self { equipment, assigned_factories, efficiency: START_EFFICIENCY, max_efficiency: DEFAULT_MAX_EFFICIENCY }
+    }
+
+    /// Суточный выпуск: `заводы * выход_завода * эффективность / 100`, но не меньше 1 при назначенных заводах.
+    pub fn output(&self, working_factories: u32) -> u32 {
+        if working_factories == 0 {
+            return 0;
+        }
+        (working_factories * self.equipment.output_per_factory() * self.efficiency / 100).max(1)
+    }
+
+    /// Суточный прирост эффективности: +1% до потолка.
+    fn grow(&mut self) {
+        self.efficiency = (self.efficiency + EFFICIENCY_GAIN_PER_DAY).min(self.max_efficiency.max(self.efficiency));
+    }
 }
 
 /// Тип здания, которое можно строить.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildingType {
     MilitaryFactory,
+    /// Конверсия гражданской фабрики в военный завод.
+    CivToMilConversion,
+    /// Конверсия военного завода в гражданскую фабрику.
+    MilToCivConversion,
+}
+
+impl BuildingType {
+    /// Стоимость проекта в очках стройки.
+    pub fn cost(self) -> u32 {
+        match self {
+            BuildingType::MilitaryFactory => MILITARY_FACTORY_COST,
+            BuildingType::CivToMilConversion | BuildingType::MilToCivConversion => CONVERSION_COST,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BuildingType::MilitaryFactory => "Военный завод",
+            BuildingType::CivToMilConversion => "Конверсия Civ -> Mil",
+            BuildingType::MilToCivConversion => "Конверсия Mil -> Civ",
+        }
+    }
 }
 
 /// Проект стройки в стейте.
@@ -129,8 +186,15 @@ pub struct ConstructionProject {
 }
 
 impl ConstructionProject {
+    /// Проект военного завода (в игре создаётся через `new`; удобный конструктор для тестов).
+    #[cfg(test)]
     pub fn military_factory(state_id: u32) -> Self {
-        Self { state_id, building_type: BuildingType::MilitaryFactory, progress: 0, cost: MILITARY_FACTORY_COST }
+        Self::new(BuildingType::MilitaryFactory, state_id)
+    }
+
+    /// Проект нужного типа со стоимостью по таблице.
+    pub fn new(building_type: BuildingType, state_id: u32) -> Self {
+        Self { state_id, building_type, progress: 0, cost: building_type.cost() }
     }
 
     /// Сколько фабрик нужно, чтобы закончить проект за сутки (округление вверх).
@@ -260,19 +324,60 @@ impl CountryEconomy {
         let assigned = factories.min(self.free_factories() + on_line);
         match self.production_lines.iter_mut().find(|l| l.equipment == equipment) {
             Some(line) => line.assigned_factories = assigned,
-            None => self.production_lines.push(ProductionLine { equipment, assigned_factories: assigned }),
+            None => self.production_lines.push(ProductionLine::new(equipment, assigned)),
         }
         self.recalc_daily_output();
         assigned
     }
 
-    /// Суточный выход = заводы линии * выход завода данного типа.
+    /// Суточный выход линий: `заводы * выход завода * эффективность / 100` (минимум 1 при назначенных заводах).
     pub(crate) fn recalc_daily_output(&mut self) {
         let mut output = BTreeMap::new();
-        for (equipment, working) in self.effective_factories() {
-            *output.entry(equipment).or_insert(0u32) += working * equipment.output_per_factory();
+        for (line, (equipment, working)) in self.production_lines.iter().zip(self.effective_factories()) {
+            *output.entry(equipment).or_insert(0u32) += line.output(working);
         }
         self.daily_output = output;
+    }
+
+    /// Суточный прирост эффективности всех линий; затем выпуск пересчитывается под новые значения.
+    fn grow_efficiency(&mut self) {
+        for line in &mut self.production_lines {
+            line.grow();
+        }
+        self.recalc_daily_output();
+    }
+
+    /// Меняет тип снаряжения линии вместе с её заводами. Эффективность падает до `SWITCH_EFFICIENCY` (10%).
+    /// Нельзя: линии `from` нет, тип не меняется или линия `to` уже работает (есть заводы).
+    /// Пустая линия типа `to` заменяется переведённой.
+    pub fn switch_line_equipment(&mut self, from: EquipmentType, to: EquipmentType) -> Result<(), &'static str> {
+        if from == to {
+            return Err("тип не меняется");
+        }
+        if !self.production_lines.iter().any(|l| l.equipment == from) {
+            return Err("такой линии нет");
+        }
+        if self.production_lines.iter().any(|l| l.equipment == to && l.assigned_factories > 0) {
+            return Err("линия этого типа уже работает");
+        }
+        self.production_lines.retain(|l| !(l.equipment == to && l.assigned_factories == 0));
+        let line = self.production_lines.iter_mut().find(|l| l.equipment == from).expect("линия from проверена выше");
+        line.equipment = to;
+        line.efficiency = SWITCH_EFFICIENCY;
+        self.recalc_daily_output();
+        Ok(())
+    }
+
+    /// Убирает один военный завод (конверсия в гражданскую фабрику). Если свободных нет, завод снимается
+    /// с последней линии, где он работает, чтобы назначения оставались в пределах лимита.
+    fn release_military_factory(&mut self) {
+        if self.free_factories() == 0 {
+            if let Some(line) = self.production_lines.iter_mut().rev().find(|l| l.assigned_factories > 0) {
+                line.assigned_factories -= 1;
+            }
+        }
+        self.military_factories = self.military_factories.saturating_sub(1);
+        self.recalc_daily_output();
     }
 }
 
@@ -280,7 +385,7 @@ impl CountryEconomy {
 fn default_lines(military_factories: u32) -> Vec<ProductionLine> {
     let mut lines: Vec<ProductionLine> = START_LINE_SHARES
         .iter()
-        .map(|&(equipment, pct)| ProductionLine { equipment, assigned_factories: military_factories * pct / 100 })
+        .map(|&(equipment, pct)| ProductionLine::new(equipment, military_factories * pct / 100))
         .collect();
     let given: u32 = lines.iter().map(|l| l.assigned_factories).sum();
     lines[0].assigned_factories += military_factories - given;
@@ -304,12 +409,22 @@ pub struct SetProductionLine {
     pub factories: u32,
 }
 
-/// Приказ: поставить в очередь стройки военный завод в стейте. Принимается, только если
-/// страна контролирует стейт (`apply_construction_orders`).
+/// Приказ: сменить тип снаряжения линии (эффективность линии падает до 10%).
+#[derive(Event, Debug, Clone)]
+pub struct SwitchProductionLine {
+    pub country: String,
+    pub from: EquipmentType,
+    pub to: EquipmentType,
+}
+
+/// Приказ: поставить в очередь стройки проект в стейте — военный завод или конверсию фабрики.
+/// Принимается, только если страна контролирует стейт и есть что строить / конвертировать
+/// (`apply_construction_orders`).
 #[derive(Event, Debug, Clone)]
 pub struct QueueConstruction {
     pub country: String,
     pub state_id: u32,
+    pub building_type: BuildingType,
 }
 
 /// Военные заводы по стейтам. `StateDef` в реестре разделяется через `Arc`, поэтому достроенные
@@ -317,6 +432,18 @@ pub struct QueueConstruction {
 #[derive(Resource, Default, Debug)]
 pub struct StateFactories {
     pub military: BTreeMap<u32, u32>,
+    /// Гражданские фабрики по стейтам (нужны для конверсий).
+    pub civilian: BTreeMap<u32, u32>,
+}
+
+impl StateFactories {
+    pub fn military_in(&self, state_id: u32) -> u32 {
+        self.military.get(&state_id).copied().unwrap_or(0)
+    }
+
+    pub fn civilian_in(&self, state_id: u32) -> u32 {
+        self.civilian.get(&state_id).copied().unwrap_or(0)
+    }
 }
 
 /// Стейтом управляет страна, если ей подчиняется больше половины его провинций.
@@ -455,6 +582,7 @@ impl Plugin for EconomyPlugin {
         app.init_resource::<Economies>()
             .add_event::<SetProductionLine>()
             .add_event::<QueueConstruction>()
+            .add_event::<SwitchProductionLine>()
             .init_resource::<StateFactories>()
             .init_resource::<ArmyExperience>()
             .init_resource::<SupplyNetwork>()
@@ -470,6 +598,7 @@ impl Plugin for EconomyPlugin {
                     daily_reinforcement.after(daily_production).after(daily_supply),
                     economy_bar,
                     apply_production_orders,
+                    apply_switch_orders,
                     production_panel,
                     apply_construction_orders,
                     // прогресс стройки — после производства того же дня
@@ -522,7 +651,9 @@ fn init_economies(registry: Res<StateRegistry>, mut economies: ResMut<Economies>
 }
 
 /// Раз в сутки (00:00) заводы каждой линии производят свой тип снаряжения на склад страны:
-/// `заводы линии * выход завода`. Заводов на линиях в сумме не больше `military_factories`.
+/// `заводы линии * выход завода * эффективность / 100` (минимум 1 при назначенных заводах).
+/// Заводов на линиях в сумме не больше `military_factories`. После выпуска эффективность
+/// каждой линии растёт на 1% до её потолка.
 fn daily_production(mut events: EventReader<DailyTickEvent>, mut economies: ResMut<Economies>) {
     for event in events.read() {
         for eco in economies.0.values_mut() {
@@ -531,6 +662,7 @@ fn daily_production(mut events: EventReader<DailyTickEvent>, mut economies: ResM
                 let stock = eco.stock(equipment).saturating_add(output);
                 eco.set_stock(equipment, stock);
             }
+            eco.grow_efficiency();
         }
         println!("[ЭКОНОМИКА] Сутки {}.{}.{}: производство учтено", event.day, event.month, event.year);
     }
@@ -539,14 +671,59 @@ fn daily_production(mut events: EventReader<DailyTickEvent>, mut economies: ResM
 /// Военные заводы по стейтам на старте — из файлов стейтов.
 fn init_state_factories(registry: Res<StateRegistry>, mut factories: ResMut<StateFactories>) {
     factories.military = registry.states.iter().map(|s| (s.id, s.military_factories)).collect();
+    factories.civilian = registry.states.iter().map(|s| (s.id, s.civilian_factories)).collect();
 }
 
-/// Применяет приказы `QueueConstruction`: в очередь попадает только стейт, которым управляет страна.
+/// Можно ли поставить проект в очередь: страна управляет стейтом, а для конверсии в стейте и в стране
+/// остаются фабрики нужного вида (с учётом уже стоящих в очереди конверсий того же типа).
+pub fn can_queue(
+    kind: BuildingType,
+    state: &crate::map::StateDef,
+    controllers: &ProvinceControllers,
+    eco: &CountryEconomy,
+    state_factories: &StateFactories,
+    country: &str,
+) -> Result<(), &'static str> {
+    if !state_controlled_by(state, controllers, country) {
+        return Err("страна не контролирует стейт");
+    }
+    let queued = |same_state: bool| {
+        eco.construction
+            .projects
+            .iter()
+            .filter(|p| p.building_type == kind && (!same_state || p.state_id == state.id))
+            .count() as u32
+    };
+    match kind {
+        BuildingType::MilitaryFactory => Ok(()),
+        BuildingType::CivToMilConversion => {
+            if state_factories.civilian_in(state.id) <= queued(true) {
+                Err("в стейте нет гражданских фабрик для конверсии")
+            } else if eco.civilian_factories <= queued(false) {
+                Err("у страны нет гражданских фабрик для конверсии")
+            } else {
+                Ok(())
+            }
+        }
+        BuildingType::MilToCivConversion => {
+            if state_factories.military_in(state.id) <= queued(true) {
+                Err("в стейте нет военных заводов для конверсии")
+            } else if eco.military_factories <= queued(false) {
+                Err("у страны нет военных заводов для конверсии")
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Применяет приказы `QueueConstruction` через `can_queue`.
 fn apply_construction_orders(
     mut orders: EventReader<QueueConstruction>,
     mut economies: ResMut<Economies>,
     registry: Res<StateRegistry>,
     controllers: Res<ProvinceControllers>,
+    state_factories: Res<StateFactories>,
 ) {
     for order in orders.read() {
         let Some(eco) = economies.0.get_mut(&order.country) else { continue };
@@ -554,12 +731,12 @@ fn apply_construction_orders(
             println!("[СТРОЙКА] Стейт #{} не найден", order.state_id);
             continue;
         };
-        if !state_controlled_by(state, &controllers, &order.country) {
-            println!("[СТРОЙКА] {} не контролирует стейт #{}", order.country, order.state_id);
+        if let Err(reason) = can_queue(order.building_type, state, &controllers, eco, &state_factories, &order.country) {
+            println!("[СТРОЙКА] {}: {} в стейте #{} отклонено: {reason}", order.country, order.building_type.label(), order.state_id);
             continue;
         }
-        eco.construction.projects.push(ConstructionProject::military_factory(order.state_id));
-        println!("[СТРОЙКА] {}: в очередь добавлен военный завод в стейте #{}", order.country, order.state_id);
+        eco.construction.projects.push(ConstructionProject::new(order.building_type, order.state_id));
+        println!("[СТРОЙКА] {}: в очередь добавлено: {} в стейте #{}", order.country, order.building_type.label(), order.state_id);
     }
 }
 
@@ -582,6 +759,30 @@ fn daily_construction(
                         eco.recalc_daily_output();
                         println!("[СТРОЙКА] {tag}: достроен военный завод в стейте #{}", project.state_id);
                     }
+                    BuildingType::CivToMilConversion => {
+                        // к моменту завершения фабрика могла исчезнуть (например, при захвате): тогда проект пропадает
+                        if state_factories.civilian_in(project.state_id) == 0 || eco.civilian_factories == 0 {
+                            println!("[СТРОЙКА] {tag}: конверсия Civ -> Mil в стейте #{} отменена — нет гражданской фабрики", project.state_id);
+                            continue;
+                        }
+                        *state_factories.civilian.entry(project.state_id).or_insert(0) -= 1;
+                        *state_factories.military.entry(project.state_id).or_insert(0) += 1;
+                        eco.civilian_factories -= 1;
+                        eco.military_factories += 1;
+                        eco.recalc_daily_output();
+                        println!("[СТРОЙКА] {tag}: гражданская фабрика в стейте #{} стала военным заводом", project.state_id);
+                    }
+                    BuildingType::MilToCivConversion => {
+                        if state_factories.military_in(project.state_id) == 0 || eco.military_factories == 0 {
+                            println!("[СТРОЙКА] {tag}: конверсия Mil -> Civ в стейте #{} отменена — нет военного завода", project.state_id);
+                            continue;
+                        }
+                        *state_factories.military.entry(project.state_id).or_insert(0) -= 1;
+                        *state_factories.civilian.entry(project.state_id).or_insert(0) += 1;
+                        eco.release_military_factory();
+                        eco.civilian_factories += 1;
+                        println!("[СТРОЙКА] {tag}: военный завод в стейте #{} стал гражданской фабрикой", project.state_id);
+                    }
                 }
             }
         }
@@ -602,6 +803,22 @@ fn apply_production_orders(mut orders: EventReader<SetProductionLine>, mut econo
                 order.factories,
                 eco.military_factories
             );
+        }
+    }
+}
+
+/// Применяет приказы `SwitchProductionLine`: смена типа снаряжения сбрасывает эффективность линии до 10%.
+fn apply_switch_orders(mut orders: EventReader<SwitchProductionLine>, mut economies: ResMut<Economies>) {
+    for order in orders.read() {
+        let Some(eco) = economies.0.get_mut(&order.country) else { continue };
+        match eco.switch_line_equipment(order.from, order.to) {
+            Ok(()) => println!(
+                "[ЭКОНОМИКА] {}: линия \"{}\" переведена на \"{}\", эффективность {SWITCH_EFFICIENCY}%",
+                order.country,
+                order.from.label(),
+                order.to.label()
+            ),
+            Err(reason) => println!("[ЭКОНОМИКА] {}: смена типа линии отклонена: {reason}", order.country),
         }
     }
 }
@@ -824,10 +1041,18 @@ pub fn civilian_text(eco: &CountryEconomy) -> String {
 
 /// Строка проекта очереди: `Военный завод в стейте #5 [30/7200] (6 фабр.)`.
 pub fn project_text(project: &ConstructionProject, factories: u32) -> String {
-    let name = match project.building_type {
-        BuildingType::MilitaryFactory => "Военный завод",
-    };
-    format!("{name} в стейте #{} [{}/{}] ({factories} фабр.)", project.state_id, project.progress, project.cost)
+    format!(
+        "{} в стейте #{} [{}/{}] ({factories} фабр.)",
+        project.building_type.label(),
+        project.state_id,
+        project.progress,
+        project.cost
+    )
+}
+
+/// Строка эффективности линии: `Эфф: 20% (макс 50%)`.
+pub fn efficiency_text(line: &ProductionLine) -> String {
+    format!("Эфф: {}% (макс {}%)", line.efficiency, line.max_efficiency)
 }
 
 /// Верхняя плашка: фабрики и склад страны игрока.
@@ -878,6 +1103,7 @@ fn production_panel(
     economies: Res<Economies>,
     player: Res<PlayerCountry>,
     mut orders: EventWriter<SetProductionLine>,
+    mut switch_orders: EventWriter<SwitchProductionLine>,
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else { return };
     let Some(eco) = economies.0.get(&player.0) else { return };
@@ -901,6 +1127,23 @@ fn production_panel(
                         orders.send(SetProductionLine { country: player.0.clone(), equipment, factories: factories + 1 });
                     }
                     ui.label(format!("{}: {} зав. (+{}/день)", equipment.label(), factories, eco.output_of(equipment)));
+                    // эффективность линии, если она существует; смена типа сбрасывает её до 10%
+                    if let Some(line) = eco.production_lines.iter().find(|l| l.equipment == equipment) {
+                        ui.label(efficiency_text(line));
+                        ui.menu_button("тип", |ui| {
+                            for target in EquipmentType::ALL {
+                                let taken = eco.production_lines.iter().any(|l| l.equipment == target && l.assigned_factories > 0);
+                                if !taken && target != equipment && ui.button(format!("-> {} (эфф. {SWITCH_EFFICIENCY}%)", target.label())).clicked() {
+                                    switch_orders.send(SwitchProductionLine {
+                                        country: player.0.clone(),
+                                        from: equipment,
+                                        to: target,
+                                    });
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    }
                 });
             }
         });
@@ -942,10 +1185,21 @@ fn construction_panel(
                     ui.label("Выберите провинцию своего стейта на карте");
                 }
             }
-            let can_build = state.is_some_and(|s| state_controlled_by(s, &controllers, &player.0));
-            if ui.add_enabled(can_build, egui::Button::new("+ Построить военный завод в стейте")).clicked() {
-                if let Some(state) = state {
-                    orders.send(QueueConstruction { country: player.0.clone(), state_id: state.id });
+            if let Some(state) = state {
+                ui.label(format!("Гражданских фабрик в стейте: {}", state_factories.civilian_in(state.id)));
+            }
+            // кнопка доступна, только если проект допустим (can_queue): стейт под контролем, есть что конвертировать
+            let buttons = [
+                (BuildingType::MilitaryFactory, "+ Построить военный завод в стейте"),
+                (BuildingType::CivToMilConversion, "Конвертировать Civ -> Mil"),
+                (BuildingType::MilToCivConversion, "Конвертировать Mil -> Civ"),
+            ];
+            for (kind, caption) in buttons {
+                let allowed = state.is_some_and(|s| can_queue(kind, s, &controllers, eco, &state_factories, &player.0).is_ok());
+                if ui.add_enabled(allowed, egui::Button::new(caption)).clicked() {
+                    if let Some(state) = state {
+                        orders.send(QueueConstruction { country: player.0.clone(), state_id: state.id, building_type: kind });
+                    }
                 }
             }
             ui.separator();
@@ -1377,7 +1631,8 @@ mod equipment_tests {
         let lines: BTreeMap<_, _> = eco.production_lines.iter().map(|l| (l.equipment, l.assigned_factories)).collect();
         assert_eq!(lines[&InfantryEquipment], 6);
         assert_eq!((lines[&SupportEquipment], lines[&Artillery], lines[&LightTank], lines[&MediumTank]), (1, 1, 2, 0));
-        assert_eq!((eco.output_of(InfantryEquipment), eco.output_of(LightTank), eco.output_of(Artillery)), (30, 2, 1));
+        assert_eq!((eco.output_of(InfantryEquipment), eco.output_of(LightTank), eco.output_of(Artillery)), (6, 1, 1));
+        // винтовки: 6 заводов * 5 * 20% = 6; танки и орудия дают меньше 1 -> действует минимум 1 в сутки
     }
 
     #[test]
@@ -1390,7 +1645,8 @@ mod equipment_tests {
         assert_eq!(eco.free_factories(), 4);
         assert_eq!(eco.assign_factories(MediumTank, 3), 3);
         assert_eq!(eco.free_factories(), 1);
-        assert_eq!(eco.output_of(MediumTank), 3);
+        // 3 завода * 1 * 20% = 0 -> минимум 1 в сутки
+        assert_eq!(eco.output_of(MediumTank), 1);
         // запрос больше лимита обрезается до свободного (1 свободный + 3 уже на линии)
         assert_eq!(eco.assign_factories(MediumTank, 100), 4);
         assert_eq!(eco.free_factories(), 0);
@@ -1403,13 +1659,13 @@ mod equipment_tests {
     fn oversubscribed_lines_are_clamped_when_producing() {
         let mut eco = CountryEconomy::new(0, 10);
         eco.production_lines = vec![
-            ProductionLine { equipment: InfantryEquipment, assigned_factories: 8 },
-            ProductionLine { equipment: LightTank, assigned_factories: 8 },
+            ProductionLine::new(InfantryEquipment, 8),
+            ProductionLine::new(LightTank, 8),
         ];
         eco.recalc_daily_output();
         // винтовки заняли 8 из 10; на танки остаётся 2
         assert_eq!(eco.effective_factories(), vec![(InfantryEquipment, 8), (LightTank, 2)]);
-        assert_eq!((eco.output_of(InfantryEquipment), eco.output_of(LightTank)), (40, 2));
+        assert_eq!((eco.output_of(InfantryEquipment), eco.output_of(LightTank)), (8, 1));
         assert_eq!(eco.free_factories(), 0);
     }
 
@@ -1422,6 +1678,7 @@ mod equipment_tests {
         app.add_event::<DailyTickEvent>()
             .add_event::<SetProductionLine>()
             .add_event::<QueueConstruction>()
+            .add_event::<SwitchProductionLine>()
             .init_resource::<StateFactories>()
             .insert_resource(Economies(BTreeMap::from([("GER".to_string(), eco)])))
             .add_systems(Update, (apply_production_orders, daily_production.after(apply_production_orders)));
@@ -1438,14 +1695,16 @@ mod equipment_tests {
         let mut app = production_app();
         day(&mut app);
         let eco = &app.world().resource::<Economies>().0["GER"];
-        // линии 10 заводов: винтовки 6 * 5, оснащение 1 * 3, пушки 1 * 1, лёгкие танки 2 * 1, средние 0
-        assert_eq!(eco.stock(InfantryEquipment), 30);
-        assert_eq!(eco.stock(SupportEquipment), 3);
+        // линии 10 заводов при эффективности 20%: винтовки 6 * 5 * 20% = 6; у оснащения, орудий и лёгких
+        // танков получается меньше единицы, поэтому действует минимум 1; средние танки — без заводов
+        assert_eq!(eco.stock(InfantryEquipment), 6);
+        assert_eq!(eco.stock(SupportEquipment), 1);
         assert_eq!(eco.stock(Artillery), 1);
-        assert_eq!(eco.stock(LightTank), 2);
+        assert_eq!(eco.stock(LightTank), 1);
         assert_eq!(eco.stock(MediumTank), 0);
         day(&mut app);
-        assert_eq!(app.world().resource::<Economies>().0["GER"].stock(InfantryEquipment), 60, "выход накапливается");
+        // второй день идёт при эффективности 21%: 30 * 21 / 100 = 6
+        assert_eq!(app.world().resource::<Economies>().0["GER"].stock(InfantryEquipment), 12, "выход накапливается");
     }
 
     #[test]
@@ -1458,14 +1717,14 @@ mod equipment_tests {
         app.update();
         let eco = &app.world().resource::<Economies>().0["GER"];
         assert_eq!(eco.free_factories(), 0);
-        assert_eq!(eco.output_of(MediumTank), 4, "6 -> 2 освободило 4 завода, остальное обрезано лимитом");
+        assert_eq!(eco.output_of(MediumTank), 1, "6 -> 2 освободило 4 завода, но 4 * 20% < 1 -> минимум 1");
         let total: u32 = eco.production_lines.iter().map(|l| l.assigned_factories).sum();
         assert_eq!(total, 10);
         // неизвестная страна приказ игнорирует без паники
         app.world_mut().send_event(SetProductionLine { country: "XXX".into(), equipment: Artillery, factories: 1 });
         app.update();
         day(&mut app);
-        assert_eq!(app.world().resource::<Economies>().0["GER"].stock(MediumTank), 4);
+        assert_eq!(app.world().resource::<Economies>().0["GER"].stock(MediumTank), 1);
     }
 
     #[test]
@@ -1476,7 +1735,7 @@ mod equipment_tests {
         eco.set_stock(MediumTank, 2);
         eco.set_stock(Artillery, 77);
         eco.reinforce_cost.insert(InfantryEquipment, 50);
-        assert_eq!(stockpile_text(&eco), "📦 Винтовки: 1234 (+30 / -50 день) | Танки: 42 | Пушки: 77");
+        assert_eq!(stockpile_text(&eco), "📦 Винтовки: 1234 (+6 / -50 день) | Танки: 42 | Пушки: 77");
     }
 }
 
@@ -1645,7 +1904,7 @@ mod construction_tests {
         let mut app = App::new();
         app.add_event::<DailyTickEvent>()
             .insert_resource(Economies(BTreeMap::from([("GER".to_string(), economy)])))
-            .insert_resource(StateFactories { military: state_factories.iter().copied().collect() })
+            .insert_resource(StateFactories { military: state_factories.iter().copied().collect(), ..Default::default() })
             .add_systems(Update, daily_construction);
         app
     }
@@ -1699,6 +1958,7 @@ mod construction_tests {
     fn order_app() -> App {
         let mut app = App::new();
         app.add_event::<QueueConstruction>()
+            .init_resource::<StateFactories>()
             .insert_resource(Economies(BTreeMap::from([("GER".to_string(), CountryEconomy::new(10, 10))])))
             .insert_resource(StateRegistry {
                 states: vec![state(7, vec![1, 2, 3], 0), state(8, vec![4, 5], 0)],
@@ -1716,7 +1976,11 @@ mod construction_tests {
     }
 
     fn order(app: &mut App, country: &str, state_id: u32) {
-        app.world_mut().send_event(QueueConstruction { country: country.into(), state_id });
+        app.world_mut().send_event(QueueConstruction {
+            country: country.into(),
+            state_id,
+            building_type: BuildingType::MilitaryFactory,
+        });
         app.update();
     }
 
@@ -1777,5 +2041,391 @@ mod construction_tests {
             project_text(&ConstructionProject::military_factory(12), 15),
             "Военный завод в стейте #12 [0/7200] (15 фабр.)"
         );
+    }
+}
+
+#[cfg(test)]
+mod efficiency_tests {
+    use super::*;
+
+    use EquipmentType::*;
+
+    fn line(equipment: EquipmentType, factories: u32, efficiency: u32) -> ProductionLine {
+        ProductionLine { efficiency, ..ProductionLine::new(equipment, factories) }
+    }
+
+    #[test]
+    fn new_lines_start_at_twenty_percent_with_a_fifty_percent_cap() {
+        let l = ProductionLine::new(Artillery, 3);
+        assert_eq!((l.efficiency, l.max_efficiency), (20, 50));
+        // стартовые линии страны тоже начинают с 20%
+        let eco = CountryEconomy::new(0, 10);
+        assert!(eco.production_lines.iter().all(|l| (l.efficiency, l.max_efficiency) == (20, 50)));
+    }
+
+    #[test]
+    fn output_is_factories_times_base_times_efficiency() {
+        // 6 заводов * 5 винтовок * эффективность / 100
+        assert_eq!(line(InfantryEquipment, 6, 20).output(6), 6);
+        assert_eq!(line(InfantryEquipment, 6, 50).output(6), 15);
+        assert_eq!(line(InfantryEquipment, 6, 100).output(6), 30);
+        assert_eq!(line(InfantryEquipment, 6, 33).output(6), 9, "30 * 33 / 100 = 9, округление вниз");
+        // орудия: 4 * 1 * 50% = 2; при 20% получается 0, но назначенные заводы дают минимум 1
+        assert_eq!(line(Artillery, 4, 50).output(4), 2);
+        assert_eq!(line(Artillery, 4, 20).output(4), 1);
+        assert_eq!(line(LightTank, 1, 10).output(1), 1);
+        // без работающих заводов выпуска нет (минимум 1 действует только при назначенных)
+        assert_eq!(line(LightTank, 0, 100).output(0), 0);
+        assert_eq!(line(LightTank, 5, 100).output(0), 0, "назначено, но лимит не оставил заводов");
+    }
+
+    #[test]
+    fn efficiency_grows_one_percent_a_day_up_to_the_cap() {
+        let mut l = ProductionLine::new(InfantryEquipment, 1);
+        for day in 1..=30 {
+            l.grow();
+            assert_eq!(l.efficiency, 20 + day);
+        }
+        assert_eq!(l.efficiency, 50);
+        l.grow();
+        assert_eq!(l.efficiency, 50, "выше потолка не растёт");
+        // повышенный потолок разрешает дальше
+        l.max_efficiency = 100;
+        l.grow();
+        assert_eq!(l.efficiency, 51);
+        // эффективность, оказавшаяся выше потолка, не откатывается назад
+        l.efficiency = 60;
+        l.max_efficiency = 50;
+        l.grow();
+        assert_eq!(l.efficiency, 60);
+    }
+
+    fn production_app() -> App {
+        let mut app = App::new();
+        let mut eco = CountryEconomy::new(0, 10);
+        for t in EquipmentType::ALL {
+            eco.set_stock(t, 0);
+        }
+        app.add_event::<DailyTickEvent>()
+            .add_event::<SwitchProductionLine>()
+            .insert_resource(Economies(BTreeMap::from([("GER".to_string(), eco)])))
+            .add_systems(Update, (apply_switch_orders, daily_production.after(apply_switch_orders)));
+        app
+    }
+
+    fn day(app: &mut App) {
+        app.world_mut().send_event(DailyTickEvent { day: 1, month: 1, year: 1936 });
+        app.update();
+    }
+
+    fn eco(app: &App) -> &CountryEconomy {
+        &app.world().resource::<Economies>().0["GER"]
+    }
+
+    fn line_of(app: &App, equipment: EquipmentType) -> Option<&ProductionLine> {
+        eco(app).production_lines.iter().find(|l| l.equipment == equipment)
+    }
+
+    #[test]
+    fn daily_tick_produces_at_current_efficiency_then_grows_it() {
+        let mut app = production_app();
+        // сутки 1-3 идут при 20%, 21%, 22%: 30 * 20 / 100 = 6, 30 * 21 / 100 = 6, 30 * 22 / 100 = 6
+        for _ in 0..3 {
+            day(&mut app);
+        }
+        assert_eq!(eco(&app).stock(InfantryEquipment), 18);
+        assert_eq!(line_of(&app, InfantryEquipment).unwrap().efficiency, 23, "после трёх суток +3%");
+        // выпуск, показанный в интерфейсе, уже пересчитан под новую эффективность: 30 * 23 / 100 = 6
+        assert_eq!(eco(&app).output_of(InfantryEquipment), 6);
+        // через 30 суток линия на потолке 50% и даёт 30 * 50 / 100 = 15 в сутки
+        for _ in 0..27 {
+            day(&mut app);
+        }
+        assert_eq!(line_of(&app, InfantryEquipment).unwrap().efficiency, 50);
+        assert_eq!(eco(&app).output_of(InfantryEquipment), 15);
+        let before = eco(&app).stock(InfantryEquipment);
+        day(&mut app);
+        assert_eq!(eco(&app).stock(InfantryEquipment) - before, 15);
+        assert_eq!(line_of(&app, InfantryEquipment).unwrap().efficiency, 50, "потолок держится");
+    }
+
+    #[test]
+    fn switching_equipment_resets_efficiency_to_ten_percent() {
+        let mut economy = CountryEconomy::new(0, 10);
+        economy.production_lines.iter_mut().for_each(|l| l.efficiency = 45);
+        // винтовки (6 заводов) -> средние танки: у средних танков пустая линия, она заменяется
+        assert_eq!(economy.switch_line_equipment(InfantryEquipment, MediumTank), Ok(()));
+        let medium = economy.production_lines.iter().find(|l| l.equipment == MediumTank).unwrap();
+        assert_eq!((medium.assigned_factories, medium.efficiency, medium.max_efficiency), (6, 10, 50));
+        assert!(economy.production_lines.iter().all(|l| l.equipment != InfantryEquipment));
+        assert_eq!(economy.production_lines.iter().filter(|l| l.equipment == MediumTank).count(), 1, "дубликатов линий нет");
+        // 6 заводов * 1 * 10% = 0 -> минимум 1
+        assert_eq!(economy.output_of(MediumTank), 1);
+        // остальные линии свою эффективность сохраняют
+        assert!(economy.production_lines.iter().filter(|l| l.equipment != MediumTank).all(|l| l.efficiency == 45));
+        // общий лимит заводов остался прежним
+        assert_eq!(economy.free_factories(), 0);
+    }
+
+    #[test]
+    fn switching_is_rejected_for_missing_same_or_busy_target_lines() {
+        let mut economy = CountryEconomy::new(0, 10);
+        assert_eq!(economy.switch_line_equipment(InfantryEquipment, InfantryEquipment), Err("тип не меняется"));
+        // пушки уже работают (1 завод)
+        assert_eq!(economy.switch_line_equipment(InfantryEquipment, Artillery), Err("линия этого типа уже работает"));
+        // линии средних танков не было бы после замены — а исходной линии нет вовсе
+        economy.production_lines.retain(|l| l.equipment != LightTank);
+        assert_eq!(economy.switch_line_equipment(LightTank, MediumTank), Err("такой линии нет"));
+        // отклонение ничего не меняет
+        assert!(economy.production_lines.iter().all(|l| l.efficiency == 20));
+    }
+
+    #[test]
+    fn switch_orders_work_through_events_and_efficiency_climbs_again() {
+        let mut app = production_app();
+        for _ in 0..10 {
+            day(&mut app);
+        }
+        assert_eq!(line_of(&app, InfantryEquipment).unwrap().efficiency, 30);
+        app.world_mut().send_event(SwitchProductionLine { country: "GER".into(), from: InfantryEquipment, to: MediumTank });
+        app.update();
+        assert_eq!(line_of(&app, MediumTank).unwrap().efficiency, 10, "смена типа сбросила эффективность");
+        assert!(line_of(&app, InfantryEquipment).is_none());
+        // дальше линия снова набирает по 1% в сутки
+        day(&mut app);
+        day(&mut app);
+        assert_eq!(line_of(&app, MediumTank).unwrap().efficiency, 12);
+        // приказ для неизвестной страны или с недопустимой сменой не паникует и ничего не меняет
+        app.world_mut().send_event(SwitchProductionLine { country: "XXX".into(), from: Artillery, to: LightTank });
+        app.world_mut().send_event(SwitchProductionLine { country: "GER".into(), from: Artillery, to: LightTank });
+        app.update();
+        assert!(line_of(&app, Artillery).is_some());
+    }
+
+    #[test]
+    fn efficiency_text_matches_the_panel_format() {
+        assert_eq!(efficiency_text(&ProductionLine::new(Artillery, 1)), "Эфф: 20% (макс 50%)");
+        assert_eq!(efficiency_text(&line(LightTank, 1, 37)), "Эфф: 37% (макс 50%)");
+    }
+}
+
+#[cfg(test)]
+mod conversion_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::map::StateDef;
+    use EquipmentType::*;
+
+    fn state(id: u32, provinces: Vec<u32>) -> Arc<StateDef> {
+        Arc::new(StateDef {
+            id,
+            name: format!("S{id}"),
+            owner: "GER".into(),
+            provinces,
+            victory_points: vec![],
+            civilian_factories: 0,
+            military_factories: 0,
+        })
+    }
+
+    fn controllers() -> ProvinceControllers {
+        ProvinceControllers(BTreeMap::from([
+            (1, "GER".to_string()),
+            (2, "GER".to_string()),
+            (3, "FRA".to_string()),
+            (4, "FRA".to_string()),
+        ]))
+    }
+
+    fn factories(military: &[(u32, u32)], civilian: &[(u32, u32)]) -> StateFactories {
+        StateFactories { military: military.iter().copied().collect(), civilian: civilian.iter().copied().collect() }
+    }
+
+    #[test]
+    fn building_types_have_the_requested_costs_and_names() {
+        assert_eq!(BuildingType::MilitaryFactory.cost(), 7200);
+        assert_eq!(BuildingType::CivToMilConversion.cost(), 4000);
+        assert_eq!(BuildingType::MilToCivConversion.cost(), 4000);
+        assert_eq!(ConstructionProject::new(BuildingType::CivToMilConversion, 5).cost, 4000);
+        assert_eq!(
+            project_text(&ConstructionProject::new(BuildingType::CivToMilConversion, 5), 3),
+            "Конверсия Civ -> Mil в стейте #5 [0/4000] (3 фабр.)"
+        );
+        assert_eq!(
+            project_text(&ConstructionProject::new(BuildingType::MilToCivConversion, 9), 15),
+            "Конверсия Mil -> Civ в стейте #9 [0/4000] (15 фабр.)"
+        );
+    }
+
+    #[test]
+    fn a_conversion_takes_fifty_four_days_with_fifteen_factories() {
+        let mut queue = ConstructionQueue { projects: vec![ConstructionProject::new(BuildingType::CivToMilConversion, 1)] };
+        for day in 1..=53 {
+            assert!(queue.advance(15).is_empty(), "на сутки {day} ещё не готово");
+        }
+        assert_eq!(queue.projects[0].progress, 3975);
+        assert_eq!(queue.advance(15).len(), 1, "54 суток * 75 очков = 4050 >= 4000");
+    }
+
+    #[test]
+    fn can_queue_checks_control_and_available_factories() {
+        let s = state(1, vec![1, 2, 3]); // два из трёх под GER
+        let foreign = state(2, vec![3, 4]);
+        let eco = CountryEconomy::new(10, 10);
+        let sf = factories(&[(1, 2)], &[(1, 3)]);
+        let c = controllers();
+        let ok = |kind, st: &StateDef| can_queue(kind, st, &c, &eco, &sf, "GER");
+        assert_eq!(ok(BuildingType::MilitaryFactory, &s), Ok(()));
+        assert_eq!(ok(BuildingType::CivToMilConversion, &s), Ok(()));
+        assert_eq!(ok(BuildingType::MilToCivConversion, &s), Ok(()));
+        // чужой стейт — ничего нельзя
+        for kind in [BuildingType::MilitaryFactory, BuildingType::CivToMilConversion, BuildingType::MilToCivConversion] {
+            assert_eq!(ok(kind, &foreign), Err("страна не контролирует стейт"));
+        }
+        // в стейте без фабрик конвертировать нечего
+        let empty = factories(&[], &[]);
+        assert!(can_queue(BuildingType::CivToMilConversion, &s, &c, &eco, &empty, "GER").is_err());
+        assert!(can_queue(BuildingType::MilToCivConversion, &s, &c, &eco, &empty, "GER").is_err());
+        // строить новый военный завод можно и в стейте без заводов
+        assert_eq!(can_queue(BuildingType::MilitaryFactory, &s, &c, &eco, &empty, "GER"), Ok(()));
+    }
+
+    #[test]
+    fn queued_conversions_reserve_the_factories_they_will_use() {
+        let s = state(1, vec![1, 2]);
+        let c = controllers();
+        let sf = factories(&[(1, 1)], &[(1, 2)]);
+        let mut eco = CountryEconomy::new(10, 10);
+        // в стейте две гражданские фабрики: третья конверсия уже не пройдёт
+        for _ in 0..2 {
+            assert_eq!(can_queue(BuildingType::CivToMilConversion, &s, &c, &eco, &sf, "GER"), Ok(()));
+            eco.construction.projects.push(ConstructionProject::new(BuildingType::CivToMilConversion, 1));
+        }
+        assert!(can_queue(BuildingType::CivToMilConversion, &s, &c, &eco, &sf, "GER").is_err());
+        // а вот военный завод в стейте один: после первой конверсии вторая не принимается
+        assert_eq!(can_queue(BuildingType::MilToCivConversion, &s, &c, &eco, &sf, "GER"), Ok(()));
+        eco.construction.projects.push(ConstructionProject::new(BuildingType::MilToCivConversion, 1));
+        assert!(can_queue(BuildingType::MilToCivConversion, &s, &c, &eco, &sf, "GER").is_err());
+        // у страны всего две гражданские фабрики: третьей для конверсии нет и в другом стейте
+        let mut small = CountryEconomy::new(2, 10);
+        small.construction.projects.extend([
+            ConstructionProject::new(BuildingType::CivToMilConversion, 7),
+            ConstructionProject::new(BuildingType::CivToMilConversion, 7),
+        ]);
+        let other = state(2, vec![1, 2]);
+        let sf2 = factories(&[], &[(2, 5)]);
+        assert_eq!(
+            can_queue(BuildingType::CivToMilConversion, &other, &c, &small, &sf2, "GER"),
+            Err("у страны нет гражданских фабрик для конверсии")
+        );
+    }
+
+    fn daily_app(economy: CountryEconomy, sf: StateFactories) -> App {
+        let mut app = App::new();
+        app.add_event::<DailyTickEvent>()
+            .insert_resource(Economies(BTreeMap::from([("GER".to_string(), economy)])))
+            .insert_resource(sf)
+            .add_systems(Update, daily_construction);
+        app
+    }
+
+    fn day(app: &mut App) {
+        app.world_mut().send_event(DailyTickEvent { day: 1, month: 1, year: 1936 });
+        app.update();
+    }
+
+    fn almost_done(kind: BuildingType, state_id: u32) -> ConstructionProject {
+        ConstructionProject { progress: kind.cost() - 5, ..ConstructionProject::new(kind, state_id) }
+    }
+
+    #[test]
+    fn civilian_factory_becomes_a_military_one() {
+        let mut economy = CountryEconomy::new(10, 10);
+        economy.construction.projects.push(almost_done(BuildingType::CivToMilConversion, 5));
+        let mut app = daily_app(economy, factories(&[(5, 1)], &[(5, 4)]));
+        day(&mut app);
+        let eco = &app.world().resource::<Economies>().0["GER"];
+        assert_eq!((eco.civilian_factories, eco.military_factories), (9, 11));
+        assert!(eco.construction.projects.is_empty());
+        let sf = app.world().resource::<StateFactories>();
+        assert_eq!((sf.military_in(5), sf.civilian_in(5)), (2, 3));
+        // новый завод свободен для линий; ТНП пересчитаны под 9 фабрик (1), свободных гражданских 8
+        assert_eq!(eco.free_factories(), 1);
+        assert_eq!((eco.consumer_goods_factories(), eco.available_civilian_factories()), (1, 8));
+    }
+
+    #[test]
+    fn military_factory_becomes_a_civilian_one_and_lines_stay_within_the_limit() {
+        let mut economy = CountryEconomy::new(10, 10);
+        economy.construction.projects.push(almost_done(BuildingType::MilToCivConversion, 5));
+        // все 10 заводов заняты линиями: конверсия снимет завод с последней работающей линии (лёгкие танки)
+        let before: u32 = economy.production_lines.iter().map(|l| l.assigned_factories).sum();
+        assert_eq!(before, 10);
+        let mut app = daily_app(economy, factories(&[(5, 2)], &[(5, 1)]));
+        day(&mut app);
+        let eco = &app.world().resource::<Economies>().0["GER"];
+        assert_eq!((eco.civilian_factories, eco.military_factories), (11, 9));
+        let sf = app.world().resource::<StateFactories>();
+        assert_eq!((sf.military_in(5), sf.civilian_in(5)), (1, 2));
+        let assigned: u32 = eco.production_lines.iter().map(|l| l.assigned_factories).sum();
+        assert_eq!(assigned, 9, "назначения не превышают новый лимит");
+        let light_tanks = eco.production_lines.iter().find(|l| l.equipment == LightTank).unwrap();
+        assert_eq!(light_tanks.assigned_factories, 1, "снят завод с последней работающей линии");
+        assert_eq!(eco.free_factories(), 0);
+    }
+
+    #[test]
+    fn free_military_factory_is_converted_before_any_line_loses_one() {
+        let mut economy = CountryEconomy::new(10, 10);
+        economy.assign_factories(InfantryEquipment, 3); // 3 заводов освободилось
+        assert_eq!(economy.free_factories(), 3);
+        economy.construction.projects.push(almost_done(BuildingType::MilToCivConversion, 5));
+        let lines_before: Vec<u32> = economy.production_lines.iter().map(|l| l.assigned_factories).collect();
+        let mut app = daily_app(economy, factories(&[(5, 1)], &[]));
+        day(&mut app);
+        let eco = &app.world().resource::<Economies>().0["GER"];
+        assert_eq!(eco.production_lines.iter().map(|l| l.assigned_factories).collect::<Vec<_>>(), lines_before);
+        assert_eq!((eco.military_factories, eco.free_factories()), (9, 2));
+    }
+
+    #[test]
+    fn conversion_without_a_factory_at_completion_is_cancelled_without_effect() {
+        let mut economy = CountryEconomy::new(10, 10);
+        economy.construction.projects.extend([
+            almost_done(BuildingType::CivToMilConversion, 5),
+            almost_done(BuildingType::MilToCivConversion, 6),
+        ]);
+        // в стейте 5 нет гражданских, в стейте 6 нет военных (фабрики пропали, например, при захвате)
+        let mut app = daily_app(economy, factories(&[(5, 1)], &[(6, 1)]));
+        day(&mut app);
+        let eco = &app.world().resource::<Economies>().0["GER"];
+        assert_eq!((eco.civilian_factories, eco.military_factories), (10, 10), "ничего не изменилось");
+        assert!(eco.construction.projects.is_empty(), "проекты сняты из очереди");
+        let sf = app.world().resource::<StateFactories>();
+        assert_eq!((sf.military_in(5), sf.civilian_in(5), sf.military_in(6), sf.civilian_in(6)), (1, 0, 0, 1));
+    }
+
+    #[test]
+    fn conversion_orders_go_through_the_queue_system() {
+        let mut app = App::new();
+        app.add_event::<QueueConstruction>()
+            .insert_resource(Economies(BTreeMap::from([("GER".to_string(), CountryEconomy::new(10, 10))])))
+            .insert_resource(StateRegistry { states: vec![state(1, vec![1, 2]), state(2, vec![3, 4])], ..Default::default() })
+            .insert_resource(controllers())
+            .insert_resource(factories(&[(1, 1), (2, 1)], &[(1, 2), (2, 2)]))
+            .add_systems(Update, apply_construction_orders);
+        let mut order = |kind: BuildingType, state_id: u32| {
+            app.world_mut().send_event(QueueConstruction { country: "GER".into(), state_id, building_type: kind });
+            app.update();
+        };
+        order(BuildingType::CivToMilConversion, 1);
+        order(BuildingType::MilToCivConversion, 1);
+        order(BuildingType::CivToMilConversion, 2); // чужой стейт
+        order(BuildingType::MilToCivConversion, 1); // единственный военный завод уже зарезервирован
+        let projects = &app.world().resource::<Economies>().0["GER"].construction.projects;
+        assert_eq!(projects.len(), 2);
+        assert_eq!((projects[0].building_type, projects[0].state_id, projects[0].cost), (BuildingType::CivToMilConversion, 1, 4000));
+        assert_eq!((projects[1].building_type, projects[1].state_id, projects[1].cost), (BuildingType::MilToCivConversion, 1, 4000));
     }
 }
