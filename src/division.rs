@@ -18,7 +18,7 @@ use crate::clock::{ClockSet, DailyTickEvent, HourTick};
 use crate::air::{air_attack_bonus_pct, air_defense_penalty_pct, air_status, side_edge, AirSuperiorityMap};
 use crate::colors::CountryColors;
 use crate::command::SKILL_BONUS_PCT;
-use crate::economy::{update_supply_network, ArmyExperience, EquipmentType, SupplyNetwork};
+use crate::economy::{update_supply_network, ArmyExperience, EquipmentType, PlayerCountry, SupplyNetwork};
 use crate::oob::{resolve_placement, resolve_template, OobDivisions, Placement};
 use crate::units::{DivisionTemplate, DivisionTemplates, BASE_TEMPLATE, INFANTRY_SPEED_KPH};
 #[cfg(test)]
@@ -322,6 +322,63 @@ pub struct SelectedGroup {
     pub whole: bool,
 }
 
+/// Протяжка рамки выделения. Экранные координаты в логических пикселях окна — только клиентский ввод.
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
+pub struct DragSelection {
+    /// ЛКМ зажата, рамка тянется.
+    pub active: bool,
+    /// Точка нажатия ЛКМ.
+    pub start_screen_pos: Vec2,
+    /// Текущее положение курсора.
+    pub current_screen_pos: Vec2,
+    /// Минимальная протяжка в пикселях, отличающая рамку от клика.
+    pub threshold: f32,
+}
+
+impl Default for DragSelection {
+    fn default() -> Self {
+        Self { active: false, start_screen_pos: Vec2::ZERO, current_screen_pos: Vec2::ZERO, threshold: 8.0 }
+    }
+}
+
+impl DragSelection {
+    /// Протяжка длиннее порога: это рамка, а не клик.
+    pub fn is_box(&self) -> bool {
+        self.start_screen_pos.distance(self.current_screen_pos) > self.threshold
+    }
+}
+
+/// Множественный выбор рамкой: дивизии игрока по возрастанию id. Пусто — действует обычный выбор стека.
+#[derive(Resource, Default, Debug, Clone, PartialEq, Eq)]
+pub struct SelectedDivisions(pub Vec<Entity>);
+
+/// Прямоугольник из двух углов в любом порядке: (минимум, максимум).
+pub fn normalized_rect(a: Vec2, b: Vec2) -> (Vec2, Vec2) {
+    (a.min(b), a.max(b))
+}
+
+/// Точка внутри AABB (границы включены).
+pub fn rect_contains(min: Vec2, max: Vec2, point: Vec2) -> bool {
+    point.x >= min.x && point.x <= max.x && point.y >= min.y && point.y <= max.y
+}
+
+/// Дивизии владельца `owner`, центры которых лежат в прямоугольнике; элементы — `(сущность, id, владелец, центр)`.
+/// Результат по возрастанию id (детерминированный порядок).
+pub fn boxed_divisions<'a>(
+    items: impl IntoIterator<Item = (Entity, u32, &'a str, Vec2)>,
+    owner: &str,
+    min: Vec2,
+    max: Vec2,
+) -> Vec<Entity> {
+    let mut found: Vec<(u32, Entity)> = items
+        .into_iter()
+        .filter(|&(_, _, o, center)| o == owner && rect_contains(min, max, center))
+        .map(|(e, id, _, _)| (id, e))
+        .collect();
+    found.sort_unstable();
+    found.into_iter().map(|(_, e)| e).collect()
+}
+
 /// Полоска организации на фишке (дочерний спрайт).
 #[derive(Component)]
 struct OrgBar;
@@ -388,6 +445,20 @@ pub fn stack_row_text(index: usize, d: &Division) -> String {
         percent(d.current_org, d.max_org),
         percent(d.current_strength, d.max_strength)
     )
+}
+
+/// Адресаты приказа ПКМ с учётом рамки: при выделении рамкой — все живые дивизии группы по порядку,
+/// иначе обычная логика стека / одной дивизии.
+pub fn command_targets(
+    multi: &SelectedDivisions,
+    divisions: &Query<(Entity, &Division)>,
+    selected: Entity,
+    whole: bool,
+) -> Vec<Entity> {
+    if multi.0.is_empty() {
+        return order_targets(divisions, selected, whole);
+    }
+    multi.0.iter().copied().filter(|&e| divisions.get(e).is_ok()).collect()
 }
 
 /// Кому отдаётся приказ ПКМ: вся группа (стоящие дивизии провинции выбранной, того же владельца, по id)
@@ -526,6 +597,8 @@ impl Plugin for DivisionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SelectedDivision>()
             .init_resource::<SelectedGroup>()
+            .init_resource::<DragSelection>()
+            .init_resource::<SelectedDivisions>()
             .init_resource::<StackView>()
             .init_resource::<DivisionTemplates>()
             .add_event::<OrderMove>()
@@ -550,7 +623,7 @@ impl Plugin for DivisionPlugin {
                     .after(ClockSet)
                     .in_set(CombatSet),
             )
-            .add_systems(Update, (combat_ui, division_info_ui, stack_badges_ui))
+            .add_systems(Update, (combat_ui, division_info_ui, stack_badges_ui, draw_selection_box))
             .add_systems(Update, daily_entrenchment.after(ClockSet))
             // переформирование применяется до боевой цепочки кадра
             .add_systems(Update, apply_refits.before(CombatSet))
@@ -716,19 +789,72 @@ fn spawn_oob_divisions(
 // Ввод (формирует только выбор / события)
 // ---------------------------------------------------------------------------
 
-/// ЛКМ по провинции: выбирает весь стек стоящих в ней дивизий (активна дивизия с наименьшим id,
-/// инспектор показывает список). Клик в другое место снимает выбор.
+/// ЛКМ: короткий клик по провинции выбирает весь стек стоящих в ней дивизий (активна дивизия с наименьшим
+/// id, инспектор показывает список); протяжка длиннее порога выделяет рамкой все дивизии игрока, центры
+/// которых попали в неё. Рамка без дивизий ведёт себя как обычный клик. Паник нет: нет окна, курсора или
+/// проекции камеры — действие просто пропускается.
+#[allow(clippy::too_many_arguments)]
 fn select_division_input(
     mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     hovered: Res<HoveredProvince>,
+    player: Res<PlayerCountry>,
     divisions: Query<(Entity, &Division)>,
+    transforms: Query<(Entity, &Division, &Transform)>,
     mut selected: ResMut<SelectedDivision>,
     mut group: ResMut<SelectedGroup>,
+    mut multi: ResMut<SelectedDivisions>,
+    mut drag: ResMut<DragSelection>,
     mut contexts: EguiContexts,
 ) {
-    if !mouse.just_pressed(MouseButton::Left) || contexts.try_ctx_mut().is_none_or(|ctx| ctx.wants_pointer_input()) {
+    let cursor = windows.get_single().ok().and_then(|w| w.cursor_position());
+    if mouse.just_pressed(MouseButton::Left) {
+        let over_ui = contexts.try_ctx_mut().is_none_or(|ctx| ctx.wants_pointer_input());
+        if over_ui {
+            return;
+        }
+        if let Some(pos) = cursor {
+            *drag = DragSelection { active: true, start_screen_pos: pos, current_screen_pos: pos, ..*drag };
+        }
         return;
     }
+    if !drag.active {
+        return;
+    }
+    if let Some(pos) = cursor {
+        drag.current_screen_pos = pos;
+    }
+    if !mouse.just_released(MouseButton::Left) {
+        return;
+    }
+    drag.active = false;
+
+    // Рамка: экранный прямоугольник -> мировой AABB через камеру
+    if drag.is_box() {
+        let corners = cameras.get_single().ok().and_then(|(camera, camera_transform)| {
+            let a = camera.viewport_to_world_2d(camera_transform, drag.start_screen_pos)?;
+            let b = camera.viewport_to_world_2d(camera_transform, drag.current_screen_pos)?;
+            Some(normalized_rect(a, b))
+        });
+        if let Some((min, max)) = corners {
+            let captured = boxed_divisions(
+                transforms.iter().map(|(e, d, t)| (e, d.id, d.owner.as_str(), t.translation.truncate())),
+                &player.0,
+                min,
+                max,
+            );
+            if let Some(&first) = captured.first() {
+                selected.0 = Some(first);
+                group.whole = true;
+                multi.0 = captured;
+                return;
+            }
+        }
+    }
+
+    // Обычный клик (или рамка без дивизий): выбор стека провинции под курсором
+    multi.0.clear();
     group.whole = false;
     selected.0 = hovered.id.and_then(|province| {
         // Стек провинции: стоящие дивизии по возрастанию id — детерминированный порядок
@@ -749,6 +875,19 @@ fn select_division_input(
     });
 }
 
+/// Рамка выделения: контрастная светло-зелёная граница и заливка с alpha ~15% в фоновом слое egui.
+fn draw_selection_box(mut contexts: EguiContexts, drag: Res<DragSelection>) {
+    if !drag.active || !drag.is_box() {
+        return;
+    }
+    let Some(ctx) = contexts.try_ctx_mut() else { return };
+    let (min, max) = normalized_rect(drag.start_screen_pos, drag.current_screen_pos);
+    let rect = egui::Rect::from_min_max(egui::pos2(min.x, min.y), egui::pos2(max.x, max.y));
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("selection_box")));
+    painter.rect_filled(rect, 0.0, egui::Color32::from_rgba_unmultiplied(120, 255, 120, 38));
+    painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(170, 255, 170)));
+}
+
 /// ПКМ (короткий клик без перетаскивания, т.к. ПКМ-drag — панорама камеры) -> `OrderMove`.
 fn order_move_input(
     mouse: Res<ButtonInput<MouseButton>>,
@@ -756,6 +895,7 @@ fn order_move_input(
     hovered: Res<HoveredProvince>,
     selected: Res<SelectedDivision>,
     group: Res<SelectedGroup>,
+    multi: Res<SelectedDivisions>,
     divisions: Query<(Entity, &Division)>,
     mut orders: EventWriter<OrderMove>,
     mut press_pos: Local<Option<Vec2>>,
@@ -778,8 +918,8 @@ fn order_move_input(
         return; // это была панорама
     }
     if let (Some(selected), Some(target)) = (selected.0, hovered.id) {
-        // вся группа стека или одна дивизия, выбранная в инспекторе
-        for division in order_targets(&divisions, selected, group.whole) {
+        // вся группа рамки, весь стек или одна дивизия, выбранная в инспекторе
+        for division in command_targets(&multi, &divisions, selected, group.whole) {
             orders.send(OrderMove { division, target });
         }
     }
@@ -2131,6 +2271,7 @@ fn division_info_ui(
     mut contexts: EguiContexts,
     mut selected: ResMut<SelectedDivision>,
     mut group: ResMut<SelectedGroup>,
+    mut multi: ResMut<SelectedDivisions>,
     divisions: Query<&Division>,
     all: Query<(Entity, &Division)>,
     combats: Query<&ActiveCombat>,
@@ -2157,6 +2298,16 @@ fn division_info_ui(
         Vec::new()
     };
     let mut clicked: Option<Entity> = None;
+    // Выделение рамкой: строки всех живых дивизий группы
+    let multi_rows: Vec<(Entity, String)> = multi
+        .0
+        .iter()
+        .filter_map(|&e| all.get(e).ok())
+        .enumerate()
+        .map(|(i, (e, o))| (e, stack_row_text(i + 1, o)))
+        .collect();
+    let mut focus: Option<Entity> = None;
+    let mut clear_group = false;
 
     let combat = combats.iter().find(|c| c.involves(entity));
     let status = match combat {
@@ -2185,7 +2336,18 @@ fn division_info_ui(
                 ui.label(egui::RichText::new(format!("[{}]", d.owner)).color(owner_color).strong());
             });
             // Стек провинции: кликабельные строки; ПКМ командует всей группой, пока она выбрана целиком
-            if rows.len() > 1 {
+            if !multi_rows.is_empty() {
+                ui.label(format!("Выделено рамкой: {} див. (ПКМ — приказ всем)", multi_rows.len()));
+                for (row_entity, text) in &multi_rows {
+                    if ui.selectable_label(*row_entity == entity, text).clicked() {
+                        focus = Some(*row_entity);
+                    }
+                }
+                if ui.button("Сбросить группу").clicked() {
+                    clear_group = true;
+                }
+                ui.separator();
+            } else if rows.len() > 1 {
                 ui.label(format!(
                     "Стек в провинции #{} ({}). {}",
                     d.current_province,
@@ -2310,6 +2472,14 @@ fn division_info_ui(
     // выбор строки инспектора переключает управление на одну дивизию
     if let Some(row) = clicked {
         selected.0 = Some(row);
+        group.whole = false;
+    }
+    // строка группы рамки только переводит фокус инспектора, приказ по-прежнему получает вся группа
+    if let Some(row) = focus {
+        selected.0 = Some(row);
+    }
+    if clear_group {
+        multi.0.clear();
         group.whole = false;
     }
 }
@@ -3659,5 +3829,109 @@ mod stack_tests {
         assert_eq!(targets(&mut app, other, true), vec![other]);
         assert_eq!(targets(&mut app, foreign, true), vec![foreign]);
         assert!(targets(&mut app, Entity::PLACEHOLDER, true).is_empty(), "несуществующая сущность — без паники");
+    }
+}
+
+#[cfg(test)]
+mod box_select_tests {
+    use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+
+    fn spawn_at(app: &mut App, id: u32, owner: &str, province: u32, at: Vec2) -> Entity {
+        let templates = DivisionTemplates::default();
+        let d = Division::from_template(
+            id,
+            format!("Div {id}"),
+            owner.to_string(),
+            province,
+            BASE_TEMPLATE.to_string(),
+            templates.get_or_base(BASE_TEMPLATE),
+        );
+        app.world_mut().spawn((d, Transform::from_xyz(at.x, at.y, 0.0))).id()
+    }
+
+    #[test]
+    fn drag_selection_defaults_and_threshold() {
+        let mut drag = DragSelection::default();
+        assert!(!drag.active);
+        assert_eq!(drag.threshold, 8.0);
+        drag.start_screen_pos = Vec2::new(100.0, 100.0);
+        drag.current_screen_pos = Vec2::new(105.0, 105.0);
+        assert!(!drag.is_box(), "7.07 px < 8: это клик");
+        drag.current_screen_pos = Vec2::new(108.0, 100.0);
+        assert!(!drag.is_box(), "ровно 8 px — ещё не рамка");
+        drag.current_screen_pos = Vec2::new(109.0, 100.0);
+        assert!(drag.is_box());
+    }
+
+    #[test]
+    fn rect_is_normalized_from_any_corner_order() {
+        let (min, max) = normalized_rect(Vec2::new(10.0, -5.0), Vec2::new(-4.0, 20.0));
+        assert_eq!((min, max), (Vec2::new(-4.0, -5.0), Vec2::new(10.0, 20.0)));
+        let (min2, max2) = normalized_rect(Vec2::new(-4.0, 20.0), Vec2::new(10.0, -5.0));
+        assert_eq!((min, max), (min2, max2));
+    }
+
+    #[test]
+    fn point_in_aabb_includes_borders_and_rejects_outside() {
+        let (min, max) = (Vec2::new(0.0, 0.0), Vec2::new(10.0, 5.0));
+        assert!(rect_contains(min, max, Vec2::new(5.0, 2.5)));
+        assert!(rect_contains(min, max, min) && rect_contains(min, max, max), "границы включены");
+        assert!(!rect_contains(min, max, Vec2::new(-0.1, 2.0)));
+        assert!(!rect_contains(min, max, Vec2::new(10.1, 2.0)));
+        assert!(!rect_contains(min, max, Vec2::new(5.0, 5.1)));
+        assert!(!rect_contains(min, max, Vec2::new(5.0, -1.0)));
+        // вырожденная рамка-точка
+        assert!(rect_contains(min, min, min));
+    }
+
+    #[test]
+    fn box_captures_only_player_divisions_inside_sorted_by_id() {
+        let mut app = App::new();
+        let far = spawn_at(&mut app, 9, "GER", 1, Vec2::new(500.0, 500.0));
+        let b = spawn_at(&mut app, 7, "GER", 2, Vec2::new(20.0, 10.0));
+        let a = spawn_at(&mut app, 3, "GER", 3, Vec2::new(5.0, 5.0));
+        let enemy = spawn_at(&mut app, 4, "FRA", 3, Vec2::new(6.0, 6.0));
+        let edge = spawn_at(&mut app, 5, "GER", 4, Vec2::new(30.0, 30.0));
+        let result = app.world_mut().run_system_once(|q: Query<(Entity, &Division, &Transform)>| {
+            boxed_divisions(
+                q.iter().map(|(e, d, t)| (e, d.id, d.owner.as_str(), t.translation.truncate())),
+                "GER",
+                Vec2::new(0.0, 0.0),
+                Vec2::new(30.0, 30.0),
+            )
+        });
+        assert_eq!(result, vec![a, edge, b], "чужие и далёкие не попали; порядок по id 3, 5, 7");
+        assert!(!result.contains(&enemy) && !result.contains(&far));
+        // пустая рамка
+        let none = app.world_mut().run_system_once(|q: Query<(Entity, &Division, &Transform)>| {
+            boxed_divisions(
+                q.iter().map(|(e, d, t)| (e, d.id, d.owner.as_str(), t.translation.truncate())),
+                "GER",
+                Vec2::new(-100.0, -100.0),
+                Vec2::new(-50.0, -50.0),
+            )
+        });
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn rmb_orders_every_division_of_the_box_group() {
+        let mut app = App::new();
+        let a = spawn_at(&mut app, 1, "GER", 1, Vec2::ZERO);
+        let b = spawn_at(&mut app, 2, "GER", 2, Vec2::ZERO);
+        let c = spawn_at(&mut app, 3, "GER", 3, Vec2::ZERO);
+        let dead = spawn_at(&mut app, 4, "GER", 4, Vec2::ZERO);
+        app.world_mut().despawn(dead);
+        let multi = SelectedDivisions(vec![a, b, dead, c]);
+        let targets = {
+            let multi = multi.clone();
+            app.world_mut().run_system_once(move |q: Query<(Entity, &Division)>| command_targets(&multi, &q, a, false))
+        };
+        assert_eq!(targets, vec![a, b, c], "группа рамки целиком, погибшие отфильтрованы, независимо от режима стека");
+        // без рамки действует прежняя логика: одна выбранная дивизия
+        let empty = SelectedDivisions::default();
+        let single = app.world_mut().run_system_once(move |q: Query<(Entity, &Division)>| command_targets(&empty, &q, b, false));
+        assert_eq!(single, vec![b]);
     }
 }
