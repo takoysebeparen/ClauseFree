@@ -228,6 +228,78 @@ pub struct ProvinceControllerChanged {
     pub new_controller: String,
 }
 
+/// Узлы снабжения из `map/supply_nodes.txt` (провинции-хабы).
+#[derive(Resource, Default, Debug, Clone, PartialEq, Eq)]
+pub struct SupplyNodes(pub BTreeSet<u32>);
+
+/// Граф железных дорог из `map/railways.txt`: двусторонние связи соседних точек цепочек.
+#[derive(Resource, Default, Debug, Clone, PartialEq, Eq)]
+pub struct RailwayGraph(pub BTreeMap<u32, BTreeSet<u32>>);
+
+/// Строки без комментариев (`# ...`) как списки чисел; строка с нечисловым токеном пропускается целиком.
+fn numeric_lines(text: &str) -> impl Iterator<Item = Vec<u32>> + '_ {
+    text.trim_start_matches('\u{feff}').lines().filter_map(|line| {
+        let line = line.split('#').next().unwrap_or("");
+        let numbers: Option<Vec<u32>> = line.split_whitespace().map(|t| t.parse::<u32>().ok()).collect();
+        numbers.filter(|n| !n.is_empty())
+    })
+}
+
+/// `supply_nodes.txt`: пары `<уровень> <id провинции>`; уникальные id провинций (уровень >= 1, id > 0).
+pub fn parse_supply_nodes(text: &str) -> SupplyNodes {
+    let mut nodes = BTreeSet::new();
+    for numbers in numeric_lines(text) {
+        for pair in numbers.chunks_exact(2) {
+            if pair[0] >= 1 && pair[1] > 0 {
+                nodes.insert(pair[1]);
+            }
+        }
+    }
+    SupplyNodes(nodes)
+}
+
+/// `railways.txt`: `<уровень 1..5> <K> <id_1> ... <id_K>`; связи между соседями в цепочке в обе стороны.
+/// Строки с неверным уровнем пропускаются, K сверх фактического числа id обрезается.
+pub fn parse_railways(text: &str) -> RailwayGraph {
+    let mut graph: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    for numbers in numeric_lines(text) {
+        let [level, count, ids @ ..] = numbers.as_slice() else { continue };
+        if !(1..=5).contains(level) {
+            continue;
+        }
+        let ids = &ids[..ids.len().min(*count as usize)];
+        for pair in ids.windows(2) {
+            if pair[0] != pair[1] {
+                graph.entry(pair[0]).or_default().insert(pair[1]);
+                graph.entry(pair[1]).or_default().insert(pair[0]);
+            }
+        }
+    }
+    RailwayGraph(graph)
+}
+
+/// Читает `map/supply_nodes.txt`; нет файла — пустой набор и предупреждение.
+pub fn load_supply_nodes(root: &Path) -> SupplyNodes {
+    match std::fs::read(root.join("map").join("supply_nodes.txt")) {
+        Ok(bytes) => parse_supply_nodes(&String::from_utf8_lossy(&bytes)),
+        Err(e) => {
+            eprintln!("[ПРЕДУПРЕЖДЕНИЕ] supply_nodes.txt: {e}; хабы определятся по очкам победы");
+            SupplyNodes::default()
+        }
+    }
+}
+
+/// Читает `map/railways.txt`; нет файла — пустой граф и предупреждение.
+pub fn load_railways(root: &Path) -> RailwayGraph {
+    match std::fs::read(root.join("map").join("railways.txt")) {
+        Ok(bytes) => parse_railways(&String::from_utf8_lossy(&bytes)),
+        Err(e) => {
+            eprintln!("[ПРЕДУПРЕЖДЕНИЕ] railways.txt: {e}; снабжаться будут только окрестности столиц");
+            RailwayGraph::default()
+        }
+    }
+}
+
 /// Граф смежности провинций (BTree — строгий детерминизм под мультиплеер).
 #[derive(Resource, Default)]
 pub struct ProvinceAdjacency {
@@ -322,6 +394,16 @@ impl Plugin for MapPlugin {
 
         // Order of Battle 1936 (GER, FRA): читается на лету, спавн — в division.rs
         app.insert_resource(crate::oob::load_oob(&self.root));
+
+        // Логистика: узлы снабжения и железные дороги
+        let supply_nodes = load_supply_nodes(&self.root);
+        let railways = load_railways(&self.root);
+        println!(
+            "[СНАБЖЕНИЕ] Узлов снабжения: {}, железнодорожных точек: {}",
+            supply_nodes.0.len(),
+            railways.0.len()
+        );
+        app.insert_resource(supply_nodes).insert_resource(railways);
 
         // Аутентичные цвета стран из common/countries/colors.txt и файлов стран
         app.insert_resource(crate::colors::load_country_colors(&self.root));
@@ -1168,5 +1250,51 @@ mod relief_tests {
         assert_eq!(h.pixels.len(), (h.width * h.height) as usize);
         let (min, max) = (h.pixels.iter().min().copied().unwrap_or(0), h.pixels.iter().max().copied().unwrap_or(0));
         assert!(max > min + 50, "в рельефе есть перепад высот: {min}..{max}");
+    }
+}
+
+#[cfg(test)]
+mod supply_parse_tests {
+    use super::*;
+
+    #[test]
+    fn supply_nodes_are_unique_province_ids() {
+        let nodes = parse_supply_nodes("1 67 \n1 101\n# комментарий\n2 67\n\n1 abc\n0 55\n1 121 # хвост\n1\n");
+        assert_eq!(nodes.0.into_iter().collect::<Vec<_>>(), vec![67, 101, 121], "дубликаты, мусор и уровень 0 отброшены");
+        assert!(parse_supply_nodes("").0.is_empty());
+        assert!(parse_supply_nodes("\u{feff}1 5").0.contains(&5), "BOM не мешает");
+    }
+
+    #[test]
+    fn railways_build_a_bidirectional_chain_graph() {
+        let graph = parse_railways("3 4 6521 11444 3312 6282 \n2 3 6282 349 3340\n# x\n1 2 7 7\n9 2 1 2\n1 5 10 11\n1 1 77\n").0;
+        assert_eq!(graph[&6521], BTreeSet::from([11444]));
+        assert_eq!(graph[&11444], BTreeSet::from([6521, 3312]), "связь в обе стороны");
+        assert_eq!(graph[&6282], BTreeSet::from([3312, 349]), "цепочки склеиваются общей точкой");
+        assert!(!graph.contains_key(&1), "уровень 9 пропущен");
+        assert!(!graph.contains_key(&7), "петля и одиночная точка не создают связей");
+        assert_eq!(graph[&10], BTreeSet::from([11]), "K больше числа id обрезается");
+        assert!(!graph.contains_key(&77));
+        assert!(parse_railways("garbage\n\n").0.is_empty());
+    }
+
+    #[test]
+    fn missing_files_give_empty_resources_without_panic() {
+        let missing = Path::new("Z:\\нет\\такой\\папки");
+        assert!(load_supply_nodes(missing).0.is_empty());
+        assert!(load_railways(missing).0.is_empty());
+    }
+
+    #[test]
+    fn real_data_files_are_parsed() {
+        let root = Path::new("D:\\SteamLibrary\\steamapps\\common\\Hearts of Iron IV");
+        if !root.exists() {
+            return;
+        }
+        let nodes = load_supply_nodes(root);
+        let graph = load_railways(root);
+        assert!(nodes.0.len() > 500, "узлов: {}", nodes.0.len());
+        assert!(graph.0.contains_key(&6521) && graph.0[&6521].contains(&11444), "первая линия railways.txt");
+        assert!(graph.0.values().all(|n| !n.is_empty()));
     }
 }

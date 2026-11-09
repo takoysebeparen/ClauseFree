@@ -2827,6 +2827,7 @@ mod supply_tests {
         SupplyNetwork {
             hubs: Default::default(),
             coverage: covered.iter().map(|&(p, o)| (p, o.to_string())).collect(),
+            ..Default::default()
         }
     }
 

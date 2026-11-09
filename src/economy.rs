@@ -951,6 +951,10 @@ pub fn army_xp_text(xp: u32) -> String {
 pub struct SupplyNetwork {
     /// Провинции-кандидаты в хабы (столицы / центры стейтов с VP >= 5), по возрастанию id.
     pub hubs: BTreeSet<u32>,
+    /// Столица каждой нации (самый ценный город по очкам победы); всегда активный узел, пока ею владеет нация.
+    pub capitals: BTreeMap<String, u32>,
+    /// Активные на сегодня узлы: связаны рельсами со столицей по землям своей нации (пересчёт в полночь).
+    pub active_hubs: BTreeSet<u32>,
     /// Покрытая снабжением провинция -> нация, которую снабжает хаб.
     pub coverage: BTreeMap<u32, String>,
 }
@@ -960,6 +964,66 @@ impl SupplyNetwork {
     pub fn supplies(&self, province: u32, country: &str) -> bool {
         self.coverage.get(&province).is_some_and(|c| c == country)
     }
+}
+
+/// Провинции, достижимые по железным дорогам от `start` только через земли нации `nation` (BFS в ширину,
+/// порядок соседей — по возрастанию id). Сама стартовая провинция тоже должна быть под контролем нации.
+pub fn rail_reach(
+    start: u32,
+    nation: &str,
+    rails: &BTreeMap<u32, BTreeSet<u32>>,
+    controllers: &ProvinceControllers,
+) -> BTreeSet<u32> {
+    let owned = |p: &u32| controllers.0.get(p).is_some_and(|c| c == nation);
+    let mut seen = BTreeSet::new();
+    if !owned(&start) {
+        return seen;
+    }
+    seen.insert(start);
+    let mut queue = std::collections::VecDeque::from([start]);
+    while let Some(province) = queue.pop_front() {
+        for &next in rails.get(&province).into_iter().flatten() {
+            if owned(&next) && seen.insert(next) {
+                queue.push_back(next);
+            }
+        }
+    }
+    seen
+}
+
+/// Активные узлы снабжения. Для нации со столицей узел активен, только если он под её контролем и
+/// связан со столицей непрерывной железной дорогой по её землям; столица активна сама. Потерявшая столицу
+/// нация узлов не имеет. Нация без известной столицы (нет данных) использует все свои узлы.
+pub fn active_supply_hubs(
+    nodes: &BTreeSet<u32>,
+    capitals: &BTreeMap<String, u32>,
+    rails: &BTreeMap<u32, BTreeSet<u32>>,
+    controllers: &ProvinceControllers,
+) -> BTreeSet<u32> {
+    let nations: BTreeSet<&String> = controllers.0.values().collect();
+    let mut active = BTreeSet::new();
+    for nation in nations {
+        match capitals.get(nation) {
+            Some(&capital) => {
+                let reach = rail_reach(capital, nation, rails, controllers);
+                if !reach.is_empty() {
+                    active.insert(capital);
+                    active.extend(nodes.iter().copied().filter(|n| reach.contains(n)));
+                }
+            }
+            None => active.extend(nodes.iter().copied().filter(|n| controllers.0.get(n) == Some(nation))),
+        }
+    }
+    active
+}
+
+/// Столицы наций: крупнейший город владельца (по очкам победы стейтов).
+fn capitals_from_registry(registry: &StateRegistry) -> BTreeMap<String, u32> {
+    let owners: BTreeSet<&str> = registry.states.iter().map(|s| s.owner.as_str()).collect();
+    owners
+        .into_iter()
+        .filter_map(|tag| crate::oob::largest_city(registry, tag, &|_| true).map(|p| (tag.to_string(), p)))
+        .collect()
 }
 
 /// Хабы по данным стейтов: провинции с победными очками не меньше порога.
@@ -1059,9 +1123,22 @@ impl Plugin for EconomyPlugin {
 
 /// Хабы снабжения на старте. Зона покрытия считается на первом суточном тике:
 /// граф смежности создаётся в `setup_map` позже, а до тех пор все дивизии считаются снабжёнными.
-fn init_supply_network(registry: Res<StateRegistry>, mut network: ResMut<SupplyNetwork>) {
-    network.hubs = hubs_from_registry(&registry);
-    println!("[СНАБЖЕНИЕ] Хабов снабжения: {} (VP >= {HUB_MIN_VICTORY_POINTS}), радиус {SUPPLY_RADIUS}", network.hubs.len());
+fn init_supply_network(
+    registry: Res<StateRegistry>,
+    nodes: Option<Res<crate::map::SupplyNodes>>,
+    mut network: ResMut<SupplyNetwork>,
+) {
+    network.capitals = capitals_from_registry(&registry);
+    // Узлы — из map/supply_nodes.txt; без файла запасной вариант — города с очками победы
+    let from_file = nodes.map(|n| n.0.clone()).unwrap_or_default();
+    network.hubs = if from_file.is_empty() { hubs_from_registry(&registry) } else { from_file };
+    let capital_hubs: Vec<u32> = network.capitals.values().copied().collect();
+    network.hubs.extend(capital_hubs);
+    println!(
+        "[СНАБЖЕНИЕ] Узлов снабжения: {}, столиц: {}, радиус {SUPPLY_RADIUS}",
+        network.hubs.len(),
+        network.capitals.len()
+    );
 }
 
 /// Раз в сутки (00:00): пересчёт зоны покрытия по текущим контроллерам провинций.
@@ -1072,11 +1149,20 @@ pub fn update_supply_network(
     controllers: Res<ProvinceControllers>,
     adjacency: Res<ProvinceAdjacency>,
     map: Res<ProvinceMap>,
+    rails: Option<Res<crate::map::RailwayGraph>>,
 ) {
     if events.read().count() == 0 {
         return;
     }
-    network.coverage = compute_coverage(&network.hubs, &controllers, &adjacency, &map);
+    // Связность логистики: узел работает, только если по рельсам по своим землям дотянулся до столицы
+    let empty = BTreeMap::new();
+    let graph = rails.as_ref().map_or(&empty, |r| &r.0);
+    let active = active_supply_hubs(&network.hubs, &network.capitals, graph, &controllers);
+    if active.len() != network.active_hubs.len() {
+        println!("[СНАБЖЕНИЕ] Активных узлов: {} из {}", active.len(), network.hubs.len());
+    }
+    network.coverage = compute_coverage(&active, &controllers, &adjacency, &map);
+    network.active_hubs = active;
 }
 
 /// Стартовая экономика: суммы фабрик из стейтов по владельцам.
@@ -1904,6 +1990,7 @@ mod tests {
         let network = SupplyNetwork {
             hubs: BTreeSet::from([1]),
             coverage: compute_coverage(&BTreeSet::from([1]), &owners, &chain(), &ProvinceMap::empty_for_test()),
+            ..Default::default()
         };
         assert!(network.supplies(1, "FRA") && network.supplies(2, "FRA"));
         assert!(!network.supplies(2, "GER"), "германская дивизия во французской зоне не снабжается");
@@ -2149,7 +2236,7 @@ mod reinforcement_tests {
         economy.set_stock(InfantryEquipment, 1000);
         app.add_event::<DailyTickEvent>()
             .insert_resource(Economies(BTreeMap::from([("GER".to_string(), economy)])))
-            .insert_resource(SupplyNetwork { hubs: BTreeSet::from([1]), coverage: BTreeMap::new() })
+            .insert_resource(SupplyNetwork { hubs: BTreeSet::from([1]), ..Default::default() })
             .insert_resource(ProvinceControllers(BTreeMap::from([
                 (1, "GER".to_string()),
                 (2, "GER".to_string()),
@@ -3585,5 +3672,146 @@ mod export_tests {
         assert!(economies["GER"].natural(Steel) > 0);
         open_trade_order(&mut economies, "GER", Steel, "SWE", START_TRADE_FACTORIES).expect("стартовый контракт");
         assert_eq!(economies["GER"].imported_resources(Steel), 24);
+    }
+}
+
+#[cfg(test)]
+mod rail_supply_tests {
+    use super::*;
+    use crate::units::{DivisionTemplates, PLAIN_INFANTRY_TEMPLATE};
+    use std::path::Path;
+
+    fn controllers(list: &[(u32, &str)]) -> ProvinceControllers {
+        ProvinceControllers(list.iter().map(|&(p, c)| (p, c.to_string())).collect())
+    }
+
+    fn rails(lines: &[&str]) -> BTreeMap<u32, BTreeSet<u32>> {
+        crate::map::parse_railways(&lines.join("\n")).0
+    }
+
+    fn capitals(list: &[(&str, u32)]) -> BTreeMap<String, u32> {
+        list.iter().map(|&(t, p)| (t.to_string(), p)).collect()
+    }
+
+    #[test]
+    fn rail_branch_to_the_capital_keeps_the_hub_active() {
+        let graph = rails(&["1 5 1 2 3 4 5"]);
+        let owners = controllers(&[(1, "GER"), (2, "GER"), (3, "GER"), (4, "GER"), (5, "GER")]);
+        let active = active_supply_hubs(&BTreeSet::from([5, 3]), &capitals(&[("GER", 1)]), &graph, &owners);
+        assert_eq!(active, BTreeSet::from([1, 3, 5]), "столица и оба узла, связанные веткой");
+        assert_eq!(rail_reach(1, "GER", &graph, &owners), BTreeSet::from([1, 2, 3, 4, 5]));
+    }
+
+    #[test]
+    fn enemy_province_cuts_the_railway_and_disables_the_end_hub() {
+        let graph = rails(&["1 5 1 2 3 4 5"]);
+        // провинцию 3 занял противник: хабы 4 и 5 под нашим контролем, но отрезаны
+        let owners = controllers(&[(1, "GER"), (2, "GER"), (3, "FRA"), (4, "GER"), (5, "GER")]);
+        let nodes = BTreeSet::from([2, 4, 5]);
+        let active = active_supply_hubs(&nodes, &capitals(&[("GER", 1), ("FRA", 3)]), &graph, &owners);
+        assert!(active.contains(&2) && active.contains(&1), "узел до разрыва работает");
+        assert!(!active.contains(&4) && !active.contains(&5), "узлы за разрывом отключены");
+        assert!(active.contains(&3), "столица FRA активна у своей нации");
+    }
+
+    #[test]
+    fn hubs_off_the_rails_or_without_a_capital_follow_the_rules() {
+        let graph = rails(&["1 3 1 2 3"]);
+        let owners = controllers(&[(1, "GER"), (2, "GER"), (3, "GER"), (9, "GER"), (20, "ITA")]);
+        let nodes = BTreeSet::from([3, 9, 20]);
+        let active = active_supply_hubs(&nodes, &capitals(&[("GER", 1)]), &graph, &owners);
+        assert_eq!(active, BTreeSet::from([1, 3, 20]), "9 вне рельсов отключён; ITA без столицы — запасное правило: свой узел 20 активен");
+        // потеря столицы: нация вообще без активных узлов
+        let lost = controllers(&[(1, "FRA"), (2, "GER"), (3, "GER")]);
+        let active = active_supply_hubs(&nodes, &capitals(&[("GER", 1)]), &graph, &lost);
+        assert!(active.iter().all(|h| lost.0.get(h).map(String::as_str) != Some("GER")), "у нации без столицы активных узлов нет");
+    }
+
+    #[test]
+    fn conquered_node_joins_the_conquerors_network_only_through_its_own_lands() {
+        let graph = rails(&["1 3 1 2 3", "1 3 3 4 5"]);
+        // FRA: столица 5; хаб 3 захвачен ею; цепочка 5-4-3 целиком французская
+        let owners = controllers(&[(1, "GER"), (2, "GER"), (3, "FRA"), (4, "FRA"), (5, "FRA")]);
+        let nodes = BTreeSet::from([3]);
+        let active = active_supply_hubs(&nodes, &capitals(&[("GER", 1), ("FRA", 5)]), &graph, &owners);
+        assert!(active.contains(&3), "узел 3 теперь снабжает FRA");
+        // 4 перешла к GER: узел 3 отрезан от французской столицы
+        let owners = controllers(&[(1, "GER"), (2, "GER"), (3, "FRA"), (4, "GER"), (5, "FRA")]);
+        let active = active_supply_hubs(&nodes, &capitals(&[("GER", 1), ("FRA", 5)]), &graph, &owners);
+        assert!(!active.contains(&3));
+    }
+
+    fn cauldron_app(owners: &[(u32, &str)]) -> App {
+        let mut app = App::new();
+        let neighbors: BTreeMap<u32, BTreeSet<u32>> = (1..=5)
+            .map(|p: u32| (p, [p.wrapping_sub(1), p + 1].into_iter().filter(|n| (1..=5).contains(n)).collect()))
+            .collect();
+        app.add_event::<DailyTickEvent>()
+            .insert_resource(SupplyNetwork {
+                hubs: BTreeSet::from([1, 5]),
+                capitals: capitals(&[("GER", 1)]),
+                ..Default::default()
+            })
+            .insert_resource(crate::map::RailwayGraph(rails(&["1 5 1 2 3 4 5"])))
+            .insert_resource(controllers(owners))
+            .insert_resource(ProvinceAdjacency { neighbors })
+            .insert_resource(ProvinceMap::empty_for_test())
+            .add_systems(Update, (update_supply_network, daily_supply.after(update_supply_network)));
+        app
+    }
+
+    fn division_in(app: &mut App, id: u32, province: u32) -> Entity {
+        let templates = DivisionTemplates::default();
+        let d = Division::from_template(id, "d".into(), "GER".into(), province, PLAIN_INFANTRY_TEMPLATE.to_string(), templates.get_or_base(PLAIN_INFANTRY_TEMPLATE));
+        app.world_mut().spawn(d).id()
+    }
+
+    fn tick(app: &mut App) {
+        app.world_mut().send_event(DailyTickEvent { day: 1, month: 1, year: 1936 });
+        app.update();
+    }
+
+    #[test]
+    fn encircled_divisions_starve_until_the_railway_is_restored() {
+        // 3 занята противником: карман 4-5 (с узлом 5) отрезан от столицы 1
+        let mut app = cauldron_app(&[(1, "GER"), (2, "GER"), (3, "FRA"), (4, "GER"), (5, "GER")]);
+        let safe = division_in(&mut app, 1, 2);
+        let trapped = division_in(&mut app, 2, 5);
+        let full = app.world().get::<Division>(trapped).unwrap().current_strength;
+        tick(&mut app);
+        assert!(app.world().resource::<SupplyNetwork>().active_hubs.contains(&1));
+        assert!(!app.world().resource::<SupplyNetwork>().active_hubs.contains(&5), "узел 5 отрезан");
+        let d = app.world().get::<Division>(trapped).unwrap();
+        assert!(!d.is_supplied && d.attrition_days == 1);
+        assert_eq!(d.current_strength, full - full * 2 / 100, "истощение -2% в день");
+        assert!(app.world().get::<Division>(safe).unwrap().is_supplied);
+        tick(&mut app);
+        assert_eq!(app.world().get::<Division>(trapped).unwrap().attrition_days, 2);
+        // фронт прорван: провинция 3 снова наша — связь восстановлена
+        app.world_mut().resource_mut::<ProvinceControllers>().0.insert(3, "GER".into());
+        tick(&mut app);
+        let d = app.world().get::<Division>(trapped).unwrap();
+        assert!(d.is_supplied && d.attrition_days == 0);
+    }
+
+    #[test]
+    fn real_data_ger_network_is_connected_to_berlin() {
+        let root = Path::new("D:\\SteamLibrary\\steamapps\\common\\Hearts of Iron IV");
+        if !root.exists() {
+            return;
+        }
+        let registry = crate::map::load_all_states(&root.join("history").join("states")).expect("стейты");
+        let nodes = crate::map::load_supply_nodes(root);
+        let graph = crate::map::load_railways(root);
+        assert!(nodes.0.len() > 500 && graph.0.len() > 500, "{} узлов, {} точек рельсов", nodes.0.len(), graph.0.len());
+        let owners = ProvinceControllers(registry.province_to_state.iter().map(|(&p, s)| (p, s.owner.clone())).collect());
+        let caps = capitals_from_registry(&registry);
+        let capital = caps["GER"];
+        let active = active_supply_hubs(&nodes.0, &caps, &graph.0, &owners);
+        let ger_nodes = nodes.0.iter().filter(|n| owners.0.get(n).is_some_and(|c| c == "GER")).count();
+        let ger_active = active.iter().filter(|n| owners.0.get(n).is_some_and(|c| c == "GER") && nodes.0.contains(n)).count();
+        println!("GER: столица {capital}, узлов {ger_nodes}, активных {ger_active}");
+        assert!(active.contains(&capital));
+        assert!(ger_active > 5, "рельсы связывают германские узлы со столицей");
     }
 }
