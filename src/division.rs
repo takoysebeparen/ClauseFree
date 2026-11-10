@@ -18,7 +18,8 @@ use crate::clock::{ClockSet, DailyTickEvent, HourTick};
 use crate::air::{air_attack_bonus_pct, air_defense_penalty_pct, air_status, side_edge, AirSuperiorityMap};
 use crate::colors::CountryColors;
 use crate::command::{
-    pick_tactic, resolve_counters, side_mods, CombatTactic, ATTACKER_TACTICS, DEFENDER_TACTICS, SKILL_BONUS_PCT,
+    pick_tactic, resolve_counters, side_mods, CombatPhase, CombatTactic, ATTACKER_TACTICS, DEFENDER_TACTICS,
+    SKILL_BONUS_PCT, WITHDRAWAL_ORG_DAMAGE_PCT, WITHDRAWAL_PHASE_HOURS, WITHDRAWAL_WIDTH_DIVISOR,
 };
 use crate::diplomacy::{check_entry, DiplomacyRegistry};
 use crate::economy::{update_supply_network, ArmyExperience, EquipmentType, PlayerCountry, SupplyNetwork};
@@ -330,12 +331,24 @@ pub struct ActiveCombat {
     pub is_defender_countered: bool,
     /// Индекс игровых суток последнего выбора тактик.
     pub tactic_change_day: u32,
+    /// Фаза сражения: отход защитников сужает фронт и смягчает урон.
+    pub phase: CombatPhase,
+    /// Сколько игровых часов фаза ещё длится (уменьшается каждый `HourTick`).
+    pub phase_hours_left: u32,
 }
 
 impl ActiveCombat {
     /// Участвует ли дивизия в бою (на линии или в резерве).
     pub fn involves(&self, entity: Entity) -> bool {
         self.attackers.contains(&entity) || self.defenders.contains(&entity)
+    }
+
+    /// Лимит ширины линии каждой стороны с учётом фазы: при отходе вдвое меньше.
+    pub fn effective_max_width(&self) -> u32 {
+        match self.phase {
+            CombatPhase::Default => self.max_width,
+            CombatPhase::TacticalWithdrawal => self.max_width / WITHDRAWAL_WIDTH_DIVISOR,
+        }
     }
 }
 
@@ -1560,6 +1573,8 @@ fn advance_marches(
                 is_attacker_countered: false,
                 is_defender_countered: false,
                 tactic_change_day: 0,
+                phase: CombatPhase::Default,
+                phase_hours_left: 0,
             });
         }
     }
@@ -1592,6 +1607,18 @@ pub fn choose_tactics(
     }
 }
 
+/// Суточный переход фазы боя: отход защитника включает (или продлевает) фазу на 24 часа; фаза, срок которой
+/// истёк, а отход не выбран, возвращается в обычную; пока срок идёт, фаза доживает своё время.
+pub fn next_phase(phase: CombatPhase, hours_left: u32, defender: CombatTactic) -> (CombatPhase, u32) {
+    if defender == CombatTactic::TacticalWithdrawal {
+        (CombatPhase::TacticalWithdrawal, WITHDRAWAL_PHASE_HOURS)
+    } else if phase == CombatPhase::TacticalWithdrawal && hours_left == 0 {
+        (CombatPhase::Default, 0)
+    } else {
+        (phase, hours_left)
+    }
+}
+
 /// Раз в сутки (00:00) командующие обеих сторон каждого боя выбирают тактики; парирование выставляет
 /// флаги `is_*_countered`. Ключ командующего — наименьший id дивизии стороны (у дивизий нет ссылки на
 /// генерала, а состав стороны в бою детерминирован).
@@ -1618,6 +1645,10 @@ fn select_combat_tactics(
             combat.is_attacker_countered = att_countered;
             combat.is_defender_countered = def_countered;
             combat.tactic_change_day = day;
+            // Фаза отхода: выбор отхода защитником включает её на 24 часа; по истечении срока без отхода — обычная
+            let (phase, hours_left) = next_phase(combat.phase, combat.phase_hours_left, defender);
+            combat.phase = phase;
+            combat.phase_hours_left = hours_left;
         }
     }
 }
@@ -1638,6 +1669,18 @@ pub fn tactics_segments(combat: &ActiveCombat) -> Vec<(String, bool)> {
     segments
 }
 
+/// Статус фазы боя для интерфейса; в обычной фазе — `None`.
+pub fn phase_text(combat: &ActiveCombat) -> Option<String> {
+    match combat.phase {
+        CombatPhase::Default => None,
+        phase => Some(format!(
+            "Фаза: {} (осталось {} ч.) | Фронт сужен на 50%",
+            phase.title(),
+            combat.phase_hours_left
+        )),
+    }
+}
+
 /// Показывает строку тактик: красная пометка у парированной стороны.
 fn show_tactics(ui: &mut egui::Ui, combat: &ActiveCombat) {
     ui.horizontal_wrapped(|ui| {
@@ -1650,6 +1693,9 @@ fn show_tactics(ui: &mut egui::Ui, combat: &ActiveCombat) {
             }
         }
     });
+    if let Some(phase) = phase_text(combat) {
+        ui.label(egui::RichText::new(phase).small().color(egui::Color32::from_rgb(240, 190, 80)));
+    }
 }
 
 /// Тактическое преимущество стороны с лучшей разведкой: +5% к наносимому урону.
@@ -2040,11 +2086,29 @@ fn resolve_combats(
                     if st != CombatState::None {
                         continue;
                     }
-                    let fits = used == 0 || used + width <= state.max_width;
+                    let fits = used == 0 || used + width <= state.effective_max_width();
                     if fits {
                         used += width;
                     }
                     set_combat_state(&mut divisions, e, if fits { CombatState::Active } else { CombatState::Reserve });
+                }
+            }
+
+            // 3б. Сужение фронта (фаза отхода): лишние дивизии линии с конца по id уходят в резерв
+            let line_limit = state.effective_max_width();
+            for side in [state.attackers.clone(), state.defenders.clone()] {
+                let mut line: Vec<(u32, Entity, u32)> = side_info(&divisions, &side)
+                    .into_iter()
+                    .filter(|i| i.3 == CombatState::Active)
+                    .map(|(id, e, width, _)| (id, e, width))
+                    .collect();
+                let mut total: u32 = line.iter().map(|l| l.2).sum();
+                while total > line_limit && line.len() > 1 {
+                    if let Some((id, e, width)) = line.pop() {
+                        total -= width;
+                        set_combat_state(&mut divisions, e, CombatState::Reserve);
+                        println!("[БОЙ] Фронт сужен: дивизия #{id} отведена в резерв (провинция {province})");
+                    }
                 }
             }
 
@@ -2104,6 +2168,12 @@ fn resolve_combats(
                     let tactical = recon_adv == Some(true);
                     let (org_milli, strength) =
                         (org_milli * att_mods.damage_pct / 100, strength * att_mods.damage_pct / 100);
+                    // Арьергардный бой: по организации обороняющихся урон ещё на четверть ниже
+                    let org_milli = if state.phase == CombatPhase::TacticalWithdrawal {
+                        org_milli * WITHDRAWAL_ORG_DAMAGE_PCT / 100
+                    } else {
+                        org_milli
+                    };
                     hits.push((*target_e, advantage(org_milli, tactical), advantage(strength, tactical)));
                 }
                 for (k, (_, striker)) in def_line.iter().enumerate() {
@@ -2140,6 +2210,10 @@ fn resolve_combats(
             state.combat_progress =
                 if total_max == 0 { 0 } else { ((total_max - total_cur.min(total_max)) * 100 / total_max) as u32 };
             state.elapsed_hours += 1;
+            // Таймер фазы идёт по часовому тику
+            if state.phase != CombatPhase::Default {
+                state.phase_hours_left = state.phase_hours_left.saturating_sub(1);
+            }
 
             // 5. Дивизии линии с нулевой организацией выходят из боя и освобождают ширину
             for attacker_side in [true, false] {
@@ -2184,7 +2258,7 @@ fn resolve_combats(
                 let mut used: u32 =
                     info.iter().filter(|i| i.3 == CombatState::Active).map(|i| i.2).sum();
                 for &(id, e, width, st) in &info {
-                    if st != CombatState::Reserve || used + width > state.max_width {
+                    if st != CombatState::Reserve || used + width > state.effective_max_width() {
                         continue;
                     }
                     // Сторона с лучшей разведкой быстрее реагирует на бреши в линии: шанс вдвое выше
@@ -2907,6 +2981,8 @@ mod tests {
             is_attacker_countered: false,
             is_defender_countered: false,
             tactic_change_day: 0,
+            phase: CombatPhase::Default,
+            phase_hours_left: 0,
         });
         (app, att, def)
     }
@@ -3398,6 +3474,124 @@ mod tests {
         combat.defender_tactic = Defend;
         let text: String = tactics_segments(&combat).iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(text, "Тактика: Атака vs Оборона");
+    }
+
+    fn set_phase(app: &mut App, phase: CombatPhase, hours: u32) {
+        let world = app.world_mut();
+        let mut combat = world.query::<&mut ActiveCombat>().single_mut(world);
+        combat.phase = phase;
+        combat.phase_hours_left = hours;
+    }
+
+    fn combat_of(app: &mut App) -> ActiveCombat {
+        let world = app.world_mut();
+        world.query::<&ActiveCombat>().single(world).clone()
+    }
+
+    #[test]
+    fn phase_machine_follows_the_defenders_choice() {
+        use CombatPhase as P;
+        use CombatTactic as T;
+        // отход защитника включает фазу на 24 часа (и продлевает её, если выбран снова)
+        assert_eq!(next_phase(P::Default, 0, T::TacticalWithdrawal), (P::TacticalWithdrawal, 24));
+        assert_eq!(next_phase(P::TacticalWithdrawal, 3, T::TacticalWithdrawal), (P::TacticalWithdrawal, 24));
+        // срок истёк, отход не выбран — обычная фаза
+        assert_eq!(next_phase(P::TacticalWithdrawal, 0, T::Defend), (P::Default, 0));
+        assert_eq!(next_phase(P::TacticalWithdrawal, 0, T::CounterAttack), (P::Default, 0));
+        // срок ещё идёт — фаза доживает своё время, даже если тактика уже сменилась
+        assert_eq!(next_phase(P::TacticalWithdrawal, 7, T::Defend), (P::TacticalWithdrawal, 7));
+        // обычная фаза остаётся обычной
+        assert_eq!(next_phase(P::Default, 0, T::Defend), (P::Default, 0));
+    }
+
+    #[test]
+    fn daily_choice_of_withdrawal_starts_a_24_hour_phase() {
+        let (mut app, _att, _def) = scenario(&[1], 1, 1);
+        app.add_event::<DailyTickEvent>().add_systems(Update, select_combat_tactics);
+        let mut started = false;
+        for day in 1..=60u32 {
+            app.world_mut().send_event(DailyTickEvent { day, month: 4, year: 1936 });
+            app.update();
+            let combat = combat_of(&mut app);
+            if combat.defender_tactic == CombatTactic::TacticalWithdrawal {
+                assert_eq!((combat.phase, combat.phase_hours_left), (CombatPhase::TacticalWithdrawal, 24));
+                started = true;
+                break;
+            }
+            assert_eq!(combat.phase, CombatPhase::Default, "без отхода фаза обычная");
+        }
+        assert!(started, "за два месяца защитники хотя бы раз выбрали отход");
+    }
+
+    #[test]
+    fn withdrawal_phase_halves_the_front_and_pushes_extra_attackers_to_reserve() {
+        let (mut app, att, _def) = scenario(&[1; 4], 2, 1);
+        tick(&mut app);
+        let states = |app: &App| -> Vec<CombatState> {
+            att.iter().map(|&e| app.world().get::<Division>(e).expect("дивизия").combat_state).collect()
+        };
+        assert_eq!(states(&app), vec![CombatState::Active; 4], "4 * 18 = 72 влезают в 80");
+        assert_eq!(combat_of(&mut app).effective_max_width(), 80);
+        set_phase(&mut app, CombatPhase::TacticalWithdrawal, 24);
+        assert_eq!(combat_of(&mut app).effective_max_width(), 40, "лимит вдвое меньше");
+        tick(&mut app);
+        use CombatState::{Active, Reserve};
+        assert_eq!(states(&app), vec![Active, Active, Reserve, Reserve], "лишние с конца по id ушли в резерв");
+        // резерв не возвращается на линию, пока фронт узкий
+        for _ in 0..10 {
+            tick(&mut app);
+        }
+        assert_eq!(states(&app)[2..], [Reserve, Reserve]);
+        // с обычной фазой ширина возвращается, и резерв может снова выйти на линию
+        set_phase(&mut app, CombatPhase::Default, 0);
+        assert_eq!(combat_of(&mut app).effective_max_width(), 80);
+    }
+
+    #[test]
+    fn phase_timer_counts_down_hourly_and_reaches_zero_after_24_hours() {
+        let (mut app, _att, _def) = scenario(&[1; 4], 4, 1);
+        set_phase(&mut app, CombatPhase::TacticalWithdrawal, WITHDRAWAL_PHASE_HOURS);
+        tick(&mut app);
+        assert_eq!(combat_of(&mut app).phase_hours_left, 23);
+        for _ in 0..23 {
+            tick(&mut app);
+        }
+        let combat = combat_of(&mut app);
+        assert_eq!(combat.phase_hours_left, 0, "ровно 24 часа");
+        // сама фаза снимается суточным выбором (next_phase), счётчик не уходит ниже нуля
+        tick(&mut app);
+        assert_eq!(combat_of(&mut app).phase_hours_left, 0);
+        let (phase, left) = next_phase(combat.phase, combat.phase_hours_left, CombatTactic::Defend);
+        assert_eq!((phase, left), (CombatPhase::Default, 0));
+    }
+
+    #[test]
+    fn rear_guard_phase_cuts_damage_to_defenders_organisation() {
+        use CombatTactic::*;
+        // атака против обороны: одинаковые тактики, различается только фаза
+        let loss = |phase: CombatPhase| {
+            let (mut app, _att, def) = scenario(&[1], 1, 1);
+            set_phase(&mut app, phase, 24);
+            tick(&mut app);
+            let d = app.world().get::<Division>(def[0]).expect("защитник");
+            d.max_org * 1000 - d.org_milli()
+        };
+        let (normal, withdrawal) = (loss(CombatPhase::Default), loss(CombatPhase::TacticalWithdrawal));
+        assert!(withdrawal < normal, "{withdrawal} < {normal}");
+        // ровно три четверти (округление вниз по сотой доле)
+        assert!(withdrawal.abs_diff(normal * 75 / 100) <= 2, "{withdrawal} против {}", normal * 75 / 100);
+        let _ = (Attack, Defend);
+    }
+
+    #[test]
+    fn phase_status_text_for_the_ui() {
+        let (mut app, _att, _def) = scenario(&[1], 1, 1);
+        assert_eq!(phase_text(&combat_of(&mut app)), None, "в обычной фазе строки нет");
+        set_phase(&mut app, CombatPhase::TacticalWithdrawal, 17);
+        assert_eq!(
+            phase_text(&combat_of(&mut app)).as_deref(),
+            Some("Фаза: Тактический отход (осталось 17 ч.) | Фронт сужен на 50%")
+        );
     }
 
     #[test]
@@ -4132,6 +4326,8 @@ mod refit_tests {
             is_attacker_countered: false,
             is_defender_countered: false,
             tactic_change_day: 0,
+            phase: CombatPhase::Default,
+            phase_hours_left: 0,
         });
         order(&mut app, ids[0], "Panzer-Division");
         assert_eq!(template_of(&app, ids[0]), BASE_TEMPLATE, "в бою шаблон не меняется");

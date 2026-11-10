@@ -39,6 +39,33 @@ pub enum CombatTactic {
     TacticalWithdrawal,
 }
 
+/// Длительность фазы тактического отхода, игровых часов.
+pub const WITHDRAWAL_PHASE_HOURS: u32 = 24;
+/// Во время отхода лимит ширины боя для обеих сторон делится на это число (фронт сужен на 50%).
+pub const WITHDRAWAL_WIDTH_DIVISOR: u32 = 2;
+/// Во время отхода урон по организации обороняющихся умножается на столько процентов (арьергардный бой).
+pub const WITHDRAWAL_ORG_DAMAGE_PCT: u32 = 75;
+
+/// Фаза сражения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CombatPhase {
+    /// Стандартная базовая фаза.
+    #[default]
+    Default,
+    /// Арьергардное сдерживание и отход: фронт вдвое уже, урон по обороняющимся слабее.
+    TacticalWithdrawal,
+}
+
+impl CombatPhase {
+    /// Название для интерфейса.
+    pub fn title(&self) -> &'static str {
+        match self {
+            CombatPhase::Default => "Обычная",
+            CombatPhase::TacticalWithdrawal => "Тактический отход",
+        }
+    }
+}
+
 /// Тактики наступающей стороны.
 pub const ATTACKER_TACTICS: [CombatTactic; 3] = [CombatTactic::Attack, CombatTactic::Assault, CombatTactic::Encirclement];
 /// Тактики обороняющейся стороны.
