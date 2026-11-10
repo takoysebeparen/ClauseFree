@@ -21,13 +21,19 @@ use crate::command::SKILL_BONUS_PCT;
 use crate::diplomacy::{check_entry, DiplomacyRegistry};
 use crate::economy::{update_supply_network, ArmyExperience, EquipmentType, PlayerCountry, SupplyNetwork};
 use crate::oob::{resolve_placement, resolve_template, OobDivisions, Placement};
-use crate::units::{DivisionTemplate, DivisionTemplates, NatoSymbol, BASE_TEMPLATE, INFANTRY_SPEED_KPH};
+use crate::units::{
+    DivisionExperienceLevel, DivisionTemplate, DivisionTemplates, NatoSymbol, BASE_TEMPLATE, INFANTRY_SPEED_KPH,
+    MAX_EXPERIENCE_PCT,
+};
 #[cfg(test)]
 use crate::units::PLAIN_INFANTRY_TEMPLATE;
 use crate::map::{
     pick_province, setup_map, HoveredProvince, ProvinceAdjacency, ProvinceCenters, ProvinceControllerChanged,
     ProvinceControllers, ProvinceMap, ProvinceRivers, StateRegistry,
 };
+
+/// Часов боя на линии на каждый процент опыта дивизии (сутки на линии дают +4%).
+pub const XP_HOURS_PER_PCT: u32 = 6;
 
 /// Интенсивность боя: доля организации цели, снимаемая за час, в сотых долях процента (bp),
 /// при равных атаке и защите. Подобрана так, чтобы равные дивизии дрались около суток.
@@ -109,8 +115,11 @@ pub struct Division {
     pub equipment_shortage: BTreeSet<EquipmentType>,
     /// Символ NATO на фишке: определяется шаблоном.
     pub nato_symbol: NatoSymbol,
-    /// Стартовый опыт дивизии из OOB (`start_experience_factor`), %; справочное значение.
-    pub start_experience_pct: u32,
+    /// Опыт дивизии, % (0..=100): стартует из OOB (`start_experience_factor`), растёт в бою, размывается
+    /// пополнениями. Определяет ранг и множитель боевой мощи.
+    pub experience_pct: u32,
+    /// Часы боя на линии, ещё не превращённые в процент опыта (меньше `XP_HOURS_PER_PCT`).
+    pub combat_xp_hours: u32,
     /// Стартовая оснащённость из OOB (`start_equipment_factor`), %; справочное значение.
     pub start_equipment_pct: u32,
     /// Ещё не списанный дробный урон организации, в тысячных долях очка (0..1000).
@@ -265,7 +274,8 @@ impl Division {
             equipment_needs: stats.equipment_needs,
             equipment_shortage: BTreeSet::new(),
             nato_symbol: stats.nato_symbol,
-            start_experience_pct: 0,
+            experience_pct: 0,
+            combat_xp_hours: 0,
             start_equipment_pct: 100,
             org_frac: 0,
             entrenchment: 0,
@@ -319,6 +329,58 @@ impl ActiveCombat {
 
 #[derive(Resource, Default)]
 pub struct SelectedDivision(pub Option<Entity>);
+
+impl Division {
+    /// Тест: опыт 10% (Trained, множитель ровно 100%) — чтобы формулы других модификаторов проверялись отдельно.
+    #[cfg(test)]
+    pub(crate) fn trained(mut self) -> Self {
+        self.experience_pct = 10;
+        self
+    }
+
+    /// Ранг опыта дивизии.
+    pub fn experience_level(&self) -> DivisionExperienceLevel {
+        DivisionExperienceLevel::from_experience_pct(self.experience_pct)
+    }
+
+    /// Множитель боевой мощи по опыту, %: 75 / 100 / 125 / 150 / 175 (всегда положительный).
+    pub fn experience_multiplier_pct(&self) -> u32 {
+        self.experience_level().combat_multiplier_pct().max(0) as u32
+    }
+
+    /// Час боя на линии: каждые `XP_HOURS_PER_PCT` часов дают +1% опыта, потолок 100%.
+    pub fn gain_combat_experience_hour(&mut self) {
+        if self.experience_pct >= MAX_EXPERIENCE_PCT {
+            self.experience_pct = MAX_EXPERIENCE_PCT;
+            self.combat_xp_hours = 0;
+            return;
+        }
+        self.combat_xp_hours += 1;
+        if self.combat_xp_hours >= XP_HOURS_PER_PCT {
+            self.combat_xp_hours -= XP_HOURS_PER_PCT;
+            self.experience_pct += 1;
+        }
+    }
+
+    /// Размытие опыта пополнением: новобранцы приходят с 0%, поэтому
+    /// `новый = текущая_прочность * опыт / (текущая_прочность + пополнение)` (целочисленно, вниз).
+    /// Вызывается до увеличения прочности.
+    pub fn dilute_experience(&mut self, reinforce_amount: u32) {
+        let total = u64::from(self.current_strength) + u64::from(reinforce_amount);
+        if total == 0 || reinforce_amount == 0 {
+            return;
+        }
+        self.experience_pct = (u64::from(self.current_strength) * u64::from(self.experience_pct) / total) as u32;
+    }
+}
+
+/// Строка опыта для окна «Дивизия»: `Опыт: 30% (Кадровые, +25% к бою)`.
+pub fn experience_text(experience_pct: u32) -> String {
+    let level = DivisionExperienceLevel::from_experience_pct(experience_pct);
+    let bonus = level.combat_multiplier_pct() - 100;
+    let sign = if bonus > 0 { "+" } else { "" };
+    format!("Опыт: {experience_pct}% ({}, {sign}{bonus}% к бою)", level.title())
+}
 
 /// Режим выбора: `whole` — выбран весь стек провинции (ПКМ командует всеми стоящими в ней дивизиями
 /// того же владельца), иначе — только `SelectedDivision` (выбор строки в инспекторе).
@@ -875,7 +937,7 @@ fn spawn_oob_divisions(
             template.to_string(),
             templates.get_or_base(template),
         );
-        division.start_experience_pct = entry.experience_pct;
+        division.experience_pct = entry.experience_pct;
         division.start_equipment_pct = entry.equipment_pct;
         spawn_division_entity(&mut commands, division, *center, &colors);
         *per_owner.entry(entry.owner.as_str()).or_default() += 1;
@@ -1597,6 +1659,8 @@ fn combat_bp(att: &Division, def: &Division, planning: u32) -> u32 {
 fn combat_bp_ctx(att: &Division, def: &Division, planning: u32, ctx: HitContext) -> u32 {
     // Сила удара зависит от твёрдости цели: мягкая атака против живой силы, жёсткая — против техники.
     let base_attack = blended_attack(att, def.hardness) * att.current_strength / att.max_strength.max(1);
+    // Опыт атакующей дивизии: от -25% (новобранцы) до +75% (ветераны)
+    let base_attack = base_attack * att.experience_multiplier_pct() / 100;
     let mut attack = base_attack * (100 + planning.min(MAX_PLANNING)) / 100;
     // Навык командира фронта: +2% к атаке за уровень; сверх лимита командира — вдвое слабее
     attack = attack * (100 + att.command_attack_skill * SKILL_BONUS_PCT) / 100;
@@ -1612,6 +1676,8 @@ fn combat_bp_ctx(att: &Division, def: &Division, planning: u32, ctx: HitContext)
     attack = attack * (100 + ctx.air_attack_bonus) / 100; // превосходство в воздухе: до +10%
 
     let base_defense = def.defense * def.current_strength / def.max_strength.max(1);
+    // Опыт обороняющейся дивизии масштабирует защиту так же, как атаку
+    let base_defense = base_defense * def.experience_multiplier_pct() / 100;
     // Окопанность: +2% защиты за пункт (у наступающих она всегда 0 — марш её сбрасывает)
     let mut defense = base_defense * (100 + def.entrenchment.min(def.max_entrenchment) * 2) / 100;
     defense = defense * (100 + def.command_defense_skill * SKILL_BONUS_PCT) / 100;
@@ -1887,6 +1953,12 @@ fn resolve_combats(
                 // Час боя на линии: каждые 24 дивизионо-часа дают стране +1 опыта (резерв не воюет и не считается)
                 experience.record_combat_hour(&state.attacker_owner, att_line.len() as u32);
                 experience.record_combat_hour(&state.defender_owner, def_line.len() as u32);
+                // Каждая дивизия на линии набирает собственный боевой опыт (резерв не воюет)
+                for (line_entity, _) in att_line.iter().chain(def_line.iter()) {
+                    if let Ok((_, mut fighter)) = divisions.get_mut(*line_entity) {
+                        fighter.gain_combat_experience_hour();
+                    }
+                }
                 // Все удары считаются по значениям до боя, затем применяются
                 let mut hits: Vec<(Entity, u32, u32)> = Vec::new();
                 let terrain = terrain_modifiers(map.terrain_of(province));
@@ -2499,10 +2571,8 @@ fn division_info_ui(
                 }
                 ui.separator();
             }
-            ui.label(format!(
-                "ID: {} | Старт: опыт {}%, оснащённость {}%",
-                d.id, d.start_experience_pct, d.start_equipment_pct
-            ));
+            ui.label(format!("ID: {} | Стартовая оснащённость {}%", d.id, d.start_equipment_pct));
+            ui.label(experience_text(d.experience_pct));
             ui.label(format!("Провинция: {}", d.current_province));
             ui.label(format!("Организация: {}/{}", d.current_org, d.max_org));
             ui.label(format!(
@@ -2810,7 +2880,7 @@ mod tests {
     fn commander_skills_and_limit_penalty_scale_combat_power() {
         let templates = DivisionTemplates::default();
         let make = |id| {
-            Division::from_template(id, "d".into(), "GER".into(), 1, PLAIN_INFANTRY_TEMPLATE.to_string(), templates.get_or_base(PLAIN_INFANTRY_TEMPLATE))
+            Division::from_template(id, "d".into(), "GER".into(), 1, PLAIN_INFANTRY_TEMPLATE.to_string(), templates.get_or_base(PLAIN_INFANTRY_TEMPLATE)).trained()
         };
         let (mut attacker, mut defender) = (make(1), make(2));
         // база: атака 90, защита 225 -> 800 * 90 / 315 = 228
@@ -2847,7 +2917,7 @@ mod tests {
     fn unsupplied_division_loses_a_third_of_attack_and_defense() {
         let templates = DivisionTemplates::default();
         let make = |id| {
-            Division::from_template(id, "d".into(), "GER".into(), 1, PLAIN_INFANTRY_TEMPLATE.to_string(), templates.get_or_base(PLAIN_INFANTRY_TEMPLATE))
+            Division::from_template(id, "d".into(), "GER".into(), 1, PLAIN_INFANTRY_TEMPLATE.to_string(), templates.get_or_base(PLAIN_INFANTRY_TEMPLATE)).trained()
         };
         let (mut attacker, mut defender) = (make(1), make(2));
         assert_eq!(combat_bp(&attacker, &defender, 0), 228);
@@ -3009,6 +3079,32 @@ mod tests {
     }
 
     #[test]
+    fn divisions_on_the_line_earn_personal_experience_each_hour() {
+        // 6 атакующих и 5 защитников: на линии по 4, остальные в резерве
+        let (mut app, att, def) = scenario(&[1; 6], 5, 1);
+        for _ in 0..24 {
+            tick(&mut app);
+        }
+        let mut on_line = 0;
+        let mut in_reserve = 0;
+        for e in att.iter().chain(def.iter()) {
+            let Some(d) = app.world().get::<Division>(*e) else { continue };
+            match d.combat_state {
+                CombatState::Active => {
+                    assert_eq!(d.experience_pct, 4, "24 часа на линии = +4%");
+                    on_line += 1;
+                }
+                CombatState::Reserve => {
+                    assert_eq!(d.experience_pct, 0, "резерв не набирает опыт");
+                    in_reserve += 1;
+                }
+                CombatState::None => {}
+            }
+        }
+        assert_eq!((on_line, in_reserve), (8, 3));
+    }
+
+    #[test]
     fn planning_scales_effective_attack() {
         let templates = DivisionTemplates::default();
         let make = |id| {
@@ -3020,6 +3116,7 @@ mod tests {
                 PLAIN_INFANTRY_TEMPLATE.to_string(),
                 templates.get_or_base(PLAIN_INFANTRY_TEMPLATE),
             )
+            .trained()
         };
         let (attacker, defender) = (make(1), make(2));
         // атака 90, защита 225: 800 * 90 / 315 = 228; с +30%: атака 117 -> 800 * 117 / 342 = 273
@@ -3054,7 +3151,7 @@ mod armor_and_speed_tests {
 
     fn division(template: &str) -> Division {
         let templates = DivisionTemplates::default();
-        Division::from_template(1, "d".into(), "GER".into(), 1, template.to_string(), templates.get_or_base(template))
+        Division::from_template(1, "d".into(), "GER".into(), 1, template.to_string(), templates.get_or_base(template)).trained()
     }
 
     #[test]
@@ -3210,7 +3307,7 @@ mod terrain_tests {
 
     fn division(template: &str) -> Division {
         let templates = DivisionTemplates::default();
-        Division::from_template(1, "d".into(), "GER".into(), 1, template.to_string(), templates.get_or_base(template))
+        Division::from_template(1, "d".into(), "GER".into(), 1, template.to_string(), templates.get_or_base(template)).trained()
     }
 
     #[test]
@@ -3302,7 +3399,7 @@ mod recon_air_tests {
 
     fn division(template: &str) -> Division {
         let templates = DivisionTemplates::default();
-        Division::from_template(1, "d".into(), "GER".into(), 1, template.to_string(), templates.get_or_base(template))
+        Division::from_template(1, "d".into(), "GER".into(), 1, template.to_string(), templates.get_or_base(template)).trained()
     }
 
     #[test]
@@ -3368,7 +3465,7 @@ mod support_tests {
 
     fn division(template: &str) -> Division {
         let templates = DivisionTemplates::default();
-        Division::from_template(1, "d".into(), "GER".into(), 1, template.to_string(), templates.get_or_base(template))
+        Division::from_template(1, "d".into(), "GER".into(), 1, template.to_string(), templates.get_or_base(template)).trained()
     }
 
     fn day(app: &mut App) {
@@ -3473,12 +3570,12 @@ mod hardness_tests {
     use crate::units::BattalionDef;
 
     fn division_of(template: &DivisionTemplate) -> Division {
-        Division::from_template(1, "d".into(), "GER".into(), 1, template.name.clone(), template)
+        Division::from_template(1, "d".into(), "GER".into(), 1, template.name.clone(), template).trained()
     }
 
     fn registered(name: &str) -> Division {
         let templates = DivisionTemplates::default();
-        Division::from_template(1, "d".into(), "GER".into(), 1, name.to_string(), templates.get_or_base(name))
+        Division::from_template(1, "d".into(), "GER".into(), 1, name.to_string(), templates.get_or_base(name)).trained()
     }
 
     fn custom(name: &str, battalions: Vec<BattalionDef>) -> Division {
@@ -3589,7 +3686,7 @@ mod refit_tests {
 
     fn registered(name: &str) -> Division {
         let templates = DivisionTemplates::default();
-        Division::from_template(1, "d".into(), "GER".into(), 1, name.to_string(), templates.get_or_base(name))
+        Division::from_template(1, "d".into(), "GER".into(), 1, name.to_string(), templates.get_or_base(name)).trained()
     }
 
     #[test]
@@ -3746,7 +3843,7 @@ mod equipment_status_tests {
 
     fn registered(name: &str) -> Division {
         let templates = DivisionTemplates::default();
-        Division::from_template(1, "d".into(), "GER".into(), 1, name.to_string(), templates.get_or_base(name))
+        Division::from_template(1, "d".into(), "GER".into(), 1, name.to_string(), templates.get_or_base(name)).trained()
     }
 
     #[test]
@@ -4282,5 +4379,154 @@ mod sovereignty_tests {
         assert_eq!(own.iter().map(|o| (o.division, o.target)).collect::<Vec<_>>(), vec![(a, 7), (b, 7)]);
         dip.declare_war("GER", "POL");
         assert_eq!(rmb_orders(&dip, "GER", Some("POL"), 7, &[a]).len(), 1, "на войне вход разрешён");
+    }
+}
+
+#[cfg(test)]
+mod experience_tests {
+    use super::*;
+    use crate::units::DivisionExperienceLevel as Level;
+
+    fn make(id: u32, xp: u32) -> Division {
+        let templates = DivisionTemplates::default();
+        let mut d = Division::from_template(
+            id,
+            "d".into(),
+            "GER".into(),
+            1,
+            PLAIN_INFANTRY_TEMPLATE.to_string(),
+            templates.get_or_base(PLAIN_INFANTRY_TEMPLATE),
+        );
+        d.experience_pct = xp;
+        d
+    }
+
+    #[test]
+    fn rank_boundaries_follow_the_canon() {
+        let cases = [
+            (0, Level::Green, 75),
+            (9, Level::Green, 75),
+            (10, Level::Trained, 100),
+            (29, Level::Trained, 100),
+            (30, Level::Regular, 125),
+            (59, Level::Regular, 125),
+            (60, Level::Seasoned, 150),
+            (89, Level::Seasoned, 150),
+            (90, Level::Veteran, 175),
+            (100, Level::Veteran, 175),
+            (250, Level::Veteran, 175),
+        ];
+        for (pct, level, multiplier) in cases {
+            let got = Level::from_experience_pct(pct);
+            assert_eq!(got, level, "{pct}%");
+            assert_eq!(got.combat_multiplier_pct(), multiplier, "{pct}%");
+        }
+        let titles: Vec<&str> =
+            [Level::Green, Level::Trained, Level::Regular, Level::Seasoned, Level::Veteran].iter().map(Level::title).collect();
+        assert_eq!(titles, vec!["Новобранцы", "Обученные", "Кадровые", "Опытные", "Ветераны"]);
+    }
+
+    #[test]
+    fn new_divisions_are_green_and_oob_experience_sets_the_rank() {
+        let d = make(1, 0);
+        assert_eq!(d.experience_level(), Level::Green);
+        assert_eq!(Division::from_template(1, "d".into(), "GER".into(), 1, BASE_TEMPLATE.into(), DivisionTemplates::default().get_or_base(BASE_TEMPLATE)).experience_pct, 0);
+        // стартовые 30% из GER_1936 -> Кадровые, +25%
+        assert_eq!(make(1, 30).experience_multiplier_pct(), 125);
+    }
+
+    #[test]
+    fn ui_text_shows_rank_and_bonus() {
+        assert_eq!(experience_text(30), "Опыт: 30% (Кадровые, +25% к бою)");
+        assert_eq!(experience_text(0), "Опыт: 0% (Новобранцы, -25% к бою)");
+        assert_eq!(experience_text(15), "Опыт: 15% (Обученные, 0% к бою)");
+        assert_eq!(experience_text(95), "Опыт: 95% (Ветераны, +75% к бою)");
+    }
+
+    #[test]
+    fn combat_hours_grow_experience_up_to_the_cap() {
+        let mut d = make(1, 10);
+        for _ in 0..XP_HOURS_PER_PCT - 1 {
+            d.gain_combat_experience_hour();
+        }
+        assert_eq!(d.experience_pct, 10, "накопление ещё не дало процента");
+        d.gain_combat_experience_hour();
+        assert_eq!((d.experience_pct, d.combat_xp_hours), (11, 0));
+        for _ in 0..24 {
+            d.gain_combat_experience_hour();
+        }
+        assert_eq!(d.experience_pct, 15, "сутки на линии = +4%");
+        let mut veteran = make(2, 99);
+        for _ in 0..100 {
+            veteran.gain_combat_experience_hour();
+        }
+        assert_eq!(veteran.experience_pct, 100, "потолок 100%");
+    }
+
+    #[test]
+    fn reinforcements_dilute_experience_as_a_weighted_average() {
+        // ветераны 90%, потеряли половину состава и получили её обратно: 500 * 90 / 1000 = 45% (Кадровые)
+        let mut d = make(1, 90);
+        d.max_strength = 1000;
+        d.current_strength = 500;
+        d.dilute_experience(500);
+        assert_eq!(d.experience_pct, 45);
+        assert_eq!(d.experience_level(), Level::Regular);
+        // без пополнения и при нулевой прочности ничего не ломается
+        d.dilute_experience(0);
+        assert_eq!(d.experience_pct, 45);
+        let mut empty = make(2, 50);
+        empty.current_strength = 0;
+        empty.dilute_experience(100);
+        assert_eq!(empty.experience_pct, 0, "полностью новые люди — 0%");
+        let mut nothing = make(3, 50);
+        nothing.current_strength = 0;
+        nothing.dilute_experience(0);
+        assert_eq!(nothing.experience_pct, 50, "ни прочности, ни пополнения: без деления на ноль");
+    }
+
+    #[test]
+    fn daily_reinforcement_dilutes_experience_of_a_veteran_division() {
+        use crate::economy::{CountryEconomy, Economies};
+        let mut app = App::new();
+        let mut eco = CountryEconomy::new_abundant(10, 10);
+        eco.set_stock(EquipmentType::InfantryEquipment, 100_000);
+        app.add_event::<DailyTickEvent>()
+            .insert_resource(Economies(BTreeMap::from([("GER".to_string(), eco)])))
+            .add_systems(Update, crate::economy::daily_reinforcement);
+        let mut d = make(1, 90);
+        d.current_strength = d.max_strength / 2;
+        let half = d.current_strength;
+        let e = app.world_mut().spawn(d).id();
+        app.world_mut().send_event(DailyTickEvent { day: 1, month: 1, year: 1936 });
+        app.update();
+        let d = app.world().get::<Division>(e).expect("дивизия");
+        let gained = d.current_strength - half;
+        assert!(gained > 0, "пополнение пришло");
+        assert_eq!(d.experience_pct, (u64::from(half) * 90 / u64::from(half + gained)) as u32, "формула размытия");
+        assert!(d.experience_pct < 90);
+    }
+
+    #[test]
+    fn experience_scales_attack_and_defense_in_combat() {
+        let green = make(1, 0);
+        let trained = make(2, 10);
+        let regular = make(3, 30);
+        let veteran = make(4, 95);
+        // атака 90, защита 225 у всех. Ровня (Trained vs Trained): 800 * 90 / 315 = 228
+        assert_eq!(combat_bp(&trained, &make(5, 10), 0), 228);
+        // атака ветерана 90 * 175 / 100 = 157 против защиты 225: 800 * 157 / 382 = 328
+        assert_eq!(combat_bp(&veteran, &trained, 0), 328);
+        // атака новобранца 90 * 75 / 100 = 67: 800 * 67 / 292 = 183
+        assert_eq!(combat_bp(&green, &trained, 0), 183);
+        // защита ветерана 225 * 175 / 100 = 393: 800 * 90 / 483 = 149
+        assert_eq!(combat_bp(&trained, &veteran, 0), 149);
+        // защита новобранца 225 * 75 / 100 = 168: 800 * 90 / 258 = 279
+        assert_eq!(combat_bp(&trained, &green, 0), 279);
+        // атака кадровых 90 * 125 / 100 = 112: 800 * 112 / 337 = 265
+        assert_eq!(combat_bp(&regular, &trained, 0), 265);
+        // чем опытнее атакующий, тем сильнее удар
+        assert!(combat_bp(&veteran, &trained, 0) > combat_bp(&regular, &trained, 0));
+        assert!(combat_bp(&regular, &trained, 0) > combat_bp(&trained, &trained, 0));
     }
 }

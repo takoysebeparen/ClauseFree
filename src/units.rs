@@ -34,6 +34,59 @@ pub const SUPPORT_ARTILLERY: &str = "Арт";
 pub const SUPPORT_RECON: &str = "Разведка";
 const SUPPORT_LABELS: [&str; 3] = [SUPPORT_ENGINEERS, SUPPORT_ARTILLERY, SUPPORT_RECON];
 
+/// Потолок опыта дивизии, %.
+pub const MAX_EXPERIENCE_PCT: u32 = 100;
+
+/// Ранг опыта дивизии по канону HoI4: определяет множитель боевой мощи.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DivisionExperienceLevel {
+    /// 0..=9%: -25%.
+    Green,
+    /// 10..=29%: без изменений.
+    Trained,
+    /// 30..=59%: +25%.
+    Regular,
+    /// 60..=89%: +50%.
+    Seasoned,
+    /// 90..=100%: +75%.
+    Veteran,
+}
+
+impl DivisionExperienceLevel {
+    /// Ранг по проценту опыта (значения выше 100 приравниваются к 100).
+    pub fn from_experience_pct(pct: u32) -> DivisionExperienceLevel {
+        match pct.min(MAX_EXPERIENCE_PCT) {
+            0..=9 => DivisionExperienceLevel::Green,
+            10..=29 => DivisionExperienceLevel::Trained,
+            30..=59 => DivisionExperienceLevel::Regular,
+            60..=89 => DivisionExperienceLevel::Seasoned,
+            _ => DivisionExperienceLevel::Veteran,
+        }
+    }
+
+    /// Множитель боевой мощи в процентах: 75, 100, 125, 150, 175.
+    pub fn combat_multiplier_pct(&self) -> i32 {
+        match self {
+            DivisionExperienceLevel::Green => 75,
+            DivisionExperienceLevel::Trained => 100,
+            DivisionExperienceLevel::Regular => 125,
+            DivisionExperienceLevel::Seasoned => 150,
+            DivisionExperienceLevel::Veteran => 175,
+        }
+    }
+
+    /// Название ранга для интерфейса.
+    pub fn title(&self) -> &'static str {
+        match self {
+            DivisionExperienceLevel::Green => "Новобранцы",
+            DivisionExperienceLevel::Trained => "Обученные",
+            DivisionExperienceLevel::Regular => "Кадровые",
+            DivisionExperienceLevel::Seasoned => "Опытные",
+            DivisionExperienceLevel::Veteran => "Ветераны",
+        }
+    }
+}
+
 /// Тактический символ NATO дивизии на фишке карты.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NatoSymbol {

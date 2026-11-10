@@ -1500,7 +1500,7 @@ struct DivisionRequest {
 /// пехотная и моторизованная части дивизии, а нехватка танков сдерживает рост общей прочности.
 /// Отрезанные от снабжения дивизии не получают ничего. При нехватке типа его запас делится между
 /// дивизиями пропорционально запросам (остаток — по порядку id). Всё детерминировано.
-fn daily_reinforcement(
+pub(crate) fn daily_reinforcement(
     mut events: EventReader<DailyTickEvent>,
     mut economies: ResMut<Economies>,
     mut divisions: Query<(Entity, &mut Division)>,
@@ -1579,6 +1579,9 @@ fn daily_reinforcement(
                 }
                 if let Ok((_, mut d)) = divisions.get_mut(request.entity) {
                     if gain > 0 {
+                        // Пополнение размывает опыт: новобранцы приходят с 0% (до роста прочности)
+                        let actual = gain.min(d.max_strength.saturating_sub(d.current_strength));
+                        d.dilute_experience(actual);
                         d.current_strength = (d.current_strength + gain).min(d.max_strength);
                     }
                     d.equipment_shortage = lacking;
