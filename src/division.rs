@@ -17,7 +17,9 @@ use crate::camera::MainCamera;
 use crate::clock::{ClockSet, DailyTickEvent, HourTick};
 use crate::air::{air_attack_bonus_pct, air_defense_penalty_pct, air_status, side_edge, AirSuperiorityMap};
 use crate::colors::CountryColors;
-use crate::command::SKILL_BONUS_PCT;
+use crate::command::{
+    pick_tactic, resolve_counters, side_mods, CombatTactic, ATTACKER_TACTICS, DEFENDER_TACTICS, SKILL_BONUS_PCT,
+};
 use crate::diplomacy::{check_entry, DiplomacyRegistry};
 use crate::economy::{update_supply_network, ArmyExperience, EquipmentType, PlayerCountry, SupplyNetwork};
 use crate::oob::{resolve_placement, resolve_template, OobDivisions, Placement};
@@ -318,6 +320,16 @@ pub struct ActiveCombat {
     pub combat_progress: u32,
     /// Сколько игровых часов длится бой (детерминированный источник «случайности» для резервов и отступления).
     pub elapsed_hours: u32,
+    /// Тактика наступающей стороны (до первого суточного выбора — базовая атака).
+    pub attacker_tactic: CombatTactic,
+    /// Тактика обороняющейся стороны (до первого суточного выбора — базовая оборона).
+    pub defender_tactic: CombatTactic,
+    /// Тактика атакующих парирована: бонусы своей тактики потеряны.
+    pub is_attacker_countered: bool,
+    /// Тактика защитников парирована.
+    pub is_defender_countered: bool,
+    /// Индекс игровых суток последнего выбора тактик.
+    pub tactic_change_day: u32,
 }
 
 impl ActiveCombat {
@@ -796,6 +808,8 @@ impl Plugin for DivisionPlugin {
             )
             .add_systems(Update, (combat_ui, division_info_ui, stack_badges_ui, draw_selection_box))
             .add_systems(Update, daily_entrenchment.after(ClockSet))
+            // выбор тактик — раз в сутки, до часового расчёта боя того же кадра
+            .add_systems(Update, select_combat_tactics.after(ClockSet).before(CombatSet))
             // переформирование применяется до боевой цепочки кадра
             .add_systems(Update, apply_refits.before(CombatSet))
             .add_systems(Update, daily_supply.after(update_supply_network));
@@ -1541,9 +1555,101 @@ fn advance_marches(
                 max_width: BASE_COMBAT_WIDTH,
                 combat_progress: 0,
                 elapsed_hours: 0,
+                attacker_tactic: CombatTactic::Attack,
+                defender_tactic: CombatTactic::Defend,
+                is_attacker_countered: false,
+                is_defender_countered: false,
+                tactic_change_day: 0,
             });
         }
     }
+}
+
+/// Номер игровых суток для детерминированных бросков (календарь упрощён: 12 месяцев по 31 дню).
+pub fn day_index(day: u32, month: u32, year: u32) -> u32 {
+    year.saturating_mul(372).saturating_add(month.saturating_mul(31)).saturating_add(day)
+}
+
+/// Выбор тактик обеих сторон на сутки. Сторона с худшей разведкой выбирает первой (равенство — атакующие),
+/// вторая видит выбор и даёт контр-пику двойной вес. Бросок — `det_rand(боя, суток, ключа командующего)`.
+pub fn choose_tactics(
+    combat_bits: u64,
+    day: u32,
+    attacker_key: u32,
+    defender_key: u32,
+    recon_edge: Option<bool>,
+) -> (CombatTactic, CombatTactic) {
+    let roll = |key: u32, salt: u64| det_rand(combat_bits, u64::from(day), u64::from(key) | (salt << 32));
+    if recon_edge == Some(true) {
+        // у атакующих разведка лучше: защитники выбирают первыми
+        let defender = pick_tactic(&DEFENDER_TACTICS, None, roll(defender_key, 1));
+        let attacker = pick_tactic(&ATTACKER_TACTICS, Some(defender), roll(attacker_key, 2));
+        (attacker, defender)
+    } else {
+        let attacker = pick_tactic(&ATTACKER_TACTICS, None, roll(attacker_key, 3));
+        let defender = pick_tactic(&DEFENDER_TACTICS, Some(attacker), roll(defender_key, 4));
+        (attacker, defender)
+    }
+}
+
+/// Раз в сутки (00:00) командующие обеих сторон каждого боя выбирают тактики; парирование выставляет
+/// флаги `is_*_countered`. Ключ командующего — наименьший id дивизии стороны (у дивизий нет ссылки на
+/// генерала, а состав стороны в бою детерминирован).
+fn select_combat_tactics(
+    mut events: EventReader<DailyTickEvent>,
+    mut combats: Query<(Entity, &mut ActiveCombat)>,
+    divisions: Query<&Division>,
+) {
+    for event in events.read() {
+        let day = day_index(event.day, event.month, event.year);
+        for (entity, mut combat) in &mut combats {
+            let recon_of = |side: &[Entity]| -> Vec<u32> {
+                let alive: Vec<&Division> = side.iter().filter_map(|&e| divisions.get(e).ok()).collect();
+                let line: Vec<u32> = alive.iter().filter(|d| d.combat_state == CombatState::Active).map(|d| d.recon).collect();
+                if line.is_empty() { alive.iter().map(|d| d.recon).collect() } else { line }
+            };
+            let key_of = |side: &[Entity]| side.iter().filter_map(|&e| divisions.get(e).ok()).map(|d| d.id).min().unwrap_or(0);
+            let edge = recon_advantage(&recon_of(&combat.attackers), &recon_of(&combat.defenders));
+            let (attacker, defender) =
+                choose_tactics(entity.to_bits(), day, key_of(&combat.attackers), key_of(&combat.defenders), edge);
+            let (att_countered, def_countered) = resolve_counters(attacker, defender);
+            combat.attacker_tactic = attacker;
+            combat.defender_tactic = defender;
+            combat.is_attacker_countered = att_countered;
+            combat.is_defender_countered = def_countered;
+            combat.tactic_change_day = day;
+        }
+    }
+}
+
+/// Строка тактик для интерфейса: сегменты `(текст, парирована)`; парированная сторона получает пометку.
+pub fn tactics_segments(combat: &ActiveCombat) -> Vec<(String, bool)> {
+    let (att_countered, def_countered) = resolve_counters(combat.attacker_tactic, combat.defender_tactic);
+    let mut segments = vec![("Тактика: ".to_string(), false)];
+    segments.push((combat.attacker_tactic.title().to_string(), false));
+    if att_countered {
+        segments.push((" [ПАРИРОВАНО!]".to_string(), true));
+    }
+    segments.push((" vs ".to_string(), false));
+    segments.push((combat.defender_tactic.title().to_string(), false));
+    if def_countered {
+        segments.push((" [ПАРИРОВАНО!]".to_string(), true));
+    }
+    segments
+}
+
+/// Показывает строку тактик: красная пометка у парированной стороны.
+fn show_tactics(ui: &mut egui::Ui, combat: &ActiveCombat) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for (text, countered) in tactics_segments(combat) {
+            if countered {
+                ui.label(egui::RichText::new(text).small().color(egui::Color32::from_rgb(230, 60, 60)).strong());
+            } else {
+                ui.label(egui::RichText::new(text).small());
+            }
+        }
+    });
 }
 
 /// Тактическое преимущество стороны с лучшей разведкой: +5% к наносимому урону.
@@ -1614,12 +1720,28 @@ pub struct HitContext {
     pub air_attack_bonus: u32,
     /// Штраф к защите цели под вражеским воздушным давлением (до -15%).
     pub air_defense_penalty: u32,
+    /// Бонус к атаке бьющего от его тактики, %.
+    pub tactic_attack_pct: u32,
+    /// Бонус к защите цели от её тактики, %.
+    pub tactic_defense_pct: u32,
 }
 
 impl HitContext {
     /// Без модификаторов (удары обороняющихся и тесты без рельефа).
     pub const NONE: HitContext =
-        HitContext { attack_penalty: 0, defense_bonus: 0, air_attack_bonus: 0, air_defense_penalty: 0 };
+        HitContext {
+        attack_penalty: 0,
+        defense_bonus: 0,
+        air_attack_bonus: 0,
+        air_defense_penalty: 0,
+        tactic_attack_pct: 0,
+        tactic_defense_pct: 0,
+    };
+
+    /// Добавляет эффекты тактик: бонус атаки бьющего и бонус защиты цели, %.
+    pub fn with_tactics(self, attack_pct: u32, defense_pct: u32) -> Self {
+        HitContext { tactic_attack_pct: attack_pct, tactic_defense_pct: defense_pct, ..self }
+    }
 
     /// Добавляет влияние неба: бонус атаки бьющему и штраф защиты цели, %.
     pub fn with_air(self, attack_bonus: u32, defense_penalty: u32) -> Self {
@@ -1674,6 +1796,7 @@ fn combat_bp_ctx(att: &Division, def: &Division, planning: u32, ctx: HitContext)
     // Рельеф обороняемой провинции и переправа через реку режут атаку наступающих
     attack = attack * (100 - ctx.attack_penalty.min(100)) / 100;
     attack = attack * (100 + ctx.air_attack_bonus) / 100; // превосходство в воздухе: до +10%
+    attack = attack * (100 + ctx.tactic_attack_pct) / 100; // тактика командующего
 
     let base_defense = def.defense * def.current_strength / def.max_strength.max(1);
     // Опыт обороняющейся дивизии масштабирует защиту так же, как атаку
@@ -1689,6 +1812,7 @@ fn combat_bp_ctx(att: &Division, def: &Division, planning: u32, ctx: HitContext)
     }
     defense = defense * (100 + ctx.defense_bonus) / 100; // бонус рельефа обороняющимся
     defense = defense * (100 - ctx.air_defense_penalty.min(100)) / 100; // вражеская авиация: до -15%
+    defense = defense * (100 + ctx.tactic_defense_pct) / 100; // тактика командующего
     (COMBAT_INTENSITY_BP * attack / (attack + defense).max(1)).max(1)
 }
 
@@ -1948,6 +2072,9 @@ fn resolve_combats(
             let advantage = |damage: u32, has_advantage: bool| {
                 if has_advantage { damage * (100 + TACTICAL_ADVANTAGE_PCT) / 100 } else { damage }
             };
+            // Тактики: парированная сторона теряет бонусы, парирующая бьёт на 25% сильнее, отход режет урон
+            let att_mods = side_mods(state.attacker_tactic, state.defender_tactic, true);
+            let def_mods = side_mods(state.attacker_tactic, state.defender_tactic, false);
 
             if !att_line.is_empty() && !def_line.is_empty() {
                 // Час боя на линии: каждые 24 дивизионо-часа дают стране +1 опыта (резерв не воюет и не считается)
@@ -1967,24 +2094,31 @@ fn resolve_combats(
                     // Река между провинцией отправления этой дивизии и обороняемой — форсирование
                     let over_river = striker.movement.is_some_and(|m| rivers.crosses(m.from, province));
                     let ctx = HitContext::for_attack(&terrain, striker, over_river)
-                        .with_air(air_attack_bonus_pct(att_air), air_defense_penalty_pct(def_air));
+                        .with_air(air_attack_bonus_pct(att_air), air_defense_penalty_pct(def_air))
+                        .with_tactics(att_mods.attack_pct, def_mods.defense_pct);
                     // Наступающая дивизия получает бонус планирования к атаке
                     let bp = combat_bp_ctx(striker, target, striker.planning, ctx);
                     // Броня меняет урон и по организации, и по прочности; разведка добавляет +5%
                     let org_milli = apply_armor_rule(target.max_org * bp / 10, striker, target).max(1);
                     let strength = apply_armor_rule(target.max_strength * bp / 50_000, striker, target).max(1);
                     let tactical = recon_adv == Some(true);
+                    let (org_milli, strength) =
+                        (org_milli * att_mods.damage_pct / 100, strength * att_mods.damage_pct / 100);
                     hits.push((*target_e, advantage(org_milli, tactical), advantage(strength, tactical)));
                 }
                 for (k, (_, striker)) in def_line.iter().enumerate() {
                     let (target_e, target) = &att_line[k % att_line.len()];
                     // обороняющиеся бонуса планирования и рельефа не имеют, небо действует на обе стороны
-                    let ctx = HitContext::NONE.with_air(air_attack_bonus_pct(def_air), air_defense_penalty_pct(att_air));
+                    let ctx = HitContext::NONE
+                        .with_air(air_attack_bonus_pct(def_air), air_defense_penalty_pct(att_air))
+                        .with_tactics(def_mods.attack_pct, att_mods.defense_pct);
                     let bp = combat_bp_ctx(striker, target, 0, ctx);
                     // Броня меняет урон и по организации, и по прочности; разведка добавляет +5%
                     let org_milli = apply_armor_rule(target.max_org * bp / 10, striker, target).max(1);
                     let strength = apply_armor_rule(target.max_strength * bp / 50_000, striker, target).max(1);
                     let tactical = recon_adv == Some(false);
+                    let (org_milli, strength) =
+                        (org_milli * def_mods.damage_pct / 100, strength * def_mods.damage_pct / 100);
                     hits.push((*target_e, advantage(org_milli, tactical), advantage(strength, tactical)));
                 }
                 for (target, org_milli, strength) in hits {
@@ -2447,6 +2581,7 @@ fn combat_ui(
                 );
                 ui.label(egui::RichText::new(&terrain_text).small());
                 ui.label(egui::RichText::new(&recon_text).small());
+                show_tactics(ui, combat);
                 // Организация линии: атакующие (синий) и защитники (красный), ширина фронта и резерв
                 let sides = [
                     ("АТК", &att, egui::Color32::from_rgb(70, 160, 220), attacker_color),
@@ -2602,6 +2737,9 @@ fn division_info_ui(
             ));
             ui.label(equipment_status_text(d));
             ui.label(format!("Состояние: {status}"));
+            if let Some(c) = combat {
+                show_tactics(ui, c);
+            }
             ui.label(format!("Боевая ширина дивизии: {}", d.combat_width));
             // Смена шаблона: доступна нации, только пока дивизия стоит и не воюет
             ui.separator();
@@ -2764,6 +2902,11 @@ mod tests {
             max_width: BASE_COMBAT_WIDTH,
             combat_progress: 0,
             elapsed_hours: 0,
+            attacker_tactic: CombatTactic::Attack,
+            defender_tactic: CombatTactic::Defend,
+            is_attacker_countered: false,
+            is_defender_countered: false,
+            tactic_change_day: 0,
         });
         (app, att, def)
     }
@@ -3102,6 +3245,159 @@ mod tests {
             }
         }
         assert_eq!((on_line, in_reserve), (8, 3));
+    }
+
+    /// Потери организации (в тысячных) у защитников / атакующих после одного часа боя 1 на 1 с заданными тактиками.
+    fn org_losses(att_tactic: CombatTactic, def_tactic: CombatTactic) -> (u32, u32) {
+        let (mut app, att, def) = scenario(&[1], 1, 1);
+        {
+            let world = app.world_mut();
+            let mut combat = world.query::<&mut ActiveCombat>().single_mut(world);
+            combat.attacker_tactic = att_tactic;
+            combat.defender_tactic = def_tactic;
+        }
+        tick(&mut app);
+        let lost = |app: &App, e: Entity| {
+            let d = app.world().get::<Division>(e).expect("дивизия");
+            d.max_org * 1000 - d.org_milli()
+        };
+        (lost(&app, def[0]), lost(&app, att[0]))
+    }
+
+    #[test]
+    fn tactics_change_damage_inside_resolve_combats() {
+        use CombatTactic::*;
+        let (base_def_loss, base_att_loss) = org_losses(Attack, Defend);
+        // штурм (+25%) бьёт сильнее базовой атаки (+5%)
+        let (assault_def_loss, _) = org_losses(Assault, Defend);
+        assert!(assault_def_loss > base_def_loss, "{assault_def_loss} > {base_def_loss}");
+        // контратака защитника (+25% к его атаке) сильнее бьёт по атакующим
+        let (_, counter_att_loss) = org_losses(Attack, CounterAttack);
+        assert!(counter_att_loss > base_att_loss);
+        // отход парирует штурм: атакующий теряет бонус и бьёт на 25% слабее, защитник бьёт на 6% сильнее
+        let (withdraw_def_loss, withdraw_att_loss) = org_losses(Assault, TacticalWithdrawal);
+        assert!(withdraw_def_loss < base_def_loss, "парированный штурм слабее даже базовой атаки");
+        assert!(withdraw_att_loss > base_att_loss, "за парирование защитник получает +25% (с учётом отхода 106%)");
+        // охват против контратаки: парирована контратака — защитник теряет свой бонус, охват бьёт на 25% сильнее
+        let (enc_def_loss, enc_att_loss) = org_losses(Encirclement, CounterAttack);
+        let (assault_vs_counter_def, assault_vs_counter_att) = org_losses(Assault, CounterAttack);
+        assert!(enc_def_loss > assault_vs_counter_def, "парирование охватом добавляет +25% урона");
+        assert!(enc_att_loss < assault_vs_counter_att, "парированная контратака потеряла +25% к атаке");
+    }
+
+    fn make_neutral(id: u32) -> Division {
+        let templates = DivisionTemplates::default();
+        Division::from_template(id, "d".into(), "GER".into(), 1, PLAIN_INFANTRY_TEMPLATE.to_string(), templates.get_or_base(PLAIN_INFANTRY_TEMPLATE))
+            .trained()
+    }
+
+    #[test]
+    fn countered_side_loses_tactic_bonuses_in_the_formula() {
+        use CombatTactic::*;
+        let (attacker, defender) = (make_neutral(1), make_neutral(2));
+        let formula = |att: CombatTactic, def: CombatTactic| {
+            let a = side_mods(att, def, true);
+            let d = side_mods(att, def, false);
+            combat_bp_ctx(&attacker, &defender, 0, HitContext::NONE.with_tactics(a.attack_pct, d.defense_pct))
+        };
+        // без тактик: 800 * 90 / 315 = 228
+        assert_eq!(combat_bp(&attacker, &defender, 0), 228);
+        // штурм +25%: атака 112, защита 225 (контратака защиты не даёт) -> 800 * 112 / 337 = 265
+        assert_eq!(formula(Assault, CounterAttack), 265);
+        // оборона +5%: защита 236 -> 800 * 112 / 348 = 257
+        assert_eq!(formula(Assault, Defend), 257);
+        // отход парирует штурм: бонус атаки пропал -> как без тактик
+        assert_eq!(formula(Assault, TacticalWithdrawal), 228);
+        // базовая атака +5% (94) против обороны +5% (236)
+        assert_eq!(formula(Attack, Defend), 800 * 94 / (94 + 236));
+    }
+
+    #[test]
+    fn tactic_choice_is_deterministic_and_respects_side_pools() {
+        // одни и те же входы -> один и тот же выбор
+        let first = choose_tactics(42, 13_000, 7, 101, None);
+        assert_eq!(first, choose_tactics(42, 13_000, 7, 101, None));
+        // тактики сторон из своих наборов
+        let mut seen_attackers = BTreeSet::new();
+        let mut seen_defenders = BTreeSet::new();
+        for day in 0..60 {
+            let (a, d) = choose_tactics(42, day, 7, 101, None);
+            assert!(ATTACKER_TACTICS.contains(&a) && DEFENDER_TACTICS.contains(&d));
+            seen_attackers.insert(a);
+            seen_defenders.insert(d);
+            // при разведке у атакующих порядок выбора другой, но наборы те же
+            let (a2, d2) = choose_tactics(42, day, 7, 101, Some(true));
+            assert!(ATTACKER_TACTICS.contains(&a2) && DEFENDER_TACTICS.contains(&d2));
+        }
+        assert_eq!((seen_attackers.len(), seen_defenders.len()), (3, 3), "за два месяца встречаются все тактики");
+        // другой бой или другой командующий дают другую последовательность
+        let sequence = |bits: u64, key: u32| (0..40).map(|day| choose_tactics(bits, day, key, 101, None)).collect::<Vec<_>>();
+        assert_ne!(sequence(42, 7), sequence(43, 7));
+        assert_ne!(sequence(42, 7), sequence(42, 8));
+    }
+
+    #[test]
+    fn second_picker_prefers_the_counter_pick() {
+        use CombatTactic::*;
+        // атакующие выбрали штурм: отход защитника весит 2 из 4
+        let mut counts = BTreeMap::new();
+        for roll in 0..4u64 {
+            *counts.entry(pick_tactic(&DEFENDER_TACTICS, Some(Assault), roll)).or_insert(0) += 1;
+        }
+        assert_eq!(counts[&TacticalWithdrawal], 2);
+        assert_eq!((counts[&Defend], counts[&CounterAttack]), (1, 1));
+        // против обычной атаки контр-пика нет: веса равны
+        let flat: Vec<CombatTactic> = (0..3u64).map(|r| pick_tactic(&DEFENDER_TACTICS, Some(Attack), r)).collect();
+        assert_eq!(flat, DEFENDER_TACTICS.to_vec());
+        // контратаку защитника парирует охват
+        let encircle = (0..4u64).filter(|&r| pick_tactic(&ATTACKER_TACTICS, Some(CounterAttack), r) == Encirclement).count();
+        assert_eq!(encircle, 2);
+    }
+
+    #[test]
+    fn daily_tick_selects_tactics_and_marks_counters_deterministically() {
+        let run = || {
+            let (mut app, _att, _def) = scenario(&[1, 1], 2, 1);
+            app.add_event::<DailyTickEvent>().add_systems(Update, select_combat_tactics);
+            let mut seen = Vec::new();
+            for day in 1..=20u32 {
+                app.world_mut().send_event(DailyTickEvent { day, month: 3, year: 1936 });
+                app.update();
+                let world = app.world_mut();
+                let combat = world.query::<&ActiveCombat>().single(world);
+                let (att_c, def_c) = resolve_counters(combat.attacker_tactic, combat.defender_tactic);
+                assert_eq!((combat.is_attacker_countered, combat.is_defender_countered), (att_c, def_c));
+                assert!(!(att_c && def_c), "парирована может быть только одна сторона");
+                assert_eq!(combat.tactic_change_day, day_index(day, 3, 1936));
+                seen.push((combat.attacker_tactic, combat.defender_tactic));
+            }
+            seen
+        };
+        let first = run();
+        assert_eq!(first, run(), "тот же бой и те же сутки дают тот же выбор");
+        assert!(first.iter().collect::<BTreeSet<_>>().len() > 1, "тактики меняются от суток к суткам");
+    }
+
+    #[test]
+    fn tactic_ui_marks_the_countered_side_in_red() {
+        use CombatTactic::*;
+        let (mut app, _att, _def) = scenario(&[1], 1, 1);
+        let world = app.world_mut();
+        let mut combat = world.query::<&mut ActiveCombat>().single_mut(world);
+        combat.attacker_tactic = Assault;
+        combat.defender_tactic = TacticalWithdrawal;
+        let segments = tactics_segments(&combat);
+        let text: String = segments.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(text, "Тактика: Штурм [ПАРИРОВАНО!] vs Отход");
+        assert_eq!(segments.iter().filter(|(_, red)| *red).count(), 1);
+        combat.attacker_tactic = Encirclement;
+        combat.defender_tactic = CounterAttack;
+        let text: String = tactics_segments(&combat).iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(text, "Тактика: Охват vs Контратака [ПАРИРОВАНО!]");
+        combat.attacker_tactic = Attack;
+        combat.defender_tactic = Defend;
+        let text: String = tactics_segments(&combat).iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(text, "Тактика: Атака vs Оборона");
     }
 
     #[test]
@@ -3831,6 +4127,11 @@ mod refit_tests {
             max_width: 80,
             combat_progress: 0,
             elapsed_hours: 0,
+            attacker_tactic: CombatTactic::Attack,
+            defender_tactic: CombatTactic::Defend,
+            is_attacker_countered: false,
+            is_defender_countered: false,
+            tactic_change_day: 0,
         });
         order(&mut app, ids[0], "Panzer-Division");
         assert_eq!(template_of(&app, ids[0]), BASE_TEMPLATE, "в бою шаблон не меняется");

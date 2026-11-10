@@ -19,6 +19,117 @@ pub const MARSHAL_ARMY_LIMIT: u32 = 5;
 /// Каждый уровень навыка даёт +2% к атаке / защите.
 pub const SKILL_BONUS_PCT: u32 = 2;
 
+/// Тактика боя, выбираемая командующим раз в сутки. Наступающие выбирают из `ATTACKER_TACTICS`,
+/// обороняющиеся из `DEFENDER_TACTICS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CombatTactic {
+    // Атакующие
+    /// Базовая: атака +5%.
+    Attack,
+    /// Штурм: атака +25%, парируется отходом.
+    Assault,
+    /// Охват: атака +25%, парируется отходом.
+    Encirclement,
+    // Оборонительные
+    /// Базовая: защита +5%.
+    Defend,
+    /// Контратака: атака защитника +25%, парируется охватом.
+    CounterAttack,
+    /// Тактический отход: урон атакующего -25%, урон защитника -15%.
+    TacticalWithdrawal,
+}
+
+/// Тактики наступающей стороны.
+pub const ATTACKER_TACTICS: [CombatTactic; 3] = [CombatTactic::Attack, CombatTactic::Assault, CombatTactic::Encirclement];
+/// Тактики обороняющейся стороны.
+pub const DEFENDER_TACTICS: [CombatTactic; 3] =
+    [CombatTactic::Defend, CombatTactic::CounterAttack, CombatTactic::TacticalWithdrawal];
+/// Бонус к урону стороны, чья тактика парировала тактику врага, %.
+pub const COUNTER_PICK_DAMAGE_PCT: u32 = 25;
+
+impl CombatTactic {
+    /// Тактика, которая парирует текущую (`None` — парировать нечем).
+    pub fn counter_tactic(&self) -> Option<CombatTactic> {
+        match self {
+            CombatTactic::Assault | CombatTactic::Encirclement => Some(CombatTactic::TacticalWithdrawal),
+            CombatTactic::CounterAttack => Some(CombatTactic::Encirclement),
+            CombatTactic::Attack | CombatTactic::Defend | CombatTactic::TacticalWithdrawal => None,
+        }
+    }
+
+    /// Название для интерфейса.
+    pub fn title(&self) -> &'static str {
+        match self {
+            CombatTactic::Attack => "Атака",
+            CombatTactic::Assault => "Штурм",
+            CombatTactic::Encirclement => "Охват",
+            CombatTactic::Defend => "Оборона",
+            CombatTactic::CounterAttack => "Контратака",
+            CombatTactic::TacticalWithdrawal => "Отход",
+        }
+    }
+}
+
+/// Кто кого парирует в паре тактик: `(атакующий парирован, обороняющийся парирован)`.
+pub fn resolve_counters(attacker: CombatTactic, defender: CombatTactic) -> (bool, bool) {
+    (attacker.counter_tactic() == Some(defender), defender.counter_tactic() == Some(attacker))
+}
+
+/// Эффекты тактик для одной стороны в процентах.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TacticMods {
+    /// Прибавка к атаке стороны, %.
+    pub attack_pct: u32,
+    /// Прибавка к защите стороны, %.
+    pub defense_pct: u32,
+    /// Множитель наносимого стороной урона, % (100 — без изменений).
+    pub damage_pct: u32,
+}
+
+/// Эффекты тактик стороны. Парированная сторона теряет бонусы своей тактики к атаке и защите; парирующая
+/// получает +25% к урону. Отход защитника режет урон атакующего до 75% и собственный урон до 85%.
+pub fn side_mods(attacker: CombatTactic, defender: CombatTactic, for_attacker: bool) -> TacticMods {
+    let (att_countered, def_countered) = resolve_counters(attacker, defender);
+    let (own, countered, enemy_countered) =
+        if for_attacker { (attacker, att_countered, def_countered) } else { (defender, def_countered, att_countered) };
+    let attack_pct = if countered {
+        0
+    } else {
+        match own {
+            CombatTactic::Attack => 5,
+            CombatTactic::Assault | CombatTactic::Encirclement | CombatTactic::CounterAttack => 25,
+            CombatTactic::Defend | CombatTactic::TacticalWithdrawal => 0,
+        }
+    };
+    let defense_pct = if !countered && own == CombatTactic::Defend { 5 } else { 0 };
+    let mut damage_pct = 100;
+    if enemy_countered {
+        damage_pct = damage_pct * (100 + COUNTER_PICK_DAMAGE_PCT) / 100;
+    }
+    if defender == CombatTactic::TacticalWithdrawal {
+        damage_pct = damage_pct * if for_attacker { 75 } else { 85 } / 100;
+    }
+    TacticMods { attack_pct, defense_pct, damage_pct }
+}
+
+/// Взвешенный выбор тактики из `options`: вес 1, у контр-пика к `enemy` (парирует его тактику) — 2.
+/// `roll` — детерминированный хэш; результат зависит только от входов.
+pub fn pick_tactic(options: &[CombatTactic], enemy: Option<CombatTactic>, roll: u64) -> CombatTactic {
+    let weight = |t: CombatTactic| -> u64 {
+        if enemy.is_some_and(|e| e.counter_tactic() == Some(t)) { 2 } else { 1 }
+    };
+    let total: u64 = options.iter().map(|&t| weight(t)).sum();
+    let mut point = if total == 0 { 0 } else { roll % total };
+    for &tactic in options {
+        let w = weight(tactic);
+        if point < w {
+            return tactic;
+        }
+        point -= w;
+    }
+    options.first().copied().unwrap_or(CombatTactic::Attack)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommanderRank {
     General,
@@ -252,5 +363,50 @@ mod tests {
         let d = app.world().get::<Division>(div).unwrap();
         assert_eq!((d.command_attack_skill, d.command_defense_skill), (0, 0));
         assert!(app.world().get::<Commander>(general).unwrap().assigned_divisions.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tactic_tests {
+    use super::*;
+    use CombatTactic::*;
+
+    #[test]
+    fn counters_follow_the_canon() {
+        assert_eq!(Assault.counter_tactic(), Some(TacticalWithdrawal));
+        assert_eq!(Encirclement.counter_tactic(), Some(TacticalWithdrawal));
+        assert_eq!(CounterAttack.counter_tactic(), Some(Encirclement));
+        assert_eq!(Attack.counter_tactic(), None);
+        assert_eq!(Defend.counter_tactic(), None);
+        assert_eq!(TacticalWithdrawal.counter_tactic(), None);
+        assert_eq!(resolve_counters(Assault, TacticalWithdrawal), (true, false));
+        assert_eq!(resolve_counters(Encirclement, CounterAttack), (false, true));
+        assert_eq!(resolve_counters(Attack, Defend), (false, false));
+        assert_eq!(resolve_counters(Assault, CounterAttack), (false, false));
+    }
+
+    #[test]
+    fn titles_are_russian() {
+        let titles: Vec<&str> =
+            [Attack, Assault, Encirclement, Defend, CounterAttack, TacticalWithdrawal].iter().map(CombatTactic::title).collect();
+        assert_eq!(titles, vec!["Атака", "Штурм", "Охват", "Оборона", "Контратака", "Отход"]);
+    }
+
+    #[test]
+    fn countered_side_loses_bonuses_and_the_counter_picker_gains_damage() {
+        // штурм парирован отходом: атакующий без бонуса атаки и с уроном 75%; защитник бьёт на 125% * 85% = 106%
+        assert_eq!(side_mods(Assault, TacticalWithdrawal, true), TacticMods { attack_pct: 0, defense_pct: 0, damage_pct: 75 });
+        assert_eq!(side_mods(Assault, TacticalWithdrawal, false), TacticMods { attack_pct: 0, defense_pct: 0, damage_pct: 106 });
+        // охват против контратаки: контратака парирована (нет +25% атаки), охват бьёт на 25% сильнее
+        assert_eq!(side_mods(Encirclement, CounterAttack, false), TacticMods { attack_pct: 0, defense_pct: 0, damage_pct: 100 });
+        assert_eq!(side_mods(Encirclement, CounterAttack, true), TacticMods { attack_pct: 25, defense_pct: 0, damage_pct: 125 });
+        // без парирования бонусы на месте
+        assert_eq!(side_mods(Assault, CounterAttack, true), TacticMods { attack_pct: 25, defense_pct: 0, damage_pct: 100 });
+        assert_eq!(side_mods(Assault, CounterAttack, false), TacticMods { attack_pct: 25, defense_pct: 0, damage_pct: 100 });
+        assert_eq!(side_mods(Attack, Defend, true), TacticMods { attack_pct: 5, defense_pct: 0, damage_pct: 100 });
+        assert_eq!(side_mods(Attack, Defend, false), TacticMods { attack_pct: 0, defense_pct: 5, damage_pct: 100 });
+        // отход без парирования (против базовой атаки): урон атакующего -25%, защитника -15%
+        assert_eq!(side_mods(Attack, TacticalWithdrawal, true), TacticMods { attack_pct: 5, defense_pct: 0, damage_pct: 75 });
+        assert_eq!(side_mods(Attack, TacticalWithdrawal, false), TacticMods { attack_pct: 0, defense_pct: 0, damage_pct: 85 });
     }
 }
