@@ -18,9 +18,11 @@ use crate::clock::{ClockSet, DailyTickEvent, HourTick};
 use crate::air::{air_attack_bonus_pct, air_defense_penalty_pct, air_status, side_edge, AirSuperiorityMap};
 use crate::colors::CountryColors;
 use crate::command::{
-    pick_tactic, resolve_counters, side_mods, CombatPhase, CombatTactic, ATTACKER_TACTICS, DEFENDER_TACTICS,
+    resolve_counters, side_mods, CombatPhase, CombatTactic, ATTACKER_TACTICS, DEFENDER_TACTICS,
     SKILL_BONUS_PCT, WITHDRAWAL_ORG_DAMAGE_PCT, WITHDRAWAL_PHASE_HOURS, WITHDRAWAL_WIDTH_DIVISOR,
-    pick_tactic_boosted, BRIDGE_ATTACKER_TACTICS, BRIDGE_DEFENDER_TACTICS, BRIDGE_PHASE_HOURS,
+    pick_tactic_boosted, pick_tactic_scaled, BRIDGE_ATTACKER_TACTICS, BRIDGE_DEFENDER_TACTICS, BRIDGE_PHASE_HOURS,
+    CLOSE_QUARTERS_DAMAGE_PCT, CLOSE_QUARTERS_PHASE_HOURS, CQ_ATTACKER_TACTICS, CQ_DEFENDER_TACTICS,
+    URBAN_ASSAULT_WEIGHT_MULT,
 };
 use crate::diplomacy::{check_entry, DiplomacyRegistry};
 use crate::economy::{update_supply_network, ArmyExperience, EquipmentType, PlayerCountry, SupplyNetwork};
@@ -350,7 +352,7 @@ impl ActiveCombat {
     pub fn effective_max_width(&self) -> u32 {
         match self.phase {
             CombatPhase::Default | CombatPhase::Bridge => self.max_width,
-            CombatPhase::TacticalWithdrawal => self.max_width / WITHDRAWAL_WIDTH_DIVISOR,
+            CombatPhase::TacticalWithdrawal | CombatPhase::CloseQuarters => self.max_width / WITHDRAWAL_WIDTH_DIVISOR,
         }
     }
 }
@@ -1605,23 +1607,67 @@ pub fn day_index(day: u32, month: u32, year: u32) -> u32 {
 
 /// Выбор тактик обеих сторон на сутки. Сторона с худшей разведкой выбирает первой (равенство — атакующие),
 /// вторая видит выбор и даёт контр-пику двойной вес. Бросок — `det_rand(боя, суток, ключа командующего)`.
+///
+/// В городе (`urban`) вес штурма у атакующих утраивается.
 pub fn choose_tactics(
     combat_bits: u64,
     day: u32,
     attacker_key: u32,
     defender_key: u32,
     recon_edge: Option<bool>,
+    urban: bool,
+) -> (CombatTactic, CombatTactic) {
+    let scale = urban.then_some((CombatTactic::Assault, URBAN_ASSAULT_WEIGHT_MULT));
+    choose_from_pools(
+        (combat_bits, day, attacker_key, defender_key, recon_edge),
+        (&ATTACKER_TACTICS, &DEFENDER_TACTICS, scale),
+        [1, 2, 3, 4],
+    )
+}
+
+/// Выбор тактик в фазе ближнего боя: атака в упор или продление штурма против обороны или разрыва дистанции.
+pub fn choose_cq_tactics(
+    combat_bits: u64,
+    day: u32,
+    attacker_key: u32,
+    defender_key: u32,
+    recon_edge: Option<bool>,
+) -> (CombatTactic, CombatTactic) {
+    choose_from_pools(
+        (combat_bits, day, attacker_key, defender_key, recon_edge),
+        (&CQ_ATTACKER_TACTICS, &CQ_DEFENDER_TACTICS, None),
+        [9, 10, 11, 12],
+    )
+}
+
+/// Общий порядок выбора: сторона с худшей разведкой первой, вторая видит выбор и ценит контр-пик вдвое выше.
+fn choose_from_pools(
+    (combat_bits, day, attacker_key, defender_key, recon_edge): (u64, u32, u32, u32, Option<bool>),
+    (attacker_pool, defender_pool, attacker_scale): (&[CombatTactic], &[CombatTactic], Option<(CombatTactic, u64)>),
+    salts: [u64; 4],
 ) -> (CombatTactic, CombatTactic) {
     let roll = |key: u32, salt: u64| det_rand(combat_bits, u64::from(day), u64::from(key) | (salt << 32));
     if recon_edge == Some(true) {
         // у атакующих разведка лучше: защитники выбирают первыми
-        let defender = pick_tactic(&DEFENDER_TACTICS, None, roll(defender_key, 1));
-        let attacker = pick_tactic(&ATTACKER_TACTICS, Some(defender), roll(attacker_key, 2));
+        let defender = pick_tactic_scaled(defender_pool, None, roll(defender_key, salts[0]), None);
+        let attacker = pick_tactic_scaled(attacker_pool, Some(defender), roll(attacker_key, salts[1]), attacker_scale);
         (attacker, defender)
     } else {
-        let attacker = pick_tactic(&ATTACKER_TACTICS, None, roll(attacker_key, 3));
-        let defender = pick_tactic(&DEFENDER_TACTICS, Some(attacker), roll(defender_key, 4));
+        let attacker = pick_tactic_scaled(attacker_pool, None, roll(attacker_key, salts[2]), attacker_scale);
+        let defender = pick_tactic_scaled(defender_pool, Some(attacker), roll(defender_key, salts[3]), None);
         (attacker, defender)
+    }
+}
+
+/// Суточный переход в ближний бой: штурм в городе включает (или продлевает) фазу на 24 часа; по истечении срока
+/// без нового штурма фаза возвращается в обычную; пока срок идёт, она доживает своё время.
+pub fn next_cq_phase(phase: CombatPhase, hours_left: u32, attacker: CombatTactic, urban: bool) -> (CombatPhase, u32) {
+    if urban && attacker == CombatTactic::Assault {
+        (CombatPhase::CloseQuarters, CLOSE_QUARTERS_PHASE_HOURS)
+    } else if phase == CombatPhase::CloseQuarters && hours_left == 0 {
+        (CombatPhase::Default, 0)
+    } else {
+        (phase, hours_left)
     }
 }
 
@@ -1687,6 +1733,7 @@ fn select_combat_tactics(
     mut events: EventReader<DailyTickEvent>,
     mut combats: Query<(Entity, &mut ActiveCombat)>,
     divisions: Query<&Division>,
+    map: Res<ProvinceMap>,
 ) {
     for event in events.read() {
         let day = day_index(event.day, event.month, event.year);
@@ -1699,6 +1746,7 @@ fn select_combat_tactics(
             let key_of = |side: &[Entity]| side.iter().filter_map(|&e| divisions.get(e).ok()).map(|d| d.id).min().unwrap_or(0);
             let edge = recon_advantage(&recon_of(&combat.attackers), &recon_of(&combat.defenders));
             let in_bridge_phase = combat.phase == CombatPhase::Bridge;
+            let urban = map.terrain_of(combat.province_id) == Some("urban");
             let (attacker, defender) = if in_bridge_phase {
                 // сапёры среди атакующих повышают вес захвата моста
                 let engineers = combat
@@ -1714,8 +1762,10 @@ fn select_combat_tactics(
                     edge,
                     engineers,
                 )
+            } else if combat.phase == CombatPhase::CloseQuarters {
+                choose_cq_tactics(entity.to_bits(), day, key_of(&combat.attackers), key_of(&combat.defenders), edge)
             } else {
-                choose_tactics(entity.to_bits(), day, key_of(&combat.attackers), key_of(&combat.defenders), edge)
+                choose_tactics(entity.to_bits(), day, key_of(&combat.attackers), key_of(&combat.defenders), edge, urban)
             };
             let (att_countered, def_countered) = resolve_counters(attacker, defender);
             combat.attacker_tactic = attacker;
@@ -1731,6 +1781,8 @@ fn select_combat_tactics(
                 combat.phase_hours_left = hours_left;
             } else {
                 let (phase, hours_left) = next_phase(combat.phase, combat.phase_hours_left, defender);
+                // штурм города имеет приоритет над отходом: уличный бой сменяет прочие фазы
+                let (phase, hours_left) = next_cq_phase(phase, hours_left, attacker, urban);
                 combat.phase = phase;
                 combat.phase_hours_left = hours_left;
             }
@@ -1760,6 +1812,11 @@ pub fn phase_text(combat: &ActiveCombat) -> Option<String> {
         CombatPhase::Default => None,
         CombatPhase::TacticalWithdrawal => Some(format!(
             "Фаза: {} (осталось {} ч.) | Фронт сужен на 50%",
+            combat.phase.title(),
+            combat.phase_hours_left
+        )),
+        CombatPhase::CloseQuarters => Some(format!(
+            "Фаза: {} (осталось {} ч.) | Фронт сужен на 50% | Урон повышен",
             combat.phase.title(),
             combat.phase_hours_left
         )),
@@ -1836,7 +1893,7 @@ pub fn terrain_modifiers(terrain: Option<&str>) -> TerrainModifiers {
         Some("hills") => (25, 15, 0),
         Some("mountain") => (50, 30, 20),
         Some("marsh") => (20, 25, 30),
-        Some("urban") => (30, 20, 0),
+        Some("urban") => (30, 30, 20),
         _ => (0, 0, 0), // plains и прочие типы
     };
     TerrainModifiers { defense_bonus, attack_penalty, armored_attack_penalty }
@@ -1959,7 +2016,12 @@ fn combat_bp_ctx(att: &Division, def: &Division, planning: u32, ctx: HitContext)
 ///   урон на 50% больше: безнаказанный расстрел с позиций.
 /// Для пары «A атакует B» это ровно условие `armor(B) > piercing(A)`: удар A по B режется вдвое,
 /// ответный удар B по A усиливается; правило симметрично и работает, если бронирован атакующий.
-fn apply_armor_rule(damage: u32, striker: &Division, target: &Division) -> u32 {
+///
+/// В упор (`point_blank`, фаза ближнего боя) броня преимущества не даёт ни той, ни другой стороне.
+fn apply_armor_rule(damage: u32, striker: &Division, target: &Division, point_blank: bool) -> u32 {
+    if point_blank {
+        return damage;
+    }
     let mut damage = damage;
     if target.armor > striker.piercing {
         damage /= 2;
@@ -2229,6 +2291,9 @@ fn resolve_combats(
             // Тактики: парированная сторона теряет бонусы, парирующая бьёт на 25% сильнее, отход режет урон
             let att_mods = side_mods(state.attacker_tactic, state.defender_tactic, true);
             let def_mods = side_mods(state.attacker_tactic, state.defender_tactic, false);
+            // Ближний бой: броня не помогает, обе стороны бьют сильнее
+            let point_blank = state.phase == CombatPhase::CloseQuarters;
+            let cq_damage = |value: u32| if point_blank { value * CLOSE_QUARTERS_DAMAGE_PCT / 100 } else { value };
 
             if !att_line.is_empty() && !def_line.is_empty() {
                 // Час боя на линии: каждые 24 дивизионо-часа дают стране +1 опыта (резерв не воюет и не считается)
@@ -2255,11 +2320,13 @@ fn resolve_combats(
                     // Наступающая дивизия получает бонус планирования к атаке
                     let bp = combat_bp_ctx(striker, target, striker.planning, ctx);
                     // Броня меняет урон и по организации, и по прочности; разведка добавляет +5%
-                    let org_milli = apply_armor_rule(target.max_org * bp / 10, striker, target).max(1);
-                    let strength = apply_armor_rule(target.max_strength * bp / 50_000, striker, target).max(1);
+                    let org_milli = apply_armor_rule(target.max_org * bp / 10, striker, target, point_blank).max(1);
+                    let strength = apply_armor_rule(target.max_strength * bp / 50_000, striker, target, point_blank).max(1);
                     let tactical = recon_adv == Some(true);
-                    let (org_milli, strength) =
-                        (org_milli * att_mods.damage_pct / 100, strength * att_mods.damage_pct / 100);
+                    let (org_milli, strength) = (
+                        cq_damage(org_milli * att_mods.damage_pct / 100),
+                        cq_damage(strength * att_mods.damage_pct / 100),
+                    );
                     // Арьергардный бой: по организации обороняющихся урон ещё на четверть ниже
                     let org_milli = if state.phase == CombatPhase::TacticalWithdrawal {
                         org_milli * WITHDRAWAL_ORG_DAMAGE_PCT / 100
@@ -2276,11 +2343,13 @@ fn resolve_combats(
                         .with_tactics(def_mods.attack_pct, att_mods.defense_pct);
                     let bp = combat_bp_ctx(striker, target, 0, ctx);
                     // Броня меняет урон и по организации, и по прочности; разведка добавляет +5%
-                    let org_milli = apply_armor_rule(target.max_org * bp / 10, striker, target).max(1);
-                    let strength = apply_armor_rule(target.max_strength * bp / 50_000, striker, target).max(1);
+                    let org_milli = apply_armor_rule(target.max_org * bp / 10, striker, target, point_blank).max(1);
+                    let strength = apply_armor_rule(target.max_strength * bp / 50_000, striker, target, point_blank).max(1);
                     let tactical = recon_adv == Some(false);
-                    let (org_milli, strength) =
-                        (org_milli * def_mods.damage_pct / 100, strength * def_mods.damage_pct / 100);
+                    let (org_milli, strength) = (
+                        cq_damage(org_milli * def_mods.damage_pct / 100),
+                        cq_damage(strength * def_mods.damage_pct / 100),
+                    );
                     hits.push((*target_e, advantage(org_milli, tactical), advantage(strength, tactical)));
                 }
                 for (target, org_milli, strength) in hits {
@@ -3484,23 +3553,23 @@ mod tests {
     #[test]
     fn tactic_choice_is_deterministic_and_respects_side_pools() {
         // одни и те же входы -> один и тот же выбор
-        let first = choose_tactics(42, 13_000, 7, 101, None);
-        assert_eq!(first, choose_tactics(42, 13_000, 7, 101, None));
+        let first = choose_tactics(42, 13_000, 7, 101, None, false);
+        assert_eq!(first, choose_tactics(42, 13_000, 7, 101, None, false));
         // тактики сторон из своих наборов
         let mut seen_attackers = BTreeSet::new();
         let mut seen_defenders = BTreeSet::new();
         for day in 0..60 {
-            let (a, d) = choose_tactics(42, day, 7, 101, None);
+            let (a, d) = choose_tactics(42, day, 7, 101, None, false);
             assert!(ATTACKER_TACTICS.contains(&a) && DEFENDER_TACTICS.contains(&d));
             seen_attackers.insert(a);
             seen_defenders.insert(d);
             // при разведке у атакующих порядок выбора другой, но наборы те же
-            let (a2, d2) = choose_tactics(42, day, 7, 101, Some(true));
+            let (a2, d2) = choose_tactics(42, day, 7, 101, Some(true), false);
             assert!(ATTACKER_TACTICS.contains(&a2) && DEFENDER_TACTICS.contains(&d2));
         }
         assert_eq!((seen_attackers.len(), seen_defenders.len()), (3, 3), "за два месяца встречаются все тактики");
         // другой бой или другой командующий дают другую последовательность
-        let sequence = |bits: u64, key: u32| (0..40).map(|day| choose_tactics(bits, day, key, 101, None)).collect::<Vec<_>>();
+        let sequence = |bits: u64, key: u32| (0..40).map(|day| choose_tactics(bits, day, key, 101, None, false)).collect::<Vec<_>>();
         assert_ne!(sequence(42, 7), sequence(43, 7));
         assert_ne!(sequence(42, 7), sequence(42, 8));
     }
@@ -3511,15 +3580,15 @@ mod tests {
         // атакующие выбрали штурм: отход защитника весит 2 из 4
         let mut counts = BTreeMap::new();
         for roll in 0..4u64 {
-            *counts.entry(pick_tactic(&DEFENDER_TACTICS, Some(Assault), roll)).or_insert(0) += 1;
+            *counts.entry(crate::command::pick_tactic(&DEFENDER_TACTICS, Some(Assault), roll)).or_insert(0) += 1;
         }
         assert_eq!(counts[&TacticalWithdrawal], 2);
         assert_eq!((counts[&Defend], counts[&CounterAttack]), (1, 1));
         // против обычной атаки контр-пика нет: веса равны
-        let flat: Vec<CombatTactic> = (0..3u64).map(|r| pick_tactic(&DEFENDER_TACTICS, Some(Attack), r)).collect();
+        let flat: Vec<CombatTactic> = (0..3u64).map(|r| crate::command::pick_tactic(&DEFENDER_TACTICS, Some(Attack), r)).collect();
         assert_eq!(flat, DEFENDER_TACTICS.to_vec());
         // контратаку защитника парирует охват
-        let encircle = (0..4u64).filter(|&r| pick_tactic(&ATTACKER_TACTICS, Some(CounterAttack), r) == Encirclement).count();
+        let encircle = (0..4u64).filter(|&r| crate::command::pick_tactic(&ATTACKER_TACTICS, Some(CounterAttack), r) == Encirclement).count();
         assert_eq!(encircle, 2);
     }
 
@@ -3863,6 +3932,162 @@ mod tests {
         assert_eq!(phase_text(&combat).as_deref(), Some("Фаза: Борьба за мост | Мост захвачен (штраф реки снят)"));
     }
 
+    fn named_division(name: &str) -> Division {
+        let templates = DivisionTemplates::default();
+        Division::from_template(1, "d".into(), "GER".into(), 1, name.to_string(), templates.get_or_base(name)).trained()
+    }
+
+    #[test]
+    fn urban_terrain_hits_attackers_harder_and_armor_hardest() {
+        let urban = terrain_modifiers(Some("urban"));
+        assert_eq!((urban.defense_bonus, urban.attack_penalty, urban.armored_attack_penalty), (30, 30, 20));
+        let infantry = named_division(PLAIN_INFANTRY_TEMPLATE);
+        let mut tanks = named_division("Panzer-Division");
+        tanks.hardness = 60;
+        assert_eq!(HitContext::for_attack(&urban, &infantry, false).attack_penalty, 30, "пехота: -30%");
+        assert_eq!(HitContext::for_attack(&urban, &tanks, false).attack_penalty, 50, "бронетехника: -30% и ещё -20%");
+        // защита обороняющихся +30%: атака 90 * 70 / 100 = 63, защита 225 * 130 / 100 = 292 -> 800 * 63 / 355 = 141
+        let (attacker, defender) = (make_neutral(1), make_neutral(2));
+        let ctx = HitContext::for_attack(&urban, &infantry, false);
+        assert_eq!(ctx.defense_bonus, 30);
+        assert_eq!(combat_bp_ctx(&attacker, &defender, 0, ctx), 141);
+    }
+
+    #[test]
+    fn armor_gives_no_advantage_at_point_blank() {
+        let infantry = named_division(BASE_TEMPLATE);
+        let panzer = named_division("Panzer-Division");
+        // обычный бой: пехота по танкам вдвое слабее, танки по пехоте на 50% сильнее
+        assert_eq!(apply_armor_rule(1000, &infantry, &panzer, false), 500);
+        assert_eq!(apply_armor_rule(1000, &panzer, &infantry, false), 1500);
+        // в упор бонус брони аннулирован для обеих сторон
+        assert_eq!(apply_armor_rule(1000, &infantry, &panzer, true), 1000);
+        assert_eq!(apply_armor_rule(1000, &panzer, &infantry, true), 1000);
+    }
+
+    #[test]
+    fn close_quarters_tactics_and_texts() {
+        use CombatTactic::*;
+        assert_eq!(CloseQuartersAttack.counter_tactic(), Some(CQTacticalWithdrawal));
+        assert_eq!(CQTacticalWithdrawal.counter_tactic(), None);
+        assert_eq!(CloseQuartersAttack.title(), "Ближний бой");
+        assert_eq!(CQTacticalWithdrawal.title(), "Разрыв дистанции");
+        // атака в упор: +10% атаки, оборона бьёт на 5% сильнее
+        assert_eq!(side_mods(CloseQuartersAttack, Defend, true), crate::command::TacticMods { attack_pct: 10, defense_pct: 0, damage_pct: 100 });
+        assert_eq!(side_mods(CloseQuartersAttack, Defend, false), crate::command::TacticMods { attack_pct: 0, defense_pct: 5, damage_pct: 105 });
+        // разрыв дистанции парирует атаку: бонусов нет, парирующий бьёт на 25% сильнее (с учётом отхода: 106%)
+        assert_eq!(side_mods(CloseQuartersAttack, CQTacticalWithdrawal, true), crate::command::TacticMods { attack_pct: 0, defense_pct: 0, damage_pct: 75 });
+        assert_eq!(side_mods(CloseQuartersAttack, CQTacticalWithdrawal, false), crate::command::TacticMods { attack_pct: 0, defense_pct: 0, damage_pct: 106 });
+        let (mut app, _a, _d) = scenario(&[1], 1, 1);
+        set_phase(&mut app, CombatPhase::CloseQuarters, 17);
+        assert_eq!(
+            phase_text(&combat_of(&mut app)).as_deref(),
+            Some("Фаза: Ближний бой (осталось 17 ч.) | Фронт сужен на 50% | Урон повышен")
+        );
+    }
+
+    #[test]
+    fn urban_assault_weight_triples_and_phase_machine_follows_it() {
+        use CombatTactic::*;
+        assert_eq!(tactic_weight_scaled_for_test(Assault, true), 3);
+        assert_eq!(tactic_weight_scaled_for_test(Assault, false), 1);
+        // пул [атака, штурм, охват]: в городе штурм берёт 3 из 5 бросков
+        let pool = [Attack, Assault, Encirclement];
+        let assaults = (0..5u64)
+            .filter(|&r| pick_tactic_scaled(&pool, None, r, Some((Assault, URBAN_ASSAULT_WEIGHT_MULT))) == Assault)
+            .count();
+        assert_eq!(assaults, 3);
+        // переходы: штурм в городе включает/продлевает 24 часа; срок вышел без штурма — обычная фаза
+        use CombatPhase::*;
+        assert_eq!(next_cq_phase(Default, 0, Assault, true), (CloseQuarters, 24));
+        assert_eq!(next_cq_phase(CloseQuarters, 5, Assault, true), (CloseQuarters, 24), "штурм продлён");
+        assert_eq!(next_cq_phase(Default, 0, Assault, false), (Default, 0), "вне города штурм фазу не включает");
+        assert_eq!(next_cq_phase(CloseQuarters, 5, CloseQuartersAttack, true), (CloseQuarters, 5), "срок ещё идёт");
+        assert_eq!(next_cq_phase(CloseQuarters, 0, CloseQuartersAttack, true), (Default, 0), "срок вышел");
+        assert_eq!(next_cq_phase(CombatPhase::TacticalWithdrawal, 9, Assault, true), (CloseQuarters, 24), "штурм города приоритетнее отхода");
+    }
+
+    fn tactic_weight_scaled_for_test(tactic: CombatTactic, urban: bool) -> u64 {
+        let scale = urban.then_some((CombatTactic::Assault, URBAN_ASSAULT_WEIGHT_MULT));
+        crate::command::tactic_weight_scaled(tactic, None, scale)
+    }
+
+    #[test]
+    fn assault_in_an_urban_province_starts_close_quarters() {
+        let (mut app, _att, _def) = scenario(&[1], 1, 1);
+        app.insert_resource(ProvinceMap::with_terrain_for_test(&[(2, "urban")]));
+        app.add_event::<DailyTickEvent>().add_systems(Update, select_combat_tactics);
+        let mut started = false;
+        for day in 1..=60u32 {
+            set_phase(&mut app, CombatPhase::Default, 0);
+            app.world_mut().send_event(DailyTickEvent { day, month: 6, year: 1936 });
+            app.update();
+            let combat = combat_of(&mut app);
+            if combat.attacker_tactic == CombatTactic::Assault {
+                assert_eq!((combat.phase, combat.phase_hours_left), (CombatPhase::CloseQuarters, 24));
+                started = true;
+                break;
+            }
+            assert_ne!(combat.phase, CombatPhase::CloseQuarters, "без штурма уличного боя нет");
+        }
+        assert!(started, "в городе штурм встречается");
+    }
+
+    #[test]
+    fn open_ground_assault_never_starts_close_quarters() {
+        let (mut app, _att, _def) = scenario(&[1], 1, 1);
+        app.add_event::<DailyTickEvent>().add_systems(Update, select_combat_tactics);
+        for day in 1..=60u32 {
+            set_phase(&mut app, CombatPhase::Default, 0);
+            app.world_mut().send_event(DailyTickEvent { day, month: 6, year: 1936 });
+            app.update();
+            assert_ne!(combat_of(&mut app).phase, CombatPhase::CloseQuarters, "равнина: фазы ближнего боя нет");
+        }
+    }
+
+    #[test]
+    fn close_quarters_phase_selects_its_own_tactics() {
+        for day in 0..40 {
+            let (a, d) = choose_cq_tactics(5, day, 1, 101, None);
+            assert!(CQ_ATTACKER_TACTICS.contains(&a) && CQ_DEFENDER_TACTICS.contains(&d));
+            assert_eq!((a, d), choose_cq_tactics(5, day, 1, 101, None));
+        }
+    }
+
+    #[test]
+    fn close_quarters_halves_the_front_and_pushes_extra_divisions_to_reserve() {
+        let (mut app, att, _def) = scenario(&[1; 4], 2, 1);
+        tick(&mut app);
+        let states = |app: &App| -> Vec<CombatState> {
+            att.iter().map(|&e| app.world().get::<Division>(e).expect("дивизия").combat_state).collect()
+        };
+        assert_eq!(states(&app), vec![CombatState::Active; 4]);
+        set_phase(&mut app, CombatPhase::CloseQuarters, 24);
+        assert_eq!(combat_of(&mut app).effective_max_width(), 40);
+        tick(&mut app);
+        use CombatState::{Active, Reserve};
+        assert_eq!(states(&app), vec![Active, Active, Reserve, Reserve]);
+    }
+
+    #[test]
+    fn close_quarters_raises_damage_on_both_sides_and_counts_down() {
+        let losses = |phase: CombatPhase| {
+            let (mut app, att, def) = scenario(&[1], 1, 1);
+            set_phase(&mut app, phase, 24);
+            tick(&mut app);
+            let lost = |e: Entity| {
+                let d = app.world().get::<Division>(e).expect("дивизия");
+                d.max_org * 1000 - d.org_milli()
+            };
+            (lost(def[0]), lost(att[0]), combat_of(&mut app).phase_hours_left)
+        };
+        let (normal_def, normal_att, _) = losses(CombatPhase::Default);
+        let (cq_def, cq_att, hours) = losses(CombatPhase::CloseQuarters);
+        assert!(cq_def.abs_diff(normal_def * 115 / 100) <= 2, "{cq_def} против {}", normal_def * 115 / 100);
+        assert!(cq_att.abs_diff(normal_att * 115 / 100) <= 2, "{cq_att} против {}", normal_att * 115 / 100);
+        assert_eq!(hours, 23, "часовой декремент");
+    }
+
     #[test]
     fn planning_scales_effective_attack() {
         let templates = DivisionTemplates::default();
@@ -3918,12 +4143,12 @@ mod armor_and_speed_tests {
         let infantry = division(BASE_TEMPLATE); // броня 0, пробитие 4
         let panzer = division("Panzer-Division"); // броня 11, пробитие 16
         // пехота не пробивает броню (11 > 4): её удар по танкам вдвое слабее
-        assert_eq!(apply_armor_rule(1000, &infantry, &panzer), 500);
+        assert_eq!(apply_armor_rule(1000, &infantry, &panzer, false), 500);
         // танки отвечают на 50% сильнее (11 > 4)
-        assert_eq!(apply_armor_rule(1000, &panzer, &infantry), 1500);
+        assert_eq!(apply_armor_rule(1000, &panzer, &infantry, false), 1500);
         // пехота против пехоты и танки против танков (11 < 16) — без изменений
-        assert_eq!(apply_armor_rule(1000, &infantry, &infantry), 1000);
-        assert_eq!(apply_armor_rule(1000, &panzer, &panzer), 1000);
+        assert_eq!(apply_armor_rule(1000, &infantry, &infantry, false), 1000);
+        assert_eq!(apply_armor_rule(1000, &panzer, &panzer, false), 1000);
     }
 
     #[test]
@@ -3933,7 +4158,7 @@ mod armor_and_speed_tests {
         let mut b = division(BASE_TEMPLATE);
         (a.armor, a.piercing) = (50, 10);
         (b.armor, b.piercing) = (50, 10);
-        assert_eq!(apply_armor_rule(1000, &a, &b), 750);
+        assert_eq!(apply_armor_rule(1000, &a, &b, false), 750);
     }
 
     #[test]
@@ -4079,7 +4304,7 @@ mod terrain_tests {
         assert_eq!(parts(m("hills")), (25, 15, 0));
         assert_eq!(parts(m("mountain")), (50, 30, 20));
         assert_eq!(parts(m("marsh")), (20, 25, 30));
-        assert_eq!(parts(m("urban")), (30, 20, 0));
+        assert_eq!(parts(m("urban")), (30, 30, 20));
         // прочие типы и неизвестная местность — без модификаторов
         assert_eq!(parts(m("desert")), (0, 0, 0));
         assert_eq!(parts(terrain_modifiers(None)), (0, 0, 0));
