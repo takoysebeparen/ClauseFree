@@ -34,6 +34,35 @@ pub const SUPPORT_ARTILLERY: &str = "Арт";
 pub const SUPPORT_RECON: &str = "Разведка";
 const SUPPORT_LABELS: [&str; 3] = [SUPPORT_ENGINEERS, SUPPORT_ARTILLERY, SUPPORT_RECON];
 
+/// Тактический символ NATO дивизии на фишке карты.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NatoSymbol {
+    /// Пехота: косой крест X.
+    #[default]
+    Infantry,
+    /// Кавалерия: одна диагональная черта.
+    Cavalry,
+    /// Моторизованная пехота: крест с колёсами снизу.
+    Motorized,
+    /// Бронетехника: горизонтальный эллипс.
+    Armored,
+    /// Артиллерия: точка по центру.
+    Artillery,
+}
+
+impl NatoSymbol {
+    /// Название типа для интерфейса: `[NATO: Пехота]`.
+    pub fn label(self) -> &'static str {
+        match self {
+            NatoSymbol::Infantry => "Пехота",
+            NatoSymbol::Cavalry => "Кавалерия",
+            NatoSymbol::Motorized => "Мотопехота",
+            NatoSymbol::Armored => "Танки",
+            NatoSymbol::Artillery => "Артиллерия",
+        }
+    }
+}
+
 /// Тип батальона или роты обеспечения.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BattalionDef {
@@ -71,6 +100,18 @@ pub struct BattalionDef {
 }
 
 impl BattalionDef {
+    /// Символ батальона по его данным: танковое снаряжение -> бронетехника, орудия -> артиллерия,
+    /// скорость от 10.0 км/ч -> моторизованный, от 6.0 км/ч -> конный, иначе пехота.
+    pub fn nato_symbol(&self) -> NatoSymbol {
+        match self.equipment_needs.0 {
+            EquipmentType::LightTank | EquipmentType::MediumTank => NatoSymbol::Armored,
+            EquipmentType::Artillery => NatoSymbol::Artillery,
+            _ if self.speed_kph >= 100 => NatoSymbol::Motorized,
+            _ if self.speed_kph >= 60 => NatoSymbol::Cavalry,
+            _ => NatoSymbol::Infantry,
+        }
+    }
+
     /// Пехотный батальон: 1000 человек, 100 винтовок, 4.0 км/ч, без брони.
     pub fn infantry() -> Self {
         Self {
@@ -236,6 +277,8 @@ pub struct DivisionStats {
     pub river_penalty_reduction: u32,
     /// Роты обеспечения для интерфейса в порядке «Сапёры, Арт, Разведка».
     pub support: Vec<&'static str>,
+    /// Доминирующий символ NATO шаблона.
+    pub nato_symbol: NatoSymbol,
 }
 
 #[derive(Debug, Clone)]
@@ -290,6 +333,26 @@ impl DivisionTemplate {
             max_entrenchment: BASE_MAX_ENTRENCHMENT + max(|b| b.entrenchment_bonus),
             river_penalty_reduction: max(|b| b.river_penalty_reduction),
             support: SUPPORT_LABELS.into_iter().filter(|l| all.iter().any(|b| b.support_label == *l)).collect(),
+            nato_symbol: self.nato_symbol(),
+        }
+    }
+
+    /// Доминирующий символ по боевым батальонам (роты обеспечения не считаются): есть танки -> бронетехника;
+    /// артиллерия или моторизованные — от половины батальонов; конные — от половины; иначе пехота.
+    pub fn nato_symbol(&self) -> NatoSymbol {
+        let combat: Vec<NatoSymbol> = self.battalions.iter().filter(|b| !b.is_support).map(BattalionDef::nato_symbol).collect();
+        let total = combat.len();
+        let count = |symbol: NatoSymbol| combat.iter().filter(|&&s| s == symbol).count();
+        if count(NatoSymbol::Armored) > 0 {
+            NatoSymbol::Armored
+        } else if total > 0 && count(NatoSymbol::Artillery) * 2 > total {
+            NatoSymbol::Artillery
+        } else if total > 0 && count(NatoSymbol::Motorized) * 2 >= total {
+            NatoSymbol::Motorized
+        } else if total > 0 && count(NatoSymbol::Cavalry) * 2 >= total {
+            NatoSymbol::Cavalry
+        } else {
+            NatoSymbol::Infantry
         }
     }
 

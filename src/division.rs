@@ -20,7 +20,7 @@ use crate::colors::CountryColors;
 use crate::command::SKILL_BONUS_PCT;
 use crate::economy::{update_supply_network, ArmyExperience, EquipmentType, PlayerCountry, SupplyNetwork};
 use crate::oob::{resolve_placement, resolve_template, OobDivisions, Placement};
-use crate::units::{DivisionTemplate, DivisionTemplates, BASE_TEMPLATE, INFANTRY_SPEED_KPH};
+use crate::units::{DivisionTemplate, DivisionTemplates, NatoSymbol, BASE_TEMPLATE, INFANTRY_SPEED_KPH};
 #[cfg(test)]
 use crate::units::PLAIN_INFANTRY_TEMPLATE;
 use crate::map::{
@@ -50,7 +50,7 @@ const FLANK_WIDTH_BONUS: u32 = 40;
 /// Минимальный шанс (%) выхода резерва на линию за час; к нему добавляется 0..=3 по id дивизии (итого 2..=5%).
 const RESERVE_MIN_CHANCE_PCT: u32 = 2;
 
-const DIVISION_SIZE: Vec2 = Vec2::new(24.0, 14.0);
+const DIVISION_SIZE: Vec2 = Vec2::new(26.0, 18.0);
 /// Ширина полоски организации / прочности на фишке при 100%, пиксели.
 const BAR_MAX_WIDTH: f32 = 12.0;
 const ORG_BAR_COLOR: Color = Color::srgb(0.25, 0.6, 0.95);
@@ -106,6 +106,8 @@ pub struct Division {
     pub equipment_needs: BTreeMap<EquipmentType, u32>,
     /// Типы снаряжения, которых не хватило при последнем суточном пополнении (дефицит сдерживает рост прочности).
     pub equipment_shortage: BTreeSet<EquipmentType>,
+    /// Символ NATO на фишке: определяется шаблоном.
+    pub nato_symbol: NatoSymbol,
     /// Стартовый опыт дивизии из OOB (`start_experience_factor`), %; справочное значение.
     pub start_experience_pct: u32,
     /// Стартовая оснащённость из OOB (`start_equipment_factor`), %; справочное значение.
@@ -229,6 +231,7 @@ impl Division {
         self.max_entrenchment = stats.max_entrenchment;
         self.river_penalty_reduction = stats.river_penalty_reduction;
         self.support = stats.support;
+        self.nato_symbol = stats.nato_symbol;
     }
 
     /// Дивизия в полном составе; все характеристики считает `DivisionTemplate::calculate_stats()`.
@@ -260,6 +263,7 @@ impl Division {
             max_manpower: stats.total_manpower,
             equipment_needs: stats.equipment_needs,
             equipment_shortage: BTreeSet::new(),
+            nato_symbol: stats.nato_symbol,
             start_experience_pct: 0,
             start_equipment_pct: 100,
             org_frac: 0,
@@ -379,6 +383,104 @@ pub fn boxed_divisions<'a>(
     found.into_iter().map(|(_, e)| e).collect()
 }
 
+/// Штрих символа NATO на фишке (дочерний спрайт); пересоздаётся при смене шаблона.
+#[derive(Component)]
+struct NatoStroke;
+
+/// Какой символ сейчас нарисован на фишке (для перерисовки после переформирования).
+#[derive(Component)]
+struct NatoIcon(NatoSymbol);
+
+/// Отрезок символа в половинках пикселя относительно центра фишки: `(x1, y1, x2, y2)`; нулевая длина — точка.
+pub type StrokeHp = (i32, i32, i32, i32);
+
+/// cos и sin углов k * 30 градусов в тысячных долях (целые, без f32): вершины ломаной-эллипса.
+const TRIG_30: [(i32, i32); 12] = [
+    (1000, 0), (866, 500), (500, 866), (0, 1000), (-500, 866), (-866, 500),
+    (-1000, 0), (-866, -500), (-500, -866), (0, -1000), (500, -866), (866, -500),
+];
+
+/// Центр области символа над полосками, половинки пикселя.
+const SYMBOL_CENTER_HP: (i32, i32) = (0, 5);
+
+/// Штрихи символа NATO (целые половинки пикселя): X — две диагонали, кавалерия — одна, мотопехота — X и два
+/// колеса, бронетехника — 12-угольник-эллипс, артиллерия — точка.
+pub fn symbol_strokes(symbol: NatoSymbol) -> Vec<StrokeHp> {
+    let (cx, cy) = SYMBOL_CENTER_HP;
+    match symbol {
+        NatoSymbol::Infantry => vec![(cx - 18, cy - 8, cx + 18, cy + 8), (cx - 18, cy + 8, cx + 18, cy - 8)],
+        NatoSymbol::Cavalry => vec![(cx - 18, cy - 8, cx + 18, cy + 8)],
+        NatoSymbol::Motorized => vec![
+            (cx - 18, cy - 4, cx + 18, cy + 10),
+            (cx - 18, cy + 10, cx + 18, cy - 4),
+            (cx - 8, cy - 7, cx - 8, cy - 7),
+            (cx + 8, cy - 7, cx + 8, cy - 7),
+        ],
+        NatoSymbol::Armored => {
+            let (rx, ry) = (18, 8);
+            (0..12)
+                .map(|k| {
+                    let (c1, s1) = TRIG_30[k];
+                    let (c2, s2) = TRIG_30[(k + 1) % 12];
+                    (cx + rx * c1 / 1000, cy + ry * s1 / 1000, cx + rx * c2 / 1000, cy + ry * s2 / 1000)
+                })
+                .collect()
+        }
+        NatoSymbol::Artillery => vec![(cx, cy, cx, cy)],
+    }
+}
+
+/// Цвет линий символа: чёрный на светлой нации, белый на тёмной (яркость в целых: R*299 + G*587 + B*114).
+pub fn symbol_line_color(nation_rgb: [u8; 3]) -> Color {
+    let luma = (u32::from(nation_rgb[0]) * 299 + u32::from(nation_rgb[1]) * 587 + u32::from(nation_rgb[2]) * 114) / 1000;
+    if luma > 128 { Color::srgb(0.02, 0.02, 0.02) } else { Color::srgb(0.98, 0.98, 0.98) }
+}
+
+/// Спавнит штрихи символа как дочерние спрайты фишки; масштабируются вместе с ней (billboard).
+fn spawn_nato_strokes(parent: &mut ChildBuilder, symbol: NatoSymbol, color: Color) {
+    for (x1, y1, x2, y2) in symbol_strokes(symbol) {
+        let (a, b) = (Vec2::new(x1 as f32 / 2.0, y1 as f32 / 2.0), Vec2::new(x2 as f32 / 2.0, y2 as f32 / 2.0));
+        let delta = b - a;
+        let length = delta.length();
+        // точка (нулевая длина) — квадрат 3x3, отрезок — тонкий прямоугольник вдоль линии
+        let (size, angle) = if length < 0.01 { (Vec2::splat(3.0), 0.0) } else { (Vec2::new(length + 1.0, 1.0), delta.y.atan2(delta.x)) };
+        parent.spawn((
+            SpriteBundle {
+                sprite: Sprite { color, custom_size: Some(size), ..default() },
+                transform: Transform {
+                    translation: ((a + b) * 0.5).extend(0.25),
+                    rotation: Quat::from_rotation_z(angle),
+                    ..default()
+                },
+                ..default()
+            },
+            NatoStroke,
+        ));
+    }
+}
+
+/// Перерисовывает значок, если шаблон дивизии (а с ним символ) сменился: старые штрихи удаляются.
+fn update_nato_icons(
+    mut commands: Commands,
+    colors: Res<CountryColors>,
+    mut divisions: Query<(Entity, &Division, &mut NatoIcon, Option<&Children>)>,
+    strokes: Query<(), With<NatoStroke>>,
+) {
+    for (entity, d, mut icon, children) in &mut divisions {
+        if icon.0 == d.nato_symbol {
+            continue;
+        }
+        for &child in children.into_iter().flatten() {
+            if strokes.get(child).is_ok() {
+                commands.entity(child).despawn();
+            }
+        }
+        let color = symbol_line_color(colors.map_rgb(&d.owner));
+        commands.entity(entity).with_children(|p| spawn_nato_strokes(p, d.nato_symbol, color));
+        icon.0 = d.nato_symbol;
+    }
+}
+
 /// Полоска организации на фишке (дочерний спрайт).
 #[derive(Component)]
 struct OrgBar;
@@ -430,6 +532,11 @@ pub fn average_percent(values: &[u32]) -> u32 {
         return 0;
     }
     (values.iter().map(|&v| u64::from(v)).sum::<u64>() / values.len() as u64) as u32
+}
+
+/// Бейдж типа дивизии в инспекторе: `[NATO: Пехота]`.
+pub fn nato_badge_text(symbol: NatoSymbol) -> String {
+    format!("[NATO: {}]", symbol.label())
 }
 
 /// Значок количества дивизий в стеке в квадратной рамке: `[3]`.
@@ -617,6 +724,7 @@ impl Plugin for DivisionPlugin {
                     scale_divisions_to_zoom,
                     update_selection_visual,
                     update_stack_visuals,
+                    update_nato_icons,
                 )
                     .chain()
                     .after(pick_province)
@@ -636,9 +744,12 @@ impl Plugin for DivisionPlugin {
 // ---------------------------------------------------------------------------
 
 fn spawn_division_entity(commands: &mut Commands, division: Division, center: Vec2, colors: &CountryColors) {
-    let [r, g, b] = colors.map_rgb(&division.owner);
+    let rgb = colors.map_rgb(&division.owner);
+    let [r, g, b] = rgb;
+    let symbol = division.nato_symbol;
+    let line_color = symbol_line_color(rgb);
 
-    // Корень — рамка; внутри тёмная заливка и цветной бейдж страны.
+    // Корень — рамка; внутри заливка цветом нации, символ NATO, тёмная подложка и полоски орг. / прочности.
     commands
         .spawn((
             SpriteBundle {
@@ -647,36 +758,35 @@ fn spawn_division_entity(commands: &mut Commands, division: Division, center: Ve
                 ..default()
             },
             division,
+            NatoIcon(symbol),
         ))
         .with_children(|p| {
             p.spawn(SpriteBundle {
                 sprite: Sprite {
-                    color: FILL_COLOR,
+                    color: Color::srgb_u8(r, g, b),
                     custom_size: Some(DIVISION_SIZE - Vec2::splat(2.0)),
                     ..default()
                 },
                 transform: Transform::from_xyz(0.0, 0.0, 0.1),
                 ..default()
             });
+            // подложка под полоски (нижние 5 px)
             p.spawn(SpriteBundle {
-                sprite: Sprite {
-                    color: Color::srgb_u8(r, g, b),
-                    custom_size: Some(Vec2::new(8.0, 8.0)),
-                    ..default()
-                },
-                transform: Transform::from_xyz(-6.0, 0.0, 0.2),
+                sprite: Sprite { color: FILL_COLOR, custom_size: Some(Vec2::new(24.0, 5.0)), ..default() },
+                transform: Transform::from_xyz(0.0, -5.5, 0.2),
                 ..default()
             });
+            spawn_nato_strokes(p, symbol, line_color);
             // полоски: организация (сверху) и прочность (снизу), растут вправо от левого края
-            for (y, color, is_org) in [(2.5_f32, ORG_BAR_COLOR, true), (-2.5_f32, STRENGTH_BAR_COLOR, false)] {
+            for (y, color, is_org) in [(-4.25_f32, ORG_BAR_COLOR, true), (-6.75_f32, STRENGTH_BAR_COLOR, false)] {
                 let bar = SpriteBundle {
                     sprite: Sprite {
                         color,
-                        custom_size: Some(Vec2::new(BAR_MAX_WIDTH, 3.0)),
+                        custom_size: Some(Vec2::new(BAR_MAX_WIDTH, 2.0)),
                         anchor: Anchor::CenterLeft,
                         ..default()
                     },
-                    transform: Transform::from_xyz(-1.0, y, 0.3),
+                    transform: Transform::from_xyz(-6.0, y, 0.3),
                     ..default()
                 };
                 if is_org {
@@ -2057,7 +2167,7 @@ fn update_stack_visuals(
             .copied()
             .unwrap_or((percent(d.current_org, d.max_org), percent(d.current_strength, d.max_strength)));
         let value = if is_org { org } else { hp };
-        let size = Some(Vec2::new(BAR_MAX_WIDTH * value as f32 / 100.0, 3.0));
+        let size = Some(Vec2::new(BAR_MAX_WIDTH * value as f32 / 100.0, 2.0));
         if sprite.custom_size != size {
             sprite.custom_size = size;
         }
@@ -2333,6 +2443,7 @@ fn division_info_ui(
             ui.horizontal(|ui| {
                 flags.show(ui, &d.owner, &colors);
                 ui.label(format!("Дивизия: \"{}\"", d.name));
+                ui.label(nato_badge_text(d.nato_symbol));
                 ui.label(egui::RichText::new(format!("[{}]", d.owner)).color(owner_color).strong());
             });
             // Стек провинции: кликабельные строки; ПКМ командует всей группой, пока она выбрана целиком
@@ -3933,5 +4044,130 @@ mod box_select_tests {
         let empty = SelectedDivisions::default();
         let single = app.world_mut().run_system_once(move |q: Query<(Entity, &Division)>| command_targets(&empty, &q, b, false));
         assert_eq!(single, vec![b]);
+    }
+}
+
+#[cfg(test)]
+mod nato_tests {
+    use super::*;
+    use crate::units::BattalionDef;
+    use bevy::ecs::system::RunSystemOnce;
+
+    fn symbol_of(name: &str) -> NatoSymbol {
+        DivisionTemplates::default().get_or_base(name).nato_symbol()
+    }
+
+    #[test]
+    fn real_templates_get_their_symbols() {
+        assert_eq!(symbol_of("Infanterie-Division"), NatoSymbol::Infantry, "9 пехотных; артиллерия поддержки не в счёт");
+        assert_eq!(symbol_of("Panzer-Division"), NatoSymbol::Armored, "есть лёгкие танки");
+        assert_eq!(symbol_of("Infanterie-Division (mot.)"), NatoSymbol::Motorized);
+        // неизвестное имя -> базовая пехота
+        assert_eq!(symbol_of("Gebirgs-Brigade"), NatoSymbol::Infantry);
+    }
+
+    #[test]
+    fn stats_and_division_carry_the_template_symbol() {
+        let templates = DivisionTemplates::default();
+        let panzer = templates.get_or_base("Panzer-Division");
+        assert_eq!(panzer.calculate_stats().nato_symbol, NatoSymbol::Armored);
+        let mut d = Division::from_template(1, "d".into(), "GER".into(), 1, "Panzer-Division".into(), panzer);
+        assert_eq!(d.nato_symbol, NatoSymbol::Armored);
+        // переформирование меняет символ вместе с шаблоном
+        d.refit(templates.get_or_base("Infanterie-Division"));
+        assert_eq!(d.nato_symbol, NatoSymbol::Infantry);
+    }
+
+    fn template_of(battalions: Vec<BattalionDef>) -> DivisionTemplate {
+        DivisionTemplate { name: "t".into(), battalions }
+    }
+
+    #[test]
+    fn symbol_rules_cover_cavalry_artillery_and_mixes() {
+        let horse = BattalionDef { speed_kph: 80, ..BattalionDef::infantry() };
+        assert_eq!(horse.nato_symbol(), NatoSymbol::Cavalry);
+        assert_eq!(template_of(vec![horse.clone(); 4]).nato_symbol(), NatoSymbol::Cavalry);
+        let gun = BattalionDef { equipment_needs: (EquipmentType::Artillery, 24), ..BattalionDef::infantry() };
+        assert_eq!(template_of(vec![gun.clone(), gun.clone(), BattalionDef::infantry()]).nato_symbol(), NatoSymbol::Artillery);
+        // пехота с одним орудийным батальоном — всё ещё пехота
+        assert_eq!(template_of(vec![gun, BattalionDef::infantry(), BattalionDef::infantry()]).nato_symbol(), NatoSymbol::Infantry);
+        // один танковый батальон делает дивизию бронетанковой
+        assert_eq!(
+            template_of(vec![BattalionDef::light_tank(), BattalionDef::infantry(), BattalionDef::infantry()]).nato_symbol(),
+            NatoSymbol::Armored
+        );
+        // половина моторизованных — мотопехота, меньше — пехота
+        let mot = BattalionDef::motorized();
+        assert_eq!(template_of(vec![mot.clone(), BattalionDef::infantry()]).nato_symbol(), NatoSymbol::Motorized);
+        assert_eq!(template_of(vec![mot, BattalionDef::infantry(), BattalionDef::infantry()]).nato_symbol(), NatoSymbol::Infantry);
+        // пустой шаблон и одни роты поддержки не паникуют
+        assert_eq!(template_of(vec![]).nato_symbol(), NatoSymbol::Infantry);
+        assert_eq!(template_of(vec![BattalionDef::engineers()]).nato_symbol(), NatoSymbol::Infantry);
+    }
+
+    #[test]
+    fn strokes_match_each_symbol_and_stay_inside_the_chip() {
+        assert_eq!(symbol_strokes(NatoSymbol::Infantry).len(), 2, "крест X");
+        assert_eq!(symbol_strokes(NatoSymbol::Cavalry).len(), 1, "одна черта");
+        assert_eq!(symbol_strokes(NatoSymbol::Motorized).len(), 4, "X и два колеса");
+        assert_eq!(symbol_strokes(NatoSymbol::Armored).len(), 12, "эллипс из 12 звеньев");
+        let dot = symbol_strokes(NatoSymbol::Artillery);
+        assert_eq!(dot.len(), 1);
+        assert_eq!((dot[0].0, dot[0].1), (dot[0].2, dot[0].3), "точка");
+        // всё внутри внутренней рамки фишки и над подложкой полосок (y > -3 px)
+        let half_w = DIVISION_SIZE.x as i32 - 2;
+        for symbol in [NatoSymbol::Infantry, NatoSymbol::Cavalry, NatoSymbol::Motorized, NatoSymbol::Armored, NatoSymbol::Artillery] {
+            for (x1, y1, x2, y2) in symbol_strokes(symbol) {
+                for (x, y) in [(x1, y1), (x2, y2)] {
+                    assert!(x.abs() <= half_w, "{symbol:?}: x = {x} hp");
+                    assert!(y > -6 && y <= DIVISION_SIZE.y as i32 - 3, "{symbol:?}: y = {y} hp");
+                }
+            }
+        }
+        // ломаная эллипса замкнута
+        let ring = symbol_strokes(NatoSymbol::Armored);
+        for k in 0..12 {
+            assert_eq!((ring[k].2, ring[k].3), (ring[(k + 1) % 12].0, ring[(k + 1) % 12].1));
+        }
+    }
+
+    #[test]
+    fn line_color_contrasts_with_the_nation_color() {
+        assert_eq!(symbol_line_color([240, 240, 220]), Color::srgb(0.02, 0.02, 0.02), "светлая нация — чёрные линии");
+        assert_eq!(symbol_line_color([20, 40, 90]), Color::srgb(0.98, 0.98, 0.98), "тёмная — белые");
+    }
+
+    #[test]
+    fn inspector_badge_text() {
+        assert_eq!(nato_badge_text(NatoSymbol::Infantry), "[NATO: Пехота]");
+        assert_eq!(nato_badge_text(NatoSymbol::Armored), "[NATO: Танки]");
+        assert_eq!(nato_badge_text(NatoSymbol::Motorized), "[NATO: Мотопехота]");
+    }
+
+    fn strokes_of(app: &mut App, root: Entity) -> usize {
+        let mut q = app.world_mut().query_filtered::<&Parent, With<NatoStroke>>();
+        q.iter(app.world()).filter(|p| p.get() == root).count()
+    }
+
+    #[test]
+    fn chip_is_drawn_with_its_symbol_and_redrawn_after_refit() {
+        let mut app = App::new();
+        app.insert_resource(CountryColors::default());
+        let templates = DivisionTemplates::default();
+        let division = Division::from_template(1, "d".into(), "GER".into(), 1, "Panzer-Division".into(), templates.get_or_base("Panzer-Division"));
+        app.world_mut().run_system_once(move |mut commands: Commands, colors: Res<CountryColors>| {
+            spawn_division_entity(&mut commands, division.clone(), Vec2::ZERO, &colors);
+        });
+        let root = app.world_mut().query_filtered::<Entity, With<Division>>().single(app.world());
+        assert_eq!(strokes_of(&mut app, root), 12, "танковый эллипс");
+        // переформирование в пехотную дивизию: значок меняется на крест X
+        let infantry = templates.get_or_base("Infanterie-Division").clone();
+        app.world_mut().get_mut::<Division>(root).unwrap().refit(&infantry);
+        app.world_mut().run_system_once(update_nato_icons);
+        assert_eq!(strokes_of(&mut app, root), 2, "старые штрихи удалены, нарисован крест");
+        assert_eq!(app.world().get::<NatoIcon>(root).unwrap().0, NatoSymbol::Infantry);
+        // без изменений ничего не пересоздаётся
+        app.world_mut().run_system_once(update_nato_icons);
+        assert_eq!(strokes_of(&mut app, root), 2);
     }
 }
