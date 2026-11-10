@@ -22,7 +22,8 @@ use crate::command::{
     SKILL_BONUS_PCT, WITHDRAWAL_ORG_DAMAGE_PCT, WITHDRAWAL_PHASE_HOURS, WITHDRAWAL_WIDTH_DIVISOR,
     pick_tactic_boosted, pick_tactic_scaled, BRIDGE_ATTACKER_TACTICS, BRIDGE_DEFENDER_TACTICS, BRIDGE_PHASE_HOURS,
     CLOSE_QUARTERS_DAMAGE_PCT, CLOSE_QUARTERS_PHASE_HOURS, CQ_ATTACKER_TACTICS, CQ_DEFENDER_TACTICS,
-    URBAN_ASSAULT_WEIGHT_MULT,
+    URBAN_ASSAULT_WEIGHT_MULT, ATTACKER_TACTICS_WITH_BREAKTHROUGH, BREAKTHROUGH_PHASE_HOURS,
+    DEFENDER_TACTICS_WITH_AMBUSH, breakthrough_available,
 };
 use crate::diplomacy::{check_entry, DiplomacyRegistry};
 use crate::economy::{update_supply_network, ArmyExperience, EquipmentType, PlayerCountry, SupplyNetwork};
@@ -351,7 +352,7 @@ impl ActiveCombat {
     /// Лимит ширины линии каждой стороны с учётом фазы: при отходе вдвое меньше.
     pub fn effective_max_width(&self) -> u32 {
         match self.phase {
-            CombatPhase::Default | CombatPhase::Bridge => self.max_width,
+            CombatPhase::Default | CombatPhase::Bridge | CombatPhase::Breakthrough => self.max_width,
             CombatPhase::TacticalWithdrawal | CombatPhase::CloseQuarters => self.max_width / WITHDRAWAL_WIDTH_DIVISOR,
         }
     }
@@ -1616,13 +1617,33 @@ pub fn choose_tactics(
     defender_key: u32,
     recon_edge: Option<bool>,
     urban: bool,
+    breakthrough: bool,
 ) -> (CombatTactic, CombatTactic) {
     let scale = urban.then_some((CombatTactic::Assault, URBAN_ASSAULT_WEIGHT_MULT));
-    choose_from_pools(
-        (combat_bits, day, attacker_key, defender_key, recon_edge),
-        (&ATTACKER_TACTICS, &DEFENDER_TACTICS, scale),
-        [1, 2, 3, 4],
-    )
+    // Прорыв входит в пул атакующих только при выполнении условий, а засада — как контр-пик обороны
+    let (attackers, defenders): (&[CombatTactic], &[CombatTactic]) = if breakthrough {
+        (&ATTACKER_TACTICS_WITH_BREAKTHROUGH, &DEFENDER_TACTICS_WITH_AMBUSH)
+    } else {
+        (&ATTACKER_TACTICS, &DEFENDER_TACTICS)
+    };
+    choose_from_pools((combat_bits, day, attacker_key, defender_key, recon_edge), (attackers, defenders, scale), [1, 2, 3, 4])
+}
+
+/// Суточный переход в фазу прорыва: не парированный прорыв включает (или продлевает) фазу на 24 часа; по истечении
+/// срока без нового прорыва — обычная фаза; пока срок идёт, фаза доживает своё время.
+pub fn next_breakthrough_phase(
+    phase: CombatPhase,
+    hours_left: u32,
+    attacker: CombatTactic,
+    attacker_countered: bool,
+) -> (CombatPhase, u32) {
+    if attacker == CombatTactic::Breakthrough && !attacker_countered {
+        (CombatPhase::Breakthrough, BREAKTHROUGH_PHASE_HOURS)
+    } else if phase == CombatPhase::Breakthrough && hours_left == 0 {
+        (CombatPhase::Default, 0)
+    } else {
+        (phase, hours_left)
+    }
 }
 
 /// Выбор тактик в фазе ближнего боя: атака в упор или продление штурма против обороны или разрыва дистанции.
@@ -1765,7 +1786,31 @@ fn select_combat_tactics(
             } else if combat.phase == CombatPhase::CloseQuarters {
                 choose_cq_tactics(entity.to_bits(), day, key_of(&combat.attackers), key_of(&combat.defenders), edge)
             } else {
-                choose_tactics(entity.to_bits(), day, key_of(&combat.attackers), key_of(&combat.defenders), edge, urban)
+                // Условия прорыва: средняя твёрдость атакующих или превосходство командующего
+                let attackers: Vec<&Division> = combat.attackers.iter().filter_map(|&e| divisions.get(e).ok()).collect();
+                let defenders: Vec<&Division> = combat.defenders.iter().filter_map(|&e| divisions.get(e).ok()).collect();
+                let avg_hardness = if attackers.is_empty() {
+                    0
+                } else {
+                    attackers.iter().map(|d| d.hardness).sum::<u32>() / attackers.len() as u32
+                };
+                let skill = |side: &[&Division]| side.iter().map(|d| d.command_attack_skill + d.command_defense_skill).max().unwrap_or(0);
+                let breakthrough = breakthrough_available(
+                    avg_hardness,
+                    skill(&attackers),
+                    skill(&defenders),
+                    key_of(&combat.attackers),
+                    key_of(&combat.defenders),
+                );
+                choose_tactics(
+                    entity.to_bits(),
+                    day,
+                    key_of(&combat.attackers),
+                    key_of(&combat.defenders),
+                    edge,
+                    urban,
+                    breakthrough,
+                )
             };
             let (att_countered, def_countered) = resolve_counters(attacker, defender);
             combat.attacker_tactic = attacker;
@@ -1783,6 +1828,8 @@ fn select_combat_tactics(
                 let (phase, hours_left) = next_phase(combat.phase, combat.phase_hours_left, defender);
                 // штурм города имеет приоритет над отходом: уличный бой сменяет прочие фазы
                 let (phase, hours_left) = next_cq_phase(phase, hours_left, attacker, urban);
+                // успешный прорыв сменяет отход, но не уличный бой (штурм города и прорыв не выбираются вместе)
+                let (phase, hours_left) = next_breakthrough_phase(phase, hours_left, attacker, combat.is_attacker_countered);
                 combat.phase = phase;
                 combat.phase_hours_left = hours_left;
             }
@@ -1817,6 +1864,11 @@ pub fn phase_text(combat: &ActiveCombat) -> Option<String> {
         )),
         CombatPhase::CloseQuarters => Some(format!(
             "Фаза: {} (осталось {} ч.) | Фронт сужен на 50% | Урон повышен",
+            combat.phase.title(),
+            combat.phase_hours_left
+        )),
+        CombatPhase::Breakthrough => Some(format!(
+            "Фаза: {} (осталось {} ч.) | Окопанность врага урезана на 50%",
             combat.phase.title(),
             combat.phase_hours_left
         )),
@@ -1917,6 +1969,8 @@ pub struct HitContext {
     pub tactic_attack_pct: u32,
     /// Бонус к защите цели от её тактики, %.
     pub tactic_defense_pct: u32,
+    /// Делитель окопанности цели: 1 в обычном бою, 2 в фазе прорыва (укрепления прорваны).
+    pub entrenchment_divisor: u32,
 }
 
 impl HitContext {
@@ -1929,7 +1983,13 @@ impl HitContext {
         air_defense_penalty: 0,
         tactic_attack_pct: 0,
         tactic_defense_pct: 0,
+        entrenchment_divisor: 1,
     };
+
+    /// Делит окопанность цели (фаза прорыва): эффективная окопанность = окопанность / делитель.
+    pub fn with_entrenchment_divisor(self, divisor: u32) -> Self {
+        HitContext { entrenchment_divisor: divisor.max(1), ..self }
+    }
 
     /// Добавляет эффекты тактик: бонус атаки бьющего и бонус защиты цели, %.
     pub fn with_tactics(self, attack_pct: u32, defense_pct: u32) -> Self {
@@ -1995,7 +2055,8 @@ fn combat_bp_ctx(att: &Division, def: &Division, planning: u32, ctx: HitContext)
     // Опыт обороняющейся дивизии масштабирует защиту так же, как атаку
     let base_defense = base_defense * def.experience_multiplier_pct() / 100;
     // Окопанность: +2% защиты за пункт (у наступающих она всегда 0 — марш её сбрасывает)
-    let mut defense = base_defense * (100 + def.entrenchment.min(def.max_entrenchment) * 2) / 100;
+    let entrenchment = def.entrenchment.min(def.max_entrenchment) / ctx.entrenchment_divisor.max(1);
+    let mut defense = base_defense * (100 + entrenchment * 2) / 100;
     defense = defense * (100 + def.command_defense_skill * SKILL_BONUS_PCT) / 100;
     if def.over_command_limit {
         defense = defense * 50 / 100;
@@ -2316,7 +2377,8 @@ fn resolve_combats(
                         !state.bridge_held && striker.movement.is_some_and(|m| rivers.crosses(m.from, province));
                     let ctx = HitContext::for_attack(&terrain, striker, over_river)
                         .with_air(air_attack_bonus_pct(att_air), air_defense_penalty_pct(def_air))
-                        .with_tactics(att_mods.attack_pct, def_mods.defense_pct);
+                        .with_tactics(att_mods.attack_pct, def_mods.defense_pct)
+                        .with_entrenchment_divisor(if state.phase == CombatPhase::Breakthrough { 2 } else { 1 });
                     // Наступающая дивизия получает бонус планирования к атаке
                     let bp = combat_bp_ctx(striker, target, striker.planning, ctx);
                     // Броня меняет урон и по организации, и по прочности; разведка добавляет +5%
@@ -3553,23 +3615,23 @@ mod tests {
     #[test]
     fn tactic_choice_is_deterministic_and_respects_side_pools() {
         // одни и те же входы -> один и тот же выбор
-        let first = choose_tactics(42, 13_000, 7, 101, None, false);
-        assert_eq!(first, choose_tactics(42, 13_000, 7, 101, None, false));
+        let first = choose_tactics(42, 13_000, 7, 101, None, false, false);
+        assert_eq!(first, choose_tactics(42, 13_000, 7, 101, None, false, false));
         // тактики сторон из своих наборов
         let mut seen_attackers = BTreeSet::new();
         let mut seen_defenders = BTreeSet::new();
         for day in 0..60 {
-            let (a, d) = choose_tactics(42, day, 7, 101, None, false);
+            let (a, d) = choose_tactics(42, day, 7, 101, None, false, false);
             assert!(ATTACKER_TACTICS.contains(&a) && DEFENDER_TACTICS.contains(&d));
             seen_attackers.insert(a);
             seen_defenders.insert(d);
             // при разведке у атакующих порядок выбора другой, но наборы те же
-            let (a2, d2) = choose_tactics(42, day, 7, 101, Some(true), false);
+            let (a2, d2) = choose_tactics(42, day, 7, 101, Some(true), false, false);
             assert!(ATTACKER_TACTICS.contains(&a2) && DEFENDER_TACTICS.contains(&d2));
         }
         assert_eq!((seen_attackers.len(), seen_defenders.len()), (3, 3), "за два месяца встречаются все тактики");
         // другой бой или другой командующий дают другую последовательность
-        let sequence = |bits: u64, key: u32| (0..40).map(|day| choose_tactics(bits, day, key, 101, None, false)).collect::<Vec<_>>();
+        let sequence = |bits: u64, key: u32| (0..40).map(|day| choose_tactics(bits, day, key, 101, None, false, false)).collect::<Vec<_>>();
         assert_ne!(sequence(42, 7), sequence(43, 7));
         assert_ne!(sequence(42, 7), sequence(42, 8));
     }
@@ -4086,6 +4148,147 @@ mod tests {
         assert!(cq_def.abs_diff(normal_def * 115 / 100) <= 2, "{cq_def} против {}", normal_def * 115 / 100);
         assert!(cq_att.abs_diff(normal_att * 115 / 100) <= 2, "{cq_att} против {}", normal_att * 115 / 100);
         assert_eq!(hours, 23, "часовой декремент");
+    }
+
+    #[test]
+    fn breakthrough_requires_armor_or_a_better_commander() {
+        use crate::command::breakthrough_available as available;
+        // танковый клин: твёрдость выше 50% — доступен даже без командиров
+        assert!(available(60, 0, 0, 1, 101), "бронетехника");
+        assert!(available(51, 0, 0, 1, 101));
+        // граница: ровно 50% — ещё не клин
+        assert!(!available(50, 0, 0, 1, 101));
+        // чистая пехота (0%) и равные командиры при меньшем id генерала — недоступен
+        assert!(!available(0, 0, 0, 1, 101), "пехота без преимущества командира");
+        assert!(!available(0, 3, 5, 1, 101), "командир слабее");
+        // командир сильнее — доступен и пехоте
+        assert!(available(0, 6, 5, 1, 101));
+        // при равных навыках решает больший id ведущего генерала
+        assert!(available(0, 4, 4, 200, 101));
+        assert!(!available(0, 4, 4, 100, 101));
+    }
+
+    #[test]
+    fn pure_infantry_never_picks_breakthrough_but_armor_does() {
+        use CombatTactic::*;
+        // пул без прорыва: ни прорыва, ни засады
+        for day in 0..200 {
+            let (a, d) = choose_tactics(77, day, 1, 101, None, false, false);
+            assert!(a != Breakthrough && d != Ambush);
+        }
+        // пул с прорывом: оба появляются, остальные тактики остаются
+        let (mut seen_breakthrough, mut seen_ambush, mut seen_assault) = (false, false, false);
+        for day in 0..300 {
+            let (a, d) = choose_tactics(77, day, 1, 101, None, false, true);
+            seen_breakthrough |= a == Breakthrough;
+            seen_ambush |= d == Ambush;
+            seen_assault |= a == Assault;
+            assert!(ATTACKER_TACTICS_WITH_BREAKTHROUGH.contains(&a) && DEFENDER_TACTICS_WITH_AMBUSH.contains(&d));
+        }
+        assert!(seen_breakthrough && seen_ambush && seen_assault);
+    }
+
+    #[test]
+    fn daily_selection_blocks_breakthrough_for_infantry_and_allows_it_for_armor() {
+        use CombatTactic::*;
+        // пехота (твёрдость 0, командиров нет, id атакующего меньше): прорыв никогда не выбирается
+        let (mut app, _att, _def) = scenario(&[1; 2], 2, 1);
+        app.add_event::<DailyTickEvent>().add_systems(Update, select_combat_tactics);
+        for day in 1..=120u32 {
+            app.world_mut().send_event(DailyTickEvent { day, month: 7, year: 1936 });
+            app.update();
+            let combat = combat_of(&mut app);
+            assert!(combat.attacker_tactic != Breakthrough && combat.defender_tactic != Ambush, "день {day}");
+        }
+        // танковый клин: твёрдость 60% у атакующих
+        let (mut app, att, _def) = scenario(&[1; 2], 2, 1);
+        for &e in &att {
+            app.world_mut().get_mut::<Division>(e).expect("дивизия").hardness = 60;
+        }
+        app.add_event::<DailyTickEvent>().add_systems(Update, select_combat_tactics);
+        let (mut free, mut parried) = (false, false);
+        for day in 1..=300u32 {
+            set_phase(&mut app, CombatPhase::Default, 0);
+            app.world_mut().send_event(DailyTickEvent { day, month: 7, year: 1936 });
+            app.update();
+            let combat = combat_of(&mut app);
+            if combat.attacker_tactic == Breakthrough {
+                if combat.is_attacker_countered {
+                    assert_ne!(combat.phase, CombatPhase::Breakthrough, "парированный прорыв фазу не включает");
+                    parried = true;
+                } else {
+                    assert_eq!((combat.phase, combat.phase_hours_left), (CombatPhase::Breakthrough, 24));
+                    free = true;
+                }
+            }
+        }
+        assert!(free && parried, "встречаются оба исхода: {free} / {parried}");
+    }
+
+    #[test]
+    fn ambush_parries_breakthrough() {
+        use CombatTactic::*;
+        assert_eq!(Breakthrough.counter_tactic(), Some(Ambush));
+        assert_eq!(Ambush.counter_tactic(), None);
+        assert_eq!(resolve_counters(Breakthrough, Ambush), (true, false));
+        assert_eq!(resolve_counters(Breakthrough, Defend), (false, false));
+        assert_eq!((Breakthrough.title(), Ambush.title()), ("Прорыв", "Засада"));
+        // прорыв без парирования: +25% атаки, защитник бьёт на 15% слабее
+        assert_eq!(side_mods(Breakthrough, Defend, true), crate::command::TacticMods { attack_pct: 25, defense_pct: 0, damage_pct: 100 });
+        assert_eq!(side_mods(Breakthrough, Defend, false), crate::command::TacticMods { attack_pct: 0, defense_pct: 5, damage_pct: 85 });
+        // засада: бонус прорыва пропал, защита +25%, парирование даёт +25% урона
+        assert_eq!(side_mods(Breakthrough, Ambush, true), crate::command::TacticMods { attack_pct: 0, defense_pct: 0, damage_pct: 100 });
+        assert_eq!(side_mods(Breakthrough, Ambush, false), crate::command::TacticMods { attack_pct: 0, defense_pct: 25, damage_pct: 125 });
+    }
+
+    #[test]
+    fn breakthrough_phase_table() {
+        use CombatPhase::*;
+        use CombatTactic as T;
+        assert_eq!(next_breakthrough_phase(Default, 0, T::Breakthrough, false), (Breakthrough, 24));
+        assert_eq!(next_breakthrough_phase(Breakthrough, 3, T::Breakthrough, false), (Breakthrough, 24), "продлён");
+        assert_eq!(next_breakthrough_phase(Default, 0, T::Breakthrough, true), (Default, 0), "парирован");
+        assert_eq!(next_breakthrough_phase(Breakthrough, 6, T::Assault, false), (Breakthrough, 6), "срок идёт");
+        assert_eq!(next_breakthrough_phase(Breakthrough, 0, T::Assault, false), (Default, 0), "срок вышел");
+        assert_eq!(next_breakthrough_phase(CloseQuarters, 5, T::Attack, false), (CloseQuarters, 5), "чужую фазу не трогает");
+    }
+
+    #[test]
+    fn breakthrough_phase_halves_the_defenders_entrenchment_bonus() {
+        // окопанность 10 даёт +20% защиты: 225 * 120 / 100 = 270 -> 800 * 90 / 360 = 200
+        let attacker = make_neutral(1);
+        let mut dug_in = make_neutral(2);
+        dug_in.entrenchment = 10;
+        assert_eq!(combat_bp_ctx(&attacker, &dug_in, 0, HitContext::NONE), 200);
+        // в прорыве окопанность 10 / 2 = 5 -> +10%: защита 247 -> 800 * 90 / 337 = 213
+        let cut = HitContext::NONE.with_entrenchment_divisor(2);
+        assert_eq!(combat_bp_ctx(&attacker, &dug_in, 0, cut), 213);
+        // нечётная окопанность делится вниз: 7 / 2 = 3 (+6%)
+        dug_in.entrenchment = 7;
+        assert_eq!(combat_bp_ctx(&attacker, &dug_in, 0, cut), 800 * 90 / (90 + 225 * 106 / 100));
+        // в бою: те же дивизии, но фаза прорыва — защитник теряет больше организации; таймер идёт по часам
+        let result = |phase: CombatPhase| {
+            let (mut app, _att, def) = scenario(&[1], 1, 1);
+            app.world_mut().get_mut::<Division>(def[0]).expect("защитник").entrenchment = 10;
+            set_phase(&mut app, phase, 24);
+            tick(&mut app);
+            let d = app.world().get::<Division>(def[0]).expect("защитник");
+            (d.max_org * 1000 - d.org_milli(), combat_of(&mut app).phase_hours_left)
+        };
+        let (normal, _) = result(CombatPhase::Default);
+        let (cut_loss, hours) = result(CombatPhase::Breakthrough);
+        assert!(cut_loss > normal, "{cut_loss} > {normal}");
+        assert_eq!(hours, 23, "часовой декремент");
+    }
+
+    #[test]
+    fn breakthrough_phase_status_text() {
+        let (mut app, _a, _d) = scenario(&[1], 1, 1);
+        set_phase(&mut app, CombatPhase::Breakthrough, 9);
+        assert_eq!(
+            phase_text(&combat_of(&mut app)).as_deref(),
+            Some("Фаза: Прорыв (осталось 9 ч.) | Окопанность врага урезана на 50%")
+        );
     }
 
     #[test]

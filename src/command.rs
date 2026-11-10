@@ -49,6 +49,30 @@ pub enum CombatTactic {
     CloseQuartersAttack,
     /// Разрыв дистанции (оборона): попытка отойти из упора; парирует атаку в упор.
     CQTacticalWithdrawal,
+    // Прорыв
+    /// Прорыв (атака): атака +25%, урон защитника -15%; парируется засадой. Нужна бронетехника или лучший командир.
+    Breakthrough,
+    /// Засада (оборона): защита +25%; парирует прорыв.
+    Ambush,
+}
+
+/// Длительность фазы прорыва, игровых часов.
+pub const BREAKTHROUGH_PHASE_HOURS: u32 = 24;
+/// Прорыв доступен атакующим со средней твёрдостью выше этого порога, %.
+pub const BREAKTHROUGH_MIN_HARDNESS: u32 = 50;
+/// Тактики наступающих, когда прорыв доступен.
+pub const ATTACKER_TACTICS_WITH_BREAKTHROUGH: [CombatTactic; 4] =
+    [CombatTactic::Attack, CombatTactic::Assault, CombatTactic::Encirclement, CombatTactic::Breakthrough];
+/// Тактики обороняющихся, когда у врага есть прорыв: засада как контр-пик.
+pub const DEFENDER_TACTICS_WITH_AMBUSH: [CombatTactic; 4] =
+    [CombatTactic::Defend, CombatTactic::CounterAttack, CombatTactic::TacticalWithdrawal, CombatTactic::Ambush];
+
+/// Доступен ли атакующим прорыв: средняя твёрдость выше 50% либо командующий атакующих сильнее
+/// (суммарный навык выше; при равенстве решает больший id ведущего генерала).
+pub fn breakthrough_available(avg_hardness: u32, att_skill: u32, def_skill: u32, att_key: u32, def_key: u32) -> bool {
+    avg_hardness > BREAKTHROUGH_MIN_HARDNESS
+        || att_skill > def_skill
+        || (att_skill == def_skill && att_key > def_key)
 }
 
 /// Длительность фазы ближнего боя, игровых часов.
@@ -90,6 +114,8 @@ pub enum CombatPhase {
     Bridge,
     /// Уличный бой в упор: фронт вдвое уже, урон выше у обеих сторон, броня не даёт преимущества.
     CloseQuarters,
+    /// Стремительный прорыв: окопанность обороны урезана вдвое.
+    Breakthrough,
 }
 
 impl CombatPhase {
@@ -100,6 +126,7 @@ impl CombatPhase {
             CombatPhase::TacticalWithdrawal => "Тактический отход",
             CombatPhase::Bridge => "Борьба за мост",
             CombatPhase::CloseQuarters => "Ближний бой",
+            CombatPhase::Breakthrough => "Прорыв",
         }
     }
 }
@@ -121,11 +148,13 @@ impl CombatTactic {
             CombatTactic::SeizeBridge => Some(CombatTactic::HoldBridge),
             CombatTactic::HoldBridge => Some(CombatTactic::RetakeBridge),
             CombatTactic::CloseQuartersAttack => Some(CombatTactic::CQTacticalWithdrawal),
+            CombatTactic::Breakthrough => Some(CombatTactic::Ambush),
             CombatTactic::Attack
             | CombatTactic::Defend
             | CombatTactic::TacticalWithdrawal
             | CombatTactic::RetakeBridge
-            | CombatTactic::CQTacticalWithdrawal => None,
+            | CombatTactic::CQTacticalWithdrawal
+            | CombatTactic::Ambush => None,
         }
     }
 
@@ -143,6 +172,8 @@ impl CombatTactic {
             CombatTactic::RetakeBridge => "Контрудар за мост",
             CombatTactic::CloseQuartersAttack => "Ближний бой",
             CombatTactic::CQTacticalWithdrawal => "Разрыв дистанции",
+            CombatTactic::Breakthrough => "Прорыв",
+            CombatTactic::Ambush => "Засада",
         }
     }
 }
@@ -178,10 +209,12 @@ pub fn side_mods(attacker: CombatTactic, defender: CombatTactic, for_attacker: b
             CombatTactic::SeizeBridge => 20,
             CombatTactic::RetakeBridge => 15,
             CombatTactic::CloseQuartersAttack => 10,
+            CombatTactic::Breakthrough => 25,
             CombatTactic::Defend
             | CombatTactic::TacticalWithdrawal
             | CombatTactic::HoldBridge
-            | CombatTactic::CQTacticalWithdrawal => 0,
+            | CombatTactic::CQTacticalWithdrawal
+            | CombatTactic::Ambush => 0,
         }
     };
     let defense_pct = if countered {
@@ -190,6 +223,7 @@ pub fn side_mods(attacker: CombatTactic, defender: CombatTactic, for_attacker: b
         match own {
             CombatTactic::Defend => 5,
             CombatTactic::HoldBridge => 20,
+            CombatTactic::Ambush => 25,
             _ => 0,
         }
     };
@@ -203,6 +237,10 @@ pub fn side_mods(attacker: CombatTactic, defender: CombatTactic, for_attacker: b
     // Атака в упор открывает и самого атакующего: если она не парирована, оборона бьёт на 5% сильнее
     if !for_attacker && attacker == CombatTactic::CloseQuartersAttack && !att_countered {
         damage_pct = damage_pct * 105 / 100;
+    }
+    // Успешный прорыв сбивает контрудар обороны: её урон на 15% ниже
+    if !for_attacker && attacker == CombatTactic::Breakthrough && !att_countered {
+        damage_pct = damage_pct * 85 / 100;
     }
     TacticMods { attack_pct, defense_pct, damage_pct }
 }
