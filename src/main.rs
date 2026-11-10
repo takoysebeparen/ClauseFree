@@ -4,6 +4,7 @@ mod camera;
 mod clock;
 mod colors;
 mod command;
+mod diplomacy;
 mod division;
 mod economy;
 mod flags;
@@ -25,6 +26,7 @@ use air::AirPlugin;
 use camera::CameraPlugin;
 use clock::ClockPlugin;
 use command::CommandPlugin;
+use diplomacy::DiplomacyPlugin;
 use division::DivisionPlugin;
 use economy::EconomyPlugin;
 use flags::FlagPlugin;
@@ -58,6 +60,6 @@ fn main() {
         )
         .add_plugins(EguiPlugin)
         .add_plugins(FlagPlugin { root: PathBuf::from(HOI4_PATH) })
-        .add_plugins((CameraPlugin, MapPlugin { root: PathBuf::from(HOI4_PATH) }, ClockPlugin, DivisionPlugin, EconomyPlugin, FrontlinePlugin, AiPlugin, SurrenderPlugin, CommandPlugin, AirPlugin))
+        .add_plugins((CameraPlugin, MapPlugin { root: PathBuf::from(HOI4_PATH) }, ClockPlugin, DiplomacyPlugin, DivisionPlugin, EconomyPlugin, FrontlinePlugin, AiPlugin, SurrenderPlugin, CommandPlugin, AirPlugin))
         .run();
 }

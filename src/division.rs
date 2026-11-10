@@ -18,6 +18,7 @@ use crate::clock::{ClockSet, DailyTickEvent, HourTick};
 use crate::air::{air_attack_bonus_pct, air_defense_penalty_pct, air_status, side_edge, AirSuperiorityMap};
 use crate::colors::CountryColors;
 use crate::command::SKILL_BONUS_PCT;
+use crate::diplomacy::{check_entry, DiplomacyRegistry};
 use crate::economy::{update_supply_network, ArmyExperience, EquipmentType, PlayerCountry, SupplyNetwork};
 use crate::oob::{resolve_placement, resolve_template, OobDivisions, Placement};
 use crate::units::{DivisionTemplate, DivisionTemplates, NatoSymbol, BASE_TEMPLATE, INFANTRY_SPEED_KPH};
@@ -998,6 +999,24 @@ fn draw_selection_box(mut contexts: EguiContexts, drag: Res<DragSelection>) {
     painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(170, 255, 170)));
 }
 
+/// Приказы ПКМ после проверки суверенитета: вход в чужую нейтральную землю, море или неизвестную провинцию
+/// не порождает ни одного `OrderMove`, причина пишется в консоль.
+pub fn rmb_orders(
+    diplomacy: &DiplomacyRegistry,
+    player: &str,
+    target_controller: Option<&str>,
+    target: u32,
+    units: &[Entity],
+) -> Vec<OrderMove> {
+    match check_entry(diplomacy, player, target_controller) {
+        Ok(()) => units.iter().map(|&division| OrderMove { division, target }).collect(),
+        Err(message) => {
+            println!("{message}");
+            Vec::new()
+        }
+    }
+}
+
 /// ПКМ (короткий клик без перетаскивания, т.к. ПКМ-drag — панорама камеры) -> `OrderMove`.
 fn order_move_input(
     mouse: Res<ButtonInput<MouseButton>>,
@@ -1007,6 +1026,9 @@ fn order_move_input(
     group: Res<SelectedGroup>,
     multi: Res<SelectedDivisions>,
     divisions: Query<(Entity, &Division)>,
+    player: Res<PlayerCountry>,
+    controllers: Res<ProvinceControllers>,
+    diplomacy: Option<Res<DiplomacyRegistry>>,
     mut orders: EventWriter<OrderMove>,
     mut press_pos: Local<Option<Vec2>>,
     mut contexts: EguiContexts,
@@ -1029,8 +1051,11 @@ fn order_move_input(
     }
     if let (Some(selected), Some(target)) = (selected.0, hovered.id) {
         // вся группа рамки, весь стек или одна дивизия, выбранная в инспекторе
-        for division in command_targets(&multi, &divisions, selected, group.whole) {
-            orders.send(OrderMove { division, target });
+        let units = command_targets(&multi, &divisions, selected, group.whole);
+        let peace = DiplomacyRegistry::default();
+        let diplomacy = diplomacy.as_deref().unwrap_or(&peace);
+        for order in rmb_orders(diplomacy, &player.0, controllers.0.get(&target).map(String::as_str), target, &units) {
+            orders.send(order);
         }
     }
 }
@@ -1158,9 +1183,10 @@ const NONE: u32 = u32::MAX;
 /// берётся из предрассчитанных `GraphMetrics`.
 /// Отличие от заданной сигнатуры: добавлены `map` (тип местности, вода) и `metrics`.
 ///
-/// Суверенитет: провинция проходима, только если её контроллер — `owner` или `enemy_target`.
-/// Нейтральные страны и провинции без контроллера — стена. Стартовая провинция не проверяется
-/// (дивизия может стоять где угодно), а цель обязана быть проходимой.
+/// Суверенитет: провинция проходима, только если `diplomacy.can_enter_territory(owner, контроллер)`:
+/// своя земля, земля страны, с которой война, или земля с правом прохода. Нейтральные страны и провинции
+/// без контроллера — стена, поэтому дивизия в анклаве без сухопутного пути по своим землям получает `None`.
+/// Стартовая провинция не проверяется (дивизия может стоять где угодно), а цель обязана быть проходимой.
 #[allow(clippy::too_many_arguments)]
 pub fn find_path_a_star(
     start: u32,
@@ -1171,14 +1197,11 @@ pub fn find_path_a_star(
     controllers: &ProvinceControllers,
     metrics: &GraphMetrics,
     owner: &str,
-    enemy_target: Option<&str>,
+    diplomacy: &DiplomacyRegistry,
     speed: u32,
 ) -> Option<Vec<u32>> {
     let is_passable = |province: u32| {
-        controllers
-            .0
-            .get(&province)
-            .is_some_and(|c| c.as_str() == owner || enemy_target == Some(c.as_str()))
+        controllers.0.get(&province).is_some_and(|c| diplomacy.can_enter_territory(owner, c.as_str()))
     };
     if start == goal {
         return Some(vec![start]);
@@ -1254,7 +1277,10 @@ fn apply_orders(
     map: Res<ProvinceMap>,
     controllers: Res<ProvinceControllers>,
     metrics: Res<GraphMetrics>,
+    diplomacy: Option<Res<DiplomacyRegistry>>,
 ) {
+    let peace = DiplomacyRegistry::default();
+    let diplomacy = diplomacy.as_deref().unwrap_or(&peace);
     for order in events.read() {
         if combats.iter().any(|c| c.involves(order.division)) {
             println!("[ПРИКАЗ] Дивизия в бою — приказ отклонён");
@@ -1264,9 +1290,7 @@ fn apply_orders(
 
         // Если дивизия уже в пути, новый маршрут строится от точки, куда она сейчас идёт.
         let start = division.movement.map_or(division.current_province, |m| m.to);
-        // Цель приказа определяет «противника»: путь идёт по своей территории и по территории
-        // страны, контролирующей целевую провинцию; чужие нейтральные страны — стена.
-        let enemy_target = controllers.0.get(&order.target).map(String::as_str);
+        // Путь идёт только по землям, куда дипломатия пускает владельца дивизии; нейтралы — стена.
         match find_path_a_star(
             start,
             order.target,
@@ -1276,7 +1300,7 @@ fn apply_orders(
             &controllers,
             &metrics,
             &division.owner,
-            enemy_target,
+            diplomacy,
             division.max_speed,
         ) {
             Some(path) => {
@@ -4169,5 +4193,94 @@ mod nato_tests {
         // без изменений ничего не пересоздаётся
         app.world_mut().run_system_once(update_nato_icons);
         assert_eq!(strokes_of(&mut app, root), 2);
+    }
+}
+
+#[cfg(test)]
+mod sovereignty_tests {
+    use super::*;
+
+    /// Кёнигсберг (1, GER) – Польша (2, POL) – Берлин (3, GER) цепочкой; 4 (FRA) за Берлином.
+    struct Scene {
+        adjacency: ProvinceAdjacency,
+        centers: ProvinceCenters,
+        map: ProvinceMap,
+        controllers: ProvinceControllers,
+        metrics: GraphMetrics,
+    }
+
+    fn world(owners: &[(u32, &str)]) -> Scene {
+        let neighbors: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::from([
+            (1, BTreeSet::from([2])),
+            (2, BTreeSet::from([1, 3])),
+            (3, BTreeSet::from([2, 4])),
+            (4, BTreeSet::from([3])),
+        ]);
+        let adjacency = ProvinceAdjacency { neighbors };
+        let centers = ProvinceCenters { centers: (1..=4).map(|p| (p, Vec2::new(p as f32 * 100.0, 0.0))).collect() };
+        let metrics = GraphMetrics::compute(&adjacency, &centers);
+        Scene {
+            adjacency,
+            centers,
+            map: ProvinceMap::empty_for_test(),
+            controllers: ProvinceControllers(owners.iter().map(|&(p, c)| (p, c.to_string())).collect()),
+            metrics,
+        }
+    }
+
+    fn path(w: &Scene, from: u32, to: u32, owner: &str, dip: &DiplomacyRegistry) -> Option<Vec<u32>> {
+        find_path_a_star(from, to, &w.adjacency, &w.centers, &w.map, &w.controllers, &w.metrics, owner, dip, 40)
+    }
+
+    #[test]
+    fn neutral_poland_blocks_the_path_from_koenigsberg_in_peacetime() {
+        let w = world(&[(1, "GER"), (2, "POL"), (3, "GER"), (4, "FRA")]);
+        let peace = DiplomacyRegistry::default();
+        assert_eq!(path(&w, 1, 3, "GER", &peace), None, "анклав: сухопутного пути по своим землям нет");
+        assert_eq!(path(&w, 1, 2, "GER", &peace), None, "и сама Польша закрыта");
+        assert_eq!(path(&w, 3, 1, "GER", &peace), None, "обратно тоже");
+    }
+
+    #[test]
+    fn path_through_an_enemy_country_exists_only_at_war() {
+        let w = world(&[(1, "GER"), (2, "POL"), (3, "GER"), (4, "FRA")]);
+        let mut dip = DiplomacyRegistry::default();
+        dip.declare_war("GER", "POL");
+        assert_eq!(path(&w, 1, 3, "GER", &dip), Some(vec![1, 2, 3]), "война с Польшей открывает проход");
+        assert_eq!(path(&w, 3, 4, "GER", &dip), None, "Франция по-прежнему нейтральна");
+        dip.declare_war("GER", "FRA");
+        assert_eq!(path(&w, 1, 4, "GER", &dip), Some(vec![1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn military_access_opens_a_neutral_country_for_the_guest_only() {
+        let w = world(&[(1, "GER"), (2, "POL"), (3, "GER"), (4, "FRA")]);
+        let mut dip = DiplomacyRegistry::default();
+        dip.grant_access("POL", "GER");
+        assert_eq!(path(&w, 1, 3, "GER", &dip), Some(vec![1, 2, 3]));
+        assert_eq!(path(&w, 3, 1, "FRA", &dip), None, "право есть у GER, но не у FRA");
+    }
+
+    #[test]
+    fn own_lands_and_degenerate_goals_do_not_panic() {
+        let w = world(&[(1, "GER"), (2, "GER"), (3, "GER")]);
+        let peace = DiplomacyRegistry::default();
+        assert_eq!(path(&w, 1, 3, "GER", &peace), Some(vec![1, 2, 3]));
+        assert_eq!(path(&w, 1, 1, "GER", &peace), Some(vec![1]));
+        assert_eq!(path(&w, 1, 99, "GER", &peace), None, "неизвестная провинция");
+        assert_eq!(path(&w, 1, 4, "GER", &peace), None, "у провинции 4 нет контроллера");
+    }
+
+    #[test]
+    fn rmb_on_a_neutral_province_issues_no_order() {
+        let mut ecs = World::new();
+        let (a, b) = (ecs.spawn_empty().id(), ecs.spawn_empty().id());
+        let mut dip = DiplomacyRegistry::default();
+        assert!(rmb_orders(&dip, "GER", Some("POL"), 7, &[a, b]).is_empty(), "нейтрал игнорируется");
+        assert!(rmb_orders(&dip, "GER", None, 7, &[a, b]).is_empty(), "море / неизвестная провинция");
+        let own = rmb_orders(&dip, "GER", Some("GER"), 7, &[a, b]);
+        assert_eq!(own.iter().map(|o| (o.division, o.target)).collect::<Vec<_>>(), vec![(a, 7), (b, 7)]);
+        dip.declare_war("GER", "POL");
+        assert_eq!(rmb_orders(&dip, "GER", Some("POL"), 7, &[a]).len(), 1, "на войне вход разрешён");
     }
 }

@@ -13,6 +13,7 @@ use bevy_egui::{egui, EguiContexts};
 use crate::clock::{ClockSet, DailyTickEvent};
 use crate::colors::CountryColors;
 use crate::command::Commander;
+use crate::diplomacy::DiplomacyRegistry;
 use crate::division::{
     ActiveCombat, Division, OrderMove, MAX_PLANNING, PLANNING_DECAY_PER_DAY, PLANNING_GAIN_PER_DAY,
 };
@@ -249,9 +250,15 @@ fn execute_frontline_attacks(
     controllers: Res<ProvinceControllers>,
     adjacency: Res<ProvinceAdjacency>,
     mut orders: EventWriter<OrderMove>,
+    mut diplomacy: Option<ResMut<DiplomacyRegistry>>,
 ) {
     for event in events.read() {
         let Ok(frontline) = frontlines.get(event.frontline_entity) else { continue };
+        if let Some(diplomacy) = diplomacy.as_deref_mut() {
+            if diplomacy.declare_war(&frontline.owner, &frontline.enemy) {
+                println!("[ДИПЛОМАТИЯ] {} объявила войну {}", frontline.owner, frontline.enemy);
+            }
+        }
 
         // Сколько своих дивизий уже идёт в каждую вражескую провинцию
         let mut load: BTreeMap<u32, u32> = BTreeMap::new();
@@ -376,9 +383,16 @@ fn create_frontlines(
     combats: Query<&ActiveCombat>,
     commanders: Query<(Entity, &Commander)>,
     mut orders: EventWriter<OrderMove>,
+    mut diplomacy: Option<ResMut<DiplomacyRegistry>>,
 ) {
     let mut replaced: HashSet<Entity> = HashSet::new();
     for event in events.read() {
+        // Развёртывание фронта означает войну пары: только она открывает чужую территорию для маршей
+        if let Some(diplomacy) = diplomacy.as_deref_mut() {
+            if diplomacy.declare_war(&event.owner, &event.enemy) {
+                println!("[ДИПЛОМАТИЯ] {} объявила войну {}", event.owner, event.enemy);
+            }
+        }
         let (frontline, sent) = match build_frontline(
             &event.owner,
             &event.enemy,
@@ -682,5 +696,24 @@ mod tests {
         app.world_mut().despawn(front);
         day(&mut app);
         assert_eq!(planning(&app, on_border), 0);
+    }
+
+    #[test]
+    fn deploying_a_front_and_attacking_declare_war() {
+        let mut app = App::new();
+        let neighbors = BTreeMap::from([(1, std::collections::BTreeSet::from([2])), (2, std::collections::BTreeSet::from([1]))]);
+        app.add_event::<CreateFrontline>()
+            .add_event::<ExecuteFrontlineAttack>()
+            .add_event::<OrderMove>()
+            .init_resource::<DiplomacyRegistry>()
+            .insert_resource(ProvinceAdjacency { neighbors })
+            .insert_resource(ProvinceControllers(BTreeMap::from([(1, "GER".to_string()), (2, "FRA".to_string())])))
+            .add_systems(Update, create_frontlines);
+        spawn_commander(&mut app, 0, "GER", "Роммель", 4, 2);
+        spawn_owned(&mut app, 1, "GER", 1);
+        assert!(!app.world().resource::<DiplomacyRegistry>().are_at_war("GER", "FRA"), "старт: мир");
+        create(&mut app, "GER", "FRA");
+        assert!(app.world().resource::<DiplomacyRegistry>().are_at_war("GER", "FRA"));
+        assert!(!app.world().resource::<DiplomacyRegistry>().are_at_war("GER", "ITA"), "другие пары не затронуты");
     }
 }
