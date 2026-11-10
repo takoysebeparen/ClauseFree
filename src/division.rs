@@ -66,12 +66,14 @@ const RESERVE_MIN_CHANCE_PCT: u32 = 2;
 
 const DIVISION_SIZE: Vec2 = Vec2::new(26.0, 18.0);
 /// Ширина полоски организации / прочности на фишке при 100%, пиксели.
-const BAR_MAX_WIDTH: f32 = 12.0;
-const ORG_BAR_COLOR: Color = Color::srgb(0.25, 0.6, 0.95);
-const STRENGTH_BAR_COLOR: Color = Color::srgb(0.35, 0.8, 0.35);
+/// Микро-полоски под фишкой: ширина равна ширине фишки, высота каждой 3 px.
+const BAR_MAX_WIDTH: f32 = 26.0;
+const BAR_HEIGHT: f32 = 3.0;
+const ORG_BAR_COLOR: Color = Color::srgb(46.0 / 255.0, 139.0 / 255.0, 87.0 / 255.0);
+const STRENGTH_BAR_COLOR: Color = Color::srgb(198.0 / 255.0, 120.0 / 255.0, 20.0 / 255.0);
 const FRAME_COLOR: Color = Color::srgb(0.9, 0.9, 0.86);
 const SELECTED_FRAME_COLOR: Color = Color::srgb(1.0, 0.85, 0.1);
-const FILL_COLOR: Color = Color::srgb(0.14, 0.16, 0.2);
+const BAR_BACKDROP_COLOR: Color = Color::srgb(0.2, 0.2, 0.22);
 const DIVISION_Z: f32 = 10.0;
 /// Скорость сглаживания визуальной позиции (1/сек), только для отрисовки.
 const VISUAL_SMOOTHING: f32 = 10.0;
@@ -797,6 +799,7 @@ pub struct DivisionPlugin;
 impl Plugin for DivisionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SelectedDivision>()
+            .init_resource::<OpenCombats>()
             .init_resource::<SelectedGroup>()
             .init_resource::<DragSelection>()
             .init_resource::<SelectedDivisions>()
@@ -866,23 +869,30 @@ fn spawn_division_entity(commands: &mut Commands, division: Division, center: Ve
                 transform: Transform::from_xyz(0.0, 0.0, 0.1),
                 ..default()
             });
-            // подложка под полоски (нижние 5 px)
+            // тёмно-серая подложка под полосками: сразу под NATO-прямоугольником (его высота 18 px)
             p.spawn(SpriteBundle {
-                sprite: Sprite { color: FILL_COLOR, custom_size: Some(Vec2::new(24.0, 5.0)), ..default() },
-                transform: Transform::from_xyz(0.0, -5.5, 0.2),
+                sprite: Sprite {
+                    color: BAR_BACKDROP_COLOR,
+                    custom_size: Some(Vec2::new(BAR_MAX_WIDTH, BAR_HEIGHT * 2.0)),
+                    ..default()
+                },
+                transform: Transform::from_xyz(0.0, -DIVISION_SIZE.y * 0.5 - BAR_HEIGHT, 0.2),
                 ..default()
             });
             spawn_nato_strokes(p, symbol, line_color);
             // полоски: организация (сверху) и прочность (снизу), растут вправо от левого края
-            for (y, color, is_org) in [(-4.25_f32, ORG_BAR_COLOR, true), (-6.75_f32, STRENGTH_BAR_COLOR, false)] {
+            for (y, color, is_org) in [
+                (-DIVISION_SIZE.y * 0.5 - BAR_HEIGHT * 0.5, ORG_BAR_COLOR, true),
+                (-DIVISION_SIZE.y * 0.5 - BAR_HEIGHT * 1.5, STRENGTH_BAR_COLOR, false),
+            ] {
                 let bar = SpriteBundle {
                     sprite: Sprite {
                         color,
-                        custom_size: Some(Vec2::new(BAR_MAX_WIDTH, 2.0)),
+                        custom_size: Some(Vec2::new(BAR_MAX_WIDTH, BAR_HEIGHT)),
                         anchor: Anchor::CenterLeft,
                         ..default()
                     },
-                    transform: Transform::from_xyz(-6.0, y, 0.3),
+                    transform: Transform::from_xyz(-BAR_MAX_WIDTH * 0.5, y, 0.3),
                     ..default()
                 };
                 if is_org {
@@ -2694,7 +2704,7 @@ fn update_stack_visuals(
             .copied()
             .unwrap_or((percent(d.current_org, d.max_org), percent(d.current_strength, d.max_strength)));
         let value = if is_org { org } else { hp };
-        let size = Some(Vec2::new(BAR_MAX_WIDTH * value as f32 / 100.0, 2.0));
+        let size = Some(Vec2::new(crate::ui::micro_bar_width(value, BAR_MAX_WIDTH), BAR_HEIGHT));
         if sprite.custom_size != size {
             sprite.custom_size = size;
         }
@@ -2746,19 +2756,24 @@ struct SideStats {
     /// Организация дивизий на линии: сумма текущей / сумма максимальной.
     org: u32,
     org_max: u32,
+    /// Прочность (укомплектованность) дивизий на линии: сумма текущей / сумма максимальной.
+    strength: u32,
+    strength_max: u32,
     /// Сумма разведки и число дивизий на линии — для средней разведки стороны.
     recon_sum: u32,
     active: u32,
 }
 
 fn side_stats(divisions: &Query<&Division>, list: &[Entity]) -> SideStats {
-    let mut stats = SideStats { used_width: 0, reserves: 0, org: 0, org_max: 0, recon_sum: 0, active: 0 };
+    let mut stats = SideStats { used_width: 0, reserves: 0, org: 0, org_max: 0, strength: 0, strength_max: 0, recon_sum: 0, active: 0 };
     for d in list.iter().filter_map(|&e| divisions.get(e).ok()) {
         match d.combat_state {
             CombatState::Active => {
                 stats.used_width += d.combat_width;
                 stats.org += d.current_org;
                 stats.org_max += d.max_org;
+                stats.strength += d.current_strength;
+                stats.strength_max += d.max_strength;
                 stats.recon_sum += d.recon;
                 stats.active += 1;
             }
@@ -2822,6 +2837,10 @@ fn terrain_label(terrain: Option<&str>, river_penalty: Option<u32>) -> String {
     )
 }
 
+/// Бои, у которых раскрыта подробная плашка (клик по боевому баблу). Только отображение.
+#[derive(Resource, Default)]
+struct OpenCombats(BTreeSet<Entity>);
+
 /// Маркер боя над провинцией: круглый бейдж с процентом, организация линии, ширина фронта и резерв.
 fn combat_ui(
     mut contexts: EguiContexts,
@@ -2834,15 +2853,43 @@ fn combat_ui(
     air: Res<AirSuperiorityMap>,
     colors: Res<CountryColors>,
     cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
+    mut open: ResMut<OpenCombats>,
 ) {
     let Ok((camera, cam_tf)) = cameras.get_single() else { return };
     let Some(ctx) = contexts.try_ctx_mut() else { return };
+    open.0.retain(|&e| combats.contains(e));
 
     for (ce, combat) in &combats {
         let Some(center) = centers.centers.get(&combat.province_id) else { continue };
         let Some(screen) = camera.world_to_viewport(cam_tf, center.extend(0.0)) else { continue };
         let att = side_stats(&divisions, &combat.attackers);
         let def = side_stats(&divisions, &combat.defenders);
+        // Боевой бабл над фишками обороняемой провинции: размер в пикселях экрана постоянен при любом зуме
+        let progress = crate::ui::bubble_progress(percent(att.org, att.org_max), percent(def.org, def.org_max));
+        let radius = crate::ui::BUBBLE_RADIUS;
+        let mut toggled = false;
+        egui::Area::new(egui::Id::new(("combat_bubble", ce)))
+            .fixed_pos(egui::pos2(screen.x - radius, screen.y - DIVISION_SIZE.y - radius * 2.0 - 8.0))
+            .show(ctx, |ui| {
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(radius * 2.0, radius * 2.0), egui::Sense::click());
+                let painter = ui.painter();
+                painter.circle_filled(rect.center(), radius, crate::ui::bubble_color(progress));
+                painter.circle_stroke(rect.center(), radius, egui::Stroke::new(2.5_f32, crate::ui::BUBBLE_RIM));
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    progress.to_string(),
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::WHITE,
+                );
+                toggled = response.on_hover_text("Подробности боя").clicked();
+            });
+        if toggled && !open.0.remove(&ce) {
+            open.0.insert(ce);
+        }
+        if !open.0.contains(&ce) {
+            continue;
+        }
         // Рельеф обороняемой провинции и форсирование реки хотя бы одной атакующей дивизией
         // (в плашке — самый тяжёлый штраф среди форсирующих: сапёры его снижают)
         let river_penalty = combat
@@ -2859,23 +2906,11 @@ fn combat_ui(
         let recon_text = recon_air_label(&att, &def, air_value);
 
         egui::Area::new(egui::Id::new(("combat_plate", ce)))
-            .fixed_pos(egui::pos2(screen.x - 28.0, screen.y - 70.0))
+            .fixed_pos(egui::pos2(screen.x + radius + 6.0, screen.y - DIVISION_SIZE.y - radius * 2.0 - 8.0))
             .interactable(false)
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                // Бейдж: красный круг с процентом победы атакующего (потерянная организация защитника)
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 34.0), egui::Sense::hover());
-                let painter = ui.painter();
-                let c = egui::pos2(rect.center().x, rect.min.y + 17.0);
-                painter.circle_filled(c, 17.0, egui::Color32::from_rgb(150, 30, 30));
-                painter.circle_stroke(c, 17.0, egui::Stroke::new(2.0_f32,egui::Color32::from_rgb(240, 220, 200)));
-                painter.text(
-                    c,
-                    egui::Align2::CENTER_CENTER,
-                    format!("{}%", combat.combat_progress),
-                    egui::FontId::proportional(13.0),
-                    egui::Color32::WHITE,
-                );
+                ui.label(egui::RichText::new(format!("Прогресс боя: {progress}% | Потери обороны: {}%", combat.combat_progress)).small());
                 ui.label(egui::RichText::new(&terrain_text).small());
                 ui.label(egui::RichText::new(&recon_text).small());
                 show_tactics(ui, combat);
@@ -2885,12 +2920,9 @@ fn combat_ui(
                     ("ЗАЩ", &def, egui::Color32::from_rgb(220, 90, 70), defender_color),
                 ];
                 for (tag, side, color, country_color) in sides {
-                    ui.add(
-                        egui::ProgressBar::new(side.org as f32 / side.org_max.max(1) as f32)
-                            .desired_width(56.0)
-                            .desired_height(5.0)
-                            .fill(color),
-                    );
+                    let _ = color;
+                    crate::ui::status_bar(ui, "Организация", side.org, side.org_max, crate::ui::ORG_COLOR, 160.0);
+                    crate::ui::status_bar(ui, "Прочность", side.strength, side.strength_max, crate::ui::STRENGTH_COLOR, 160.0);
                     ui.label(
                         egui::RichText::new(format!(
                             "{tag} Ширина фронта: {}/{} | В резерве: {} див.",
@@ -2959,21 +2991,20 @@ fn division_info_ui(
     };
     let owner_color = colors.ui_color32(&d.owner);
     let frame = egui::Frame::window(&ctx.style())
-        .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200))
+        .fill(crate::ui::PANEL_FILL)
         .stroke(egui::Stroke::new(2.0_f32, owner_color));
 
-    egui::Window::new("Дивизия")
+    egui::Window::new(crate::ui::window_title("Дивизия"))
         .anchor(egui::Align2::LEFT_TOP, [10.0, 10.0])
         .resizable(false)
         .collapsible(false)
         .frame(frame)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                flags.show(ui, &d.owner, &colors);
-                ui.label(format!("Дивизия: \"{}\"", d.name));
+                crate::ui::country_header(ui, &mut flags, &colors, &d.owner, &format!("Дивизия \"{}\"", d.name));
                 ui.label(nato_badge_text(d.nato_symbol));
-                ui.label(egui::RichText::new(format!("[{}]", d.owner)).color(owner_color).strong());
             });
+            crate::ui::readiness_bars(ui, (d.current_org, d.max_org), (d.current_strength, d.max_strength));
             // Стек провинции: кликабельные строки; ПКМ командует всей группой, пока она выбрана целиком
             if !multi_rows.is_empty() {
                 ui.label(format!("Выделено рамкой: {} див. (ПКМ — приказ всем)", multi_rows.len()));
@@ -3006,7 +3037,6 @@ fn division_info_ui(
             ui.label(format!("ID: {} | Стартовая оснащённость {}%", d.id, d.start_equipment_pct));
             ui.label(experience_text(d.experience_pct));
             ui.label(format!("Провинция: {}", d.current_province));
-            ui.label(format!("Организация: {}/{}", d.current_org, d.max_org));
             ui.label(format!(
                 "Укомплектованность: {}/{} (Потери: {})",
                 d.current_strength, d.max_strength, d.losses
@@ -4636,7 +4666,7 @@ mod recon_air_tests {
 
     #[test]
     fn combat_plate_shows_recon_and_sky() {
-        let side = |recon_sum, active| SideStats { used_width: 0, reserves: 0, org: 0, org_max: 0, recon_sum, active };
+        let side = |recon_sum, active| SideStats { used_width: 0, reserves: 0, org: 0, org_max: 0, strength: 0, strength_max: 0, recon_sum, active };
         assert_eq!(recon_text(3, 1), "3.0");
         assert_eq!(recon_text(5, 2), "2.5");
         assert_eq!(recon_text(0, 0), "0.0");
@@ -5218,9 +5248,9 @@ mod stack_tests {
         let _e3 = spawn(&mut app, division(3, "GER", 5, 0, false));
         let solo = spawn(&mut app, division(4, "GER", 6, 40, false));
         app.update();
-        assert_eq!(bar_width(&mut app, e1, true), 6.0, "орг (100 + 50 + 0) / 3 = 50% от 12 px");
-        assert_eq!(bar_width(&mut app, e1, false), 12.0, "прочность у всех 100%");
-        assert_eq!(bar_width(&mut app, solo, true), 4.8, "одиночная фишка показывает свою организацию 40%");
+        assert_eq!(bar_width(&mut app, e1, true), 13.0, "орг (100 + 50 + 0) / 3 = 50% от 26 px");
+        assert_eq!(bar_width(&mut app, e1, false), 26.0, "прочность у всех 100%");
+        assert_eq!(bar_width(&mut app, solo, true), 10.4, "одиночная фишка показывает свою организацию 40%");
     }
 
     #[test]

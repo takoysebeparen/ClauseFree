@@ -12,6 +12,7 @@ mod frontline;
 mod map;
 mod oob;
 mod surrender;
+mod ui;
 mod units;
 
 use std::path::PathBuf;
@@ -60,6 +61,7 @@ fn main() {
         )
         .add_plugins(EguiPlugin)
         .add_plugins(FlagPlugin { root: PathBuf::from(HOI4_PATH) })
+        .add_plugins(ui::UiPlugin)
         .add_plugins((CameraPlugin, MapPlugin { root: PathBuf::from(HOI4_PATH) }, ClockPlugin, DiplomacyPlugin, DivisionPlugin, EconomyPlugin, FrontlinePlugin, AiPlugin, SurrenderPlugin, CommandPlugin, AirPlugin))
         .run();
 }

@@ -130,7 +130,7 @@ impl FlagTextures {
 
     /// Сколько флагов уже в кэше.
     #[cfg(test)]
-    pub fn cached(&self) -> usize {
+    pub(crate) fn cached(&self) -> usize {
         self.cache.len()
     }
 
@@ -152,8 +152,13 @@ impl FlagTextures {
 
     /// Рисует миниатюру флага страны.
     pub fn show(&mut self, ui: &mut egui::Ui, tag: &str, colors: &CountryColors) {
+        self.show_sized(ui, tag, colors, THUMB_SIZE);
+    }
+
+    /// Рисует флаг заданного размера (шапки окон — 41x26).
+    pub fn show_sized(&mut self, ui: &mut egui::Ui, tag: &str, colors: &CountryColors, size: [f32; 2]) {
         let id = self.texture(ui.ctx(), tag, colors);
-        ui.add(egui::Image::new(egui::load::SizedTexture::new(id, THUMB_SIZE)));
+        ui.add(egui::Image::new(egui::load::SizedTexture::new(id, size)));
     }
 }
 

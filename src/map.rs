@@ -1050,10 +1050,10 @@ fn ui_state_panel(
 
     let terrain = map.terrain_of(id).unwrap_or("unknown");
     let state = states.state_of(id);
-    let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
+    let frame = egui::Frame::window(&ctx.style()).fill(crate::ui::PANEL_FILL);
 
     let mut deselect = false;
-    egui::Window::new("Данные региона")
+    egui::Window::new(crate::ui::window_title("Данные региона"))
         .anchor(egui::Align2::LEFT_BOTTOM, [10.0, -10.0])
         .resizable(false)
         .collapsible(false)
@@ -1066,10 +1066,9 @@ fn ui_state_panel(
                     ui.label(format!("Стейт: {} ({})", s.id, s.name));
                     // Контроллер может отличаться от владельца (оккупация)
                     let controller = controllers.0.get(&id).unwrap_or(&s.owner);
+                    ui.label("Контролирует:");
+                    crate::ui::country_header(ui, &mut flags, &colors, controller, "");
                     ui.horizontal(|ui| {
-                        ui.label("Контролирует:");
-                        flags.show(ui, controller, &colors);
-                        ui.label(egui::RichText::new(controller).color(colors.ui_color32(controller)).strong());
                         ui.label("(Владелец:");
                         flags.show(ui, &s.owner, &colors);
                         ui.label(egui::RichText::new(&s.owner).color(colors.ui_color32(&s.owner)).strong());

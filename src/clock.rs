@@ -201,7 +201,7 @@ fn tick_clock(
 
 fn clock_ui(mut contexts: EguiContexts, clock: Res<GameClock>) {
     let Some(ctx) = contexts.try_ctx_mut() else { return };
-    let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
+    let frame = egui::Frame::window(&ctx.style()).fill(crate::ui::PANEL_FILL);
 
     egui::Window::new("clock_panel")
         .title_bar(false)

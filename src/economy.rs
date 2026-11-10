@@ -1703,8 +1703,8 @@ fn trade_panel(
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else { return };
     let Some(eco) = economies.0.get(&player.0) else { return };
-    let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
-    egui::Window::new("Торговля")
+    let frame = egui::Frame::window(&ctx.style()).fill(crate::ui::PANEL_FILL);
+    egui::Window::new(crate::ui::window_title("Торговля"))
         .anchor(egui::Align2::LEFT_TOP, [10.0, 52.0])
         .resizable(false)
         .collapsible(true)
@@ -1781,7 +1781,7 @@ fn economy_bar(
     // Рамка и тег нации — в её настоящем цвете
     let country_color = colors.ui_color32(&player.0);
     let frame = egui::Frame::window(&ctx.style())
-        .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200))
+        .fill(crate::ui::PANEL_FILL)
         .stroke(egui::Stroke::new(2.0_f32, country_color));
 
     egui::Window::new("economy_bar")
@@ -1824,10 +1824,10 @@ fn production_panel(
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else { return };
     let Some(eco) = economies.0.get(&player.0) else { return };
-    let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
+    let frame = egui::Frame::window(&ctx.style()).fill(crate::ui::PANEL_FILL);
     let working = eco.effective_factories();
 
-    egui::Window::new("Производство")
+    egui::Window::new(crate::ui::window_title("Производство"))
         .anchor(egui::Align2::RIGHT_TOP, [-10.0, 52.0])
         .resizable(false)
         .collapsible(true)
@@ -1880,12 +1880,12 @@ fn construction_panel(
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else { return };
     let Some(eco) = economies.0.get(&player.0) else { return };
-    let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
+    let frame = egui::Frame::window(&ctx.style()).fill(crate::ui::PANEL_FILL);
     // Стейт выбранной на карте провинции
     let state = selected.id.and_then(|province| registry.state_of(province));
     let allocation = eco.construction.allocation(eco.available_civilian_factories());
 
-    egui::Window::new("Строительство")
+    egui::Window::new(crate::ui::window_title("Строительство"))
         .anchor(egui::Align2::RIGHT_TOP, [-10.0, 260.0])
         .resizable(false)
         .collapsible(true)

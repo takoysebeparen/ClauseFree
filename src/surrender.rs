@@ -207,7 +207,7 @@ fn surrender_ui(
     colors: Res<CountryColors>,
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else { return };
-    let frame = egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200));
+    let frame = egui::Frame::window(&ctx.style()).fill(crate::ui::PANEL_FILL);
 
     // Прогресс капитуляции под верхней панелью экономики
     egui::Window::new("surrender_progress")
@@ -230,7 +230,7 @@ fn surrender_ui(
     // Победное окно после капитуляции
     let mut close = false;
     if let Some((victim, conqueror)) = &state.banner {
-        egui::Window::new("Победа")
+        egui::Window::new(crate::ui::window_title("Победа"))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .collapsible(false)
             .resizable(false)

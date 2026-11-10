@@ -454,10 +454,10 @@ fn frontline_panel(
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else { return };
     let frame = egui::Frame::window(&ctx.style())
-        .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 200))
+        .fill(crate::ui::PANEL_FILL)
         .stroke(egui::Stroke::new(2.0_f32, colors.ui_color32(&player.0)));
 
-    egui::Window::new("Управление")
+    egui::Window::new(crate::ui::window_title("Управление"))
         .anchor(egui::Align2::RIGHT_BOTTOM, [-10.0, -10.0])
         .resizable(false)
         .collapsible(false)
