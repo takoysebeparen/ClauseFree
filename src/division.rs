@@ -20,6 +20,7 @@ use crate::colors::CountryColors;
 use crate::command::{
     pick_tactic, resolve_counters, side_mods, CombatPhase, CombatTactic, ATTACKER_TACTICS, DEFENDER_TACTICS,
     SKILL_BONUS_PCT, WITHDRAWAL_ORG_DAMAGE_PCT, WITHDRAWAL_PHASE_HOURS, WITHDRAWAL_WIDTH_DIVISOR,
+    pick_tactic_boosted, BRIDGE_ATTACKER_TACTICS, BRIDGE_DEFENDER_TACTICS, BRIDGE_PHASE_HOURS,
 };
 use crate::diplomacy::{check_entry, DiplomacyRegistry};
 use crate::economy::{update_supply_network, ArmyExperience, EquipmentType, PlayerCountry, SupplyNetwork};
@@ -335,6 +336,8 @@ pub struct ActiveCombat {
     pub phase: CombatPhase,
     /// Сколько игровых часов фаза ещё длится (уменьшается каждый `HourTick`).
     pub phase_hours_left: u32,
+    /// Мост за атакующими: речной штраф форсирования снят (держится и после выхода из речной фазы).
+    pub bridge_held: bool,
 }
 
 impl ActiveCombat {
@@ -346,7 +349,7 @@ impl ActiveCombat {
     /// Лимит ширины линии каждой стороны с учётом фазы: при отходе вдвое меньше.
     pub fn effective_max_width(&self) -> u32 {
         match self.phase {
-            CombatPhase::Default => self.max_width,
+            CombatPhase::Default | CombatPhase::Bridge => self.max_width,
             CombatPhase::TacticalWithdrawal => self.max_width / WITHDRAWAL_WIDTH_DIVISOR,
         }
     }
@@ -1432,6 +1435,7 @@ fn advance_marches(
     map: Res<ProvinceMap>,
     mut controllers: ResMut<ProvinceControllers>,
     mut controller_changed: EventWriter<ProvinceControllerChanged>,
+    rivers: Option<Res<ProvinceRivers>>,
 ) {
     for _ in ticks.read() {
         // Дивизии в бою (участвуют в уже существующих боях или созданных на этом тике).
@@ -1559,6 +1563,19 @@ fn advance_marches(
                 attackers.len(),
                 defenders.len()
             );
+            // Бой через реку начинается в речной фазе: захват против удержания моста
+            let river_crossing = rivers.as_deref().is_some_and(|r| {
+                attackers
+                    .iter()
+                    .filter_map(|&e| divisions.get(e).ok())
+                    .any(|(_, d)| d.movement.is_some_and(|m| r.crosses(m.from, province)))
+            });
+            let (phase, phase_hours_left, attacker_tactic, defender_tactic) = if river_crossing {
+                (CombatPhase::Bridge, BRIDGE_PHASE_HOURS, CombatTactic::SeizeBridge, CombatTactic::HoldBridge)
+            } else {
+                (CombatPhase::Default, 0, CombatTactic::Attack, CombatTactic::Defend)
+            };
+            let (is_attacker_countered, is_defender_countered) = resolve_counters(attacker_tactic, defender_tactic);
             commands.spawn(ActiveCombat {
                 province_id: province,
                 attacker_owner: owner,
@@ -1568,13 +1585,14 @@ fn advance_marches(
                 max_width: BASE_COMBAT_WIDTH,
                 combat_progress: 0,
                 elapsed_hours: 0,
-                attacker_tactic: CombatTactic::Attack,
-                defender_tactic: CombatTactic::Defend,
-                is_attacker_countered: false,
-                is_defender_countered: false,
+                attacker_tactic,
+                defender_tactic,
+                is_attacker_countered,
+                is_defender_countered,
                 tactic_change_day: 0,
-                phase: CombatPhase::Default,
-                phase_hours_left: 0,
+                phase,
+                phase_hours_left,
+                bridge_held: false,
             });
         }
     }
@@ -1604,6 +1622,49 @@ pub fn choose_tactics(
         let attacker = pick_tactic(&ATTACKER_TACTICS, None, roll(attacker_key, 3));
         let defender = pick_tactic(&DEFENDER_TACTICS, Some(attacker), roll(defender_key, 4));
         (attacker, defender)
+    }
+}
+
+/// Выбор речных тактик на сутки: защитники берут удержание или контрудар, наступающие — захват моста
+/// (вес ×2, если среди них есть сапёры). Порядок выбора по разведке и броски — как у обычных тактик.
+pub fn choose_bridge_tactics(
+    combat_bits: u64,
+    day: u32,
+    attacker_key: u32,
+    defender_key: u32,
+    recon_edge: Option<bool>,
+    engineers: bool,
+) -> (CombatTactic, CombatTactic) {
+    let roll = |key: u32, salt: u64| det_rand(combat_bits, u64::from(day), u64::from(key) | (salt << 32));
+    let boost = engineers.then_some(CombatTactic::SeizeBridge);
+    if recon_edge == Some(true) {
+        let defender = pick_tactic_boosted(&BRIDGE_DEFENDER_TACTICS, None, roll(defender_key, 5), None);
+        let attacker = pick_tactic_boosted(&BRIDGE_ATTACKER_TACTICS, Some(defender), roll(attacker_key, 6), boost);
+        (attacker, defender)
+    } else {
+        let attacker = pick_tactic_boosted(&BRIDGE_ATTACKER_TACTICS, None, roll(attacker_key, 7), boost);
+        let defender = pick_tactic_boosted(&BRIDGE_DEFENDER_TACTICS, Some(attacker), roll(defender_key, 8), None);
+        (attacker, defender)
+    }
+}
+
+/// Мост у атакующих после выбора тактик: захват, не парированный удержанием, снимает речной штраф.
+/// Контрудар защитников выбивает атакующих с моста, который они уже держали.
+pub fn bridge_held_after(previously_held: bool, attacker: CombatTactic, defender: CombatTactic) -> bool {
+    let (attacker_countered, _) = resolve_counters(attacker, defender);
+    let seized = attacker == CombatTactic::SeizeBridge && !attacker_countered;
+    seized && !(previously_held && defender == CombatTactic::RetakeBridge)
+}
+
+/// Выход из речной фазы: когда срок вышел и мост у атакующих, бой переходит в обычную фазу (штраф остаётся снят);
+/// если мост не взят, фаза продолжается ещё на срок. Пока срок идёт, ничего не меняется.
+pub fn next_bridge_phase(bridge_held: bool, hours_left: u32) -> (CombatPhase, u32) {
+    if hours_left > 0 {
+        (CombatPhase::Bridge, hours_left)
+    } else if bridge_held {
+        (CombatPhase::Default, 0)
+    } else {
+        (CombatPhase::Bridge, BRIDGE_PHASE_HOURS)
     }
 }
 
@@ -1637,8 +1698,25 @@ fn select_combat_tactics(
             };
             let key_of = |side: &[Entity]| side.iter().filter_map(|&e| divisions.get(e).ok()).map(|d| d.id).min().unwrap_or(0);
             let edge = recon_advantage(&recon_of(&combat.attackers), &recon_of(&combat.defenders));
-            let (attacker, defender) =
-                choose_tactics(entity.to_bits(), day, key_of(&combat.attackers), key_of(&combat.defenders), edge);
+            let in_bridge_phase = combat.phase == CombatPhase::Bridge;
+            let (attacker, defender) = if in_bridge_phase {
+                // сапёры среди атакующих повышают вес захвата моста
+                let engineers = combat
+                    .attackers
+                    .iter()
+                    .filter_map(|&e| divisions.get(e).ok())
+                    .any(|d| d.river_penalty_reduction > 0);
+                choose_bridge_tactics(
+                    entity.to_bits(),
+                    day,
+                    key_of(&combat.attackers),
+                    key_of(&combat.defenders),
+                    edge,
+                    engineers,
+                )
+            } else {
+                choose_tactics(entity.to_bits(), day, key_of(&combat.attackers), key_of(&combat.defenders), edge)
+            };
             let (att_countered, def_countered) = resolve_counters(attacker, defender);
             combat.attacker_tactic = attacker;
             combat.defender_tactic = defender;
@@ -1646,9 +1724,16 @@ fn select_combat_tactics(
             combat.is_defender_countered = def_countered;
             combat.tactic_change_day = day;
             // Фаза отхода: выбор отхода защитником включает её на 24 часа; по истечении срока без отхода — обычная
-            let (phase, hours_left) = next_phase(combat.phase, combat.phase_hours_left, defender);
-            combat.phase = phase;
-            combat.phase_hours_left = hours_left;
+            if in_bridge_phase {
+                combat.bridge_held = bridge_held_after(combat.bridge_held, attacker, defender);
+                let (phase, hours_left) = next_bridge_phase(combat.bridge_held, combat.phase_hours_left);
+                combat.phase = phase;
+                combat.phase_hours_left = hours_left;
+            } else {
+                let (phase, hours_left) = next_phase(combat.phase, combat.phase_hours_left, defender);
+                combat.phase = phase;
+                combat.phase_hours_left = hours_left;
+            }
         }
     }
 }
@@ -1673,10 +1758,15 @@ pub fn tactics_segments(combat: &ActiveCombat) -> Vec<(String, bool)> {
 pub fn phase_text(combat: &ActiveCombat) -> Option<String> {
     match combat.phase {
         CombatPhase::Default => None,
-        phase => Some(format!(
+        CombatPhase::TacticalWithdrawal => Some(format!(
             "Фаза: {} (осталось {} ч.) | Фронт сужен на 50%",
-            phase.title(),
+            combat.phase.title(),
             combat.phase_hours_left
+        )),
+        CombatPhase::Bridge => Some(format!(
+            "Фаза: {} | {}",
+            combat.phase.title(),
+            if combat.bridge_held { "Мост захвачен (штраф реки снят)" } else { "Мост удерживается обороной" }
         )),
     }
 }
@@ -2156,7 +2246,9 @@ fn resolve_combats(
                 for (k, (_, striker)) in att_line.iter().enumerate() {
                     let (target_e, target) = &def_line[k % def_line.len()];
                     // Река между провинцией отправления этой дивизии и обороняемой — форсирование
-                    let over_river = striker.movement.is_some_and(|m| rivers.crosses(m.from, province));
+                    // Захваченный мост снимает речной штраф форсирования
+                    let over_river =
+                        !state.bridge_held && striker.movement.is_some_and(|m| rivers.crosses(m.from, province));
                     let ctx = HitContext::for_attack(&terrain, striker, over_river)
                         .with_air(air_attack_bonus_pct(att_air), air_defense_penalty_pct(def_air))
                         .with_tactics(att_mods.attack_pct, def_mods.defense_pct);
@@ -2983,6 +3075,7 @@ mod tests {
             tactic_change_day: 0,
             phase: CombatPhase::Default,
             phase_hours_left: 0,
+            bridge_held: false,
         });
         (app, att, def)
     }
@@ -3592,6 +3685,182 @@ mod tests {
             phase_text(&combat_of(&mut app)).as_deref(),
             Some("Фаза: Тактический отход (осталось 17 ч.) | Фронт сужен на 50%")
         );
+    }
+
+    /// Бой через реку создаётся настоящей системой `advance_marches`: атакующая дивизия приходит из провинции 1.
+    fn river_battle(river: bool) -> ActiveCombat {
+        let mut app = App::new();
+        let neighbors = BTreeMap::from([(1, BTreeSet::from([2])), (2, BTreeSet::from([1]))]);
+        app.add_event::<HourTick>()
+            .add_event::<ProvinceControllerChanged>()
+            .insert_resource(ProvinceMap::empty_for_test())
+            .insert_resource(ProvinceAdjacency { neighbors })
+            .insert_resource(ProvinceControllers(BTreeMap::from([(1, "GER".to_string()), (2, "FRA".to_string())])))
+            .insert_resource(ProvinceRivers(if river { BTreeSet::from([(1, 2)]) } else { BTreeSet::new() }))
+            .add_systems(Update, advance_marches);
+        let m = MovementProgress { from: 1, to: 2, hours_left: 1, total_hours: 24 };
+        spawn_division(&mut app, 1, "GER", 1, Some(m), 1);
+        spawn_division(&mut app, 101, "FRA", 2, None, 1);
+        tick(&mut app);
+        combat_of(&mut app)
+    }
+
+    #[test]
+    fn river_crossing_starts_the_battle_in_the_bridge_phase() {
+        let combat = river_battle(true);
+        assert_eq!(combat.phase, CombatPhase::Bridge);
+        assert_eq!(combat.phase_hours_left, 48);
+        assert_eq!((combat.attacker_tactic, combat.defender_tactic), (CombatTactic::SeizeBridge, CombatTactic::HoldBridge));
+        assert!(combat.is_attacker_countered && !combat.is_defender_countered, "удержание парирует захват");
+        assert!(!combat.bridge_held);
+        // без реки — обычный бой
+        let plain = river_battle(false);
+        assert_eq!(plain.phase, CombatPhase::Default);
+        assert_eq!((plain.attacker_tactic, plain.defender_tactic), (CombatTactic::Attack, CombatTactic::Defend));
+    }
+
+    #[test]
+    fn seize_bridge_removes_the_crossing_penalty() {
+        let (attacker, defender) = (make_neutral(1), make_neutral(2));
+        let seize = side_mods(CombatTactic::SeizeBridge, CombatTactic::RetakeBridge, true);
+        let defend = side_mods(CombatTactic::SeizeBridge, CombatTactic::RetakeBridge, false);
+        assert_eq!((seize.attack_pct, seize.damage_pct), (20, 100), "захват не парирован");
+        assert_eq!(defend.attack_pct, 15, "контрудар защитника +15%");
+        let strike = |river_penalty: u32| {
+            let ctx = HitContext { attack_penalty: river_penalty, ..HitContext::NONE }.with_tactics(seize.attack_pct, 0);
+            combat_bp_ctx(&attacker, &defender, 0, ctx)
+        };
+        // мост взят: штраф 0, атака 90 * 120 / 100 = 108 -> 800 * 108 / 333 = 259
+        assert_eq!(strike(0), 259);
+        // мост у обороны: штраф -30% (атака 63 -> 75) -> 800 * 75 / 300 = 200
+        assert_eq!(strike(30), 200);
+        // в бою: пока мост не взят, наступающий бьёт слабее, чем когда `bridge_held`
+        let loss = |held: bool| {
+            let (mut app, _att, def) = scenario(&[1], 1, 1);
+            app.world_mut().resource_mut::<ProvinceRivers>().0.insert((1, 2));
+            {
+                let world = app.world_mut();
+                let mut combat = world.query::<&mut ActiveCombat>().single_mut(world);
+                combat.phase = CombatPhase::Bridge;
+                combat.phase_hours_left = 48;
+                combat.attacker_tactic = CombatTactic::SeizeBridge;
+                combat.defender_tactic = CombatTactic::RetakeBridge;
+                combat.bridge_held = held;
+            }
+            tick(&mut app);
+            let d = app.world().get::<Division>(def[0]).expect("защитник");
+            d.max_org * 1000 - d.org_milli()
+        };
+        assert!(loss(true) > loss(false), "{} > {}", loss(true), loss(false));
+    }
+
+    #[test]
+    fn hold_bridge_keeps_the_penalty_and_adds_twenty_percent_defense() {
+        use CombatTactic::*;
+        let hold = side_mods(SeizeBridge, HoldBridge, false);
+        assert_eq!((hold.defense_pct, hold.damage_pct), (20, 125), "защита +20%, парирование даёт ещё +25% урона");
+        let seize = side_mods(SeizeBridge, HoldBridge, true);
+        assert_eq!(seize.attack_pct, 0, "парированный захват теряет бонус");
+        // мост остаётся у обороны, штраф реки на месте
+        assert!(!bridge_held_after(false, SeizeBridge, HoldBridge));
+        assert!(!bridge_held_after(true, SeizeBridge, HoldBridge), "удержание перехватывает мост");
+        // формула: атака 63 (штраф -30%), защита 225 * 120 / 100 = 270 -> 800 * 63 / 333 = 151
+        let (attacker, defender) = (make_neutral(1), make_neutral(2));
+        let ctx = HitContext { attack_penalty: 30, ..HitContext::NONE }.with_tactics(seize.attack_pct, hold.defense_pct);
+        assert_eq!(combat_bp_ctx(&attacker, &defender, 0, ctx), 151);
+        // без удержания защита ниже: 800 * 63 / 288 = 175
+        let ctx = HitContext { attack_penalty: 30, ..HitContext::NONE };
+        assert_eq!(combat_bp_ctx(&attacker, &defender, 0, ctx), 175);
+    }
+
+    #[test]
+    fn bridge_ownership_follows_the_tactics() {
+        use CombatTactic::*;
+        assert!(bridge_held_after(false, SeizeBridge, RetakeBridge), "захват без парирования берёт мост");
+        assert!(!bridge_held_after(true, SeizeBridge, RetakeBridge), "контрудар выбивает с уже взятого моста");
+        assert_eq!(SeizeBridge.counter_tactic(), Some(HoldBridge));
+        assert_eq!(HoldBridge.counter_tactic(), Some(RetakeBridge));
+        assert_eq!(RetakeBridge.counter_tactic(), None);
+        assert_eq!(
+            [SeizeBridge, HoldBridge, RetakeBridge].iter().map(CombatTactic::title).collect::<Vec<_>>(),
+            vec!["Захват моста", "Удержание моста", "Контрудар за мост"]
+        );
+    }
+
+    #[test]
+    fn engineers_double_the_weight_of_seize_bridge() {
+        use CombatTactic::*;
+        assert_eq!(crate::command::tactic_weight(SeizeBridge, None, None), 1);
+        assert_eq!(crate::command::tactic_weight(SeizeBridge, None, Some(SeizeBridge)), 2, "сапёры: вес ×2");
+        assert_eq!(crate::command::tactic_weight(Attack, None, Some(SeizeBridge)), 1, "другие тактики не затронуты");
+        // выбор из [захват, атака]: без сапёров 1 из 2, с сапёрами 2 из 3
+        let pool = [SeizeBridge, Attack];
+        let seized = |boost: Option<CombatTactic>, rolls: u64| {
+            (0..rolls).filter(|&r| pick_tactic_boosted(&pool, None, r, boost) == SeizeBridge).count()
+        };
+        assert_eq!(seized(None, 2), 1);
+        assert_eq!(seized(Some(SeizeBridge), 3), 2);
+    }
+
+    #[test]
+    fn bridge_phase_selects_only_river_tactics_deterministically() {
+        for engineers in [false, true] {
+            let mut defenders = BTreeSet::new();
+            for day in 0..60 {
+                let (a, d) = choose_bridge_tactics(9, day, 1, 101, None, engineers);
+                assert_eq!(a, CombatTactic::SeizeBridge);
+                assert!(BRIDGE_DEFENDER_TACTICS.contains(&d));
+                assert_eq!((a, d), choose_bridge_tactics(9, day, 1, 101, None, engineers));
+                defenders.insert(d);
+            }
+            assert_eq!(defenders.len(), 2, "защитники выбирают и удержание, и контрудар");
+        }
+    }
+
+    #[test]
+    fn daily_choice_in_bridge_phase_sets_the_bridge_and_leaves_the_phase() {
+        let (mut app, _att, _def) = scenario(&[1], 1, 1);
+        app.add_event::<DailyTickEvent>().add_systems(Update, select_combat_tactics);
+        let mut released = 0;
+        let mut kept = 0;
+        for day in 1..=40u32 {
+            // срок речной фазы вышел: выход зависит от того, взят ли мост
+            set_phase(&mut app, CombatPhase::Bridge, 0);
+            app.world_mut().send_event(DailyTickEvent { day, month: 5, year: 1936 });
+            app.update();
+            let combat = combat_of(&mut app);
+            assert_eq!(combat.attacker_tactic, CombatTactic::SeizeBridge);
+            assert!(BRIDGE_DEFENDER_TACTICS.contains(&combat.defender_tactic));
+            if combat.bridge_held {
+                assert_eq!((combat.phase, combat.phase_hours_left), (CombatPhase::Default, 0));
+                released += 1;
+            } else {
+                assert_eq!((combat.phase, combat.phase_hours_left), (CombatPhase::Bridge, 48), "мост не взят: фаза продлена");
+                kept += 1;
+            }
+            // сбрасываем мост на следующий проход
+            let world = app.world_mut();
+            world.query::<&mut ActiveCombat>().single_mut(world).bridge_held = false;
+        }
+        assert!(released > 0 && kept > 0, "встречаются оба исхода: {released} / {kept}");
+        // пока срок идёт, фаза не меняется
+        assert_eq!(next_bridge_phase(true, 20), (CombatPhase::Bridge, 20));
+        assert_eq!(next_bridge_phase(false, 0), (CombatPhase::Bridge, 48));
+        assert_eq!(next_bridge_phase(true, 0), (CombatPhase::Default, 0));
+    }
+
+    #[test]
+    fn bridge_phase_timer_and_status_text() {
+        let (mut app, _att, _def) = scenario(&[1; 4], 4, 1);
+        set_phase(&mut app, CombatPhase::Bridge, BRIDGE_PHASE_HOURS);
+        for _ in 0..24 {
+            tick(&mut app);
+        }
+        assert_eq!(combat_of(&mut app).phase_hours_left, 24, "таймер идёт по часовым тикам");
+        let mut combat = combat_of(&mut app);
+        assert_eq!(phase_text(&combat).as_deref(), Some("Фаза: Борьба за мост | Мост удерживается обороной"));
+        combat.bridge_held = true;
+        assert_eq!(phase_text(&combat).as_deref(), Some("Фаза: Борьба за мост | Мост захвачен (штраф реки снят)"));
     }
 
     #[test]
@@ -4328,6 +4597,7 @@ mod refit_tests {
             tactic_change_day: 0,
             phase: CombatPhase::Default,
             phase_hours_left: 0,
+            bridge_held: false,
         });
         order(&mut app, ids[0], "Panzer-Division");
         assert_eq!(template_of(&app, ids[0]), BASE_TEMPLATE, "в бою шаблон не меняется");

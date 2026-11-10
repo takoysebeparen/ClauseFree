@@ -37,7 +37,23 @@ pub enum CombatTactic {
     CounterAttack,
     /// Тактический отход: урон атакующего -25%, урон защитника -15%.
     TacticalWithdrawal,
+    // Речные (только в фазе борьбы за мост)
+    /// Захват моста (атака): урон +20%, при успехе снимает речной штраф; парируется удержанием моста.
+    SeizeBridge,
+    /// Удержание моста (оборона): защита +20%, сохраняет речной штраф; парируется контрударом.
+    HoldBridge,
+    /// Контрудар за мост (оборона): урон защитника +15%, выбивает врага с уже захваченного моста.
+    RetakeBridge,
 }
+
+/// Длительность речной фазы до проверки выхода, игровых часов.
+pub const BRIDGE_PHASE_HOURS: u32 = 48;
+/// Речные тактики наступающей стороны.
+pub const BRIDGE_ATTACKER_TACTICS: [CombatTactic; 1] = [CombatTactic::SeizeBridge];
+/// Речные тактики обороняющейся стороны.
+pub const BRIDGE_DEFENDER_TACTICS: [CombatTactic; 2] = [CombatTactic::HoldBridge, CombatTactic::RetakeBridge];
+/// Во сколько раз растёт вес захвата моста, если среди атакующих есть сапёры.
+pub const ENGINEERS_SEIZE_WEIGHT_MULT: u64 = 2;
 
 /// Длительность фазы тактического отхода, игровых часов.
 pub const WITHDRAWAL_PHASE_HOURS: u32 = 24;
@@ -54,6 +70,8 @@ pub enum CombatPhase {
     Default,
     /// Арьергардное сдерживание и отход: фронт вдвое уже, урон по обороняющимся слабее.
     TacticalWithdrawal,
+    /// Борьба за переправу: бой через реку, тактики только речные.
+    Bridge,
 }
 
 impl CombatPhase {
@@ -62,6 +80,7 @@ impl CombatPhase {
         match self {
             CombatPhase::Default => "Обычная",
             CombatPhase::TacticalWithdrawal => "Тактический отход",
+            CombatPhase::Bridge => "Борьба за мост",
         }
     }
 }
@@ -80,7 +99,12 @@ impl CombatTactic {
         match self {
             CombatTactic::Assault | CombatTactic::Encirclement => Some(CombatTactic::TacticalWithdrawal),
             CombatTactic::CounterAttack => Some(CombatTactic::Encirclement),
-            CombatTactic::Attack | CombatTactic::Defend | CombatTactic::TacticalWithdrawal => None,
+            CombatTactic::SeizeBridge => Some(CombatTactic::HoldBridge),
+            CombatTactic::HoldBridge => Some(CombatTactic::RetakeBridge),
+            CombatTactic::Attack
+            | CombatTactic::Defend
+            | CombatTactic::TacticalWithdrawal
+            | CombatTactic::RetakeBridge => None,
         }
     }
 
@@ -93,6 +117,9 @@ impl CombatTactic {
             CombatTactic::Defend => "Оборона",
             CombatTactic::CounterAttack => "Контратака",
             CombatTactic::TacticalWithdrawal => "Отход",
+            CombatTactic::SeizeBridge => "Захват моста",
+            CombatTactic::HoldBridge => "Удержание моста",
+            CombatTactic::RetakeBridge => "Контрудар за мост",
         }
     }
 }
@@ -125,10 +152,20 @@ pub fn side_mods(attacker: CombatTactic, defender: CombatTactic, for_attacker: b
         match own {
             CombatTactic::Attack => 5,
             CombatTactic::Assault | CombatTactic::Encirclement | CombatTactic::CounterAttack => 25,
-            CombatTactic::Defend | CombatTactic::TacticalWithdrawal => 0,
+            CombatTactic::SeizeBridge => 20,
+            CombatTactic::RetakeBridge => 15,
+            CombatTactic::Defend | CombatTactic::TacticalWithdrawal | CombatTactic::HoldBridge => 0,
         }
     };
-    let defense_pct = if !countered && own == CombatTactic::Defend { 5 } else { 0 };
+    let defense_pct = if countered {
+        0
+    } else {
+        match own {
+            CombatTactic::Defend => 5,
+            CombatTactic::HoldBridge => 20,
+            _ => 0,
+        }
+    };
     let mut damage_pct = 100;
     if enemy_countered {
         damage_pct = damage_pct * (100 + COUNTER_PICK_DAMAGE_PCT) / 100;
@@ -142,9 +179,29 @@ pub fn side_mods(attacker: CombatTactic, defender: CombatTactic, for_attacker: b
 /// Взвешенный выбор тактики из `options`: вес 1, у контр-пика к `enemy` (парирует его тактику) — 2.
 /// `roll` — детерминированный хэш; результат зависит только от входов.
 pub fn pick_tactic(options: &[CombatTactic], enemy: Option<CombatTactic>, roll: u64) -> CombatTactic {
-    let weight = |t: CombatTactic| -> u64 {
-        if enemy.is_some_and(|e| e.counter_tactic() == Some(t)) { 2 } else { 1 }
-    };
+    pick_tactic_boosted(options, enemy, roll, None)
+}
+
+/// Вес тактики при выборе: 1; контр-пик к тактике врага ×2; тактика с повышением (`boost`) ещё ×2.
+pub fn tactic_weight(tactic: CombatTactic, enemy: Option<CombatTactic>, boost: Option<CombatTactic>) -> u64 {
+    let mut weight = 1;
+    if enemy.is_some_and(|e| e.counter_tactic() == Some(tactic)) {
+        weight *= 2;
+    }
+    if boost == Some(tactic) {
+        weight *= ENGINEERS_SEIZE_WEIGHT_MULT;
+    }
+    weight
+}
+
+/// Как `pick_tactic`, но тактика `boost` (захват моста при сапёрах) весит вдвое больше.
+pub fn pick_tactic_boosted(
+    options: &[CombatTactic],
+    enemy: Option<CombatTactic>,
+    roll: u64,
+    boost: Option<CombatTactic>,
+) -> CombatTactic {
+    let weight = |t: CombatTactic| -> u64 { tactic_weight(t, enemy, boost) };
     let total: u64 = options.iter().map(|&t| weight(t)).sum();
     let mut point = if total == 0 { 0 } else { roll % total };
     for &tactic in options {
