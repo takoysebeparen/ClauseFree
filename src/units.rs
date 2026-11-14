@@ -494,16 +494,23 @@ pub fn parse_division_templates(text: &str) -> Vec<TemplateSpec> {
 /// Собирает шаблон по скрипту. Неизвестный тип полка или роты -> `None` (шаблон остаётся прежним).
 /// Роты поддержки едут со скоростью самого медленного боевого батальона, чтобы не тормозить колонну.
 pub fn build_template(spec: &TemplateSpec) -> Option<DivisionTemplate> {
+    build_template_with(spec, &BTreeMap::new())
+}
+
+/// То же, но со статами батальонов из `common/units/` (пустая карта — только встроенные значения).
+pub fn build_template_with(spec: &TemplateSpec, stats: &BTreeMap<String, UnitStats>) -> Option<DivisionTemplate> {
     let mut battalions = Vec::new();
     for kind in &spec.regiments {
-        battalions.push(match kind.as_str() {
+        let mut def = match kind.as_str() {
             "infantry" => BattalionDef::infantry(),
             "motorized" => BattalionDef::motorized(),
             "mountaineers" => BattalionDef::mountaineers(),
             "cavalry" => BattalionDef::cavalry(),
             "light_armor" => BattalionDef::light_tank(),
             _ => return None,
-        });
+        };
+        apply_real_stats(&mut def, kind, stats);
+        battalions.push(def);
     }
     if battalions.is_empty() {
         return None;
@@ -517,10 +524,193 @@ pub fn build_template(spec: &TemplateSpec) -> Option<DivisionTemplate> {
             "mot_recon" => BattalionDef::support_mot_recon(),
             _ => return None,
         };
+        apply_real_stats(&mut def, kind, stats);
         def.speed_kph = speed;
         battalions.push(def);
     }
     Some(DivisionTemplate { name: spec.name.clone(), battalions })
+}
+
+/// Реальные поля батальона из `common/units/*.txt` (`sub_units = { имя = { .. } }`).
+/// Дробные числа Paradox хранятся целыми сотыми долями (`0.3` -> 30, `-0.5` -> -50): ни одного `f32`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnitStats {
+    /// Скалярные поля блока в сотых долях: `max_strength`, `max_organisation`, `default_morale`, `combat_width`,
+    /// `manpower`, `maximum_speed`, `soft_attack`, `hard_attack`, `defense`, `breakthrough`, `armor_value`,
+    /// `ap_attack`, `entrenchment`.
+    pub fields: BTreeMap<String, i32>,
+    /// Блок `need = { снаряжение = количество }`.
+    pub needs: BTreeMap<String, u32>,
+}
+
+/// Поля, которые разбираются из блока батальона.
+const UNIT_FIELDS: [&str; 13] = [
+    "max_strength",
+    "max_organisation",
+    "default_morale",
+    "combat_width",
+    "manpower",
+    "maximum_speed",
+    "soft_attack",
+    "hard_attack",
+    "defense",
+    "breakthrough",
+    "armor_value",
+    "ap_attack",
+    "entrenchment",
+];
+
+impl UnitStats {
+    /// Целое значение поля (сотые доли делятся на 100, отрицательные -> `None`).
+    pub fn uint(&self, name: &str) -> Option<u32> {
+        self.fields.get(name).and_then(|&v| u32::try_from(v).ok()).map(|v| v / 100)
+    }
+
+    /// Скорость в нашей шкале `speed_kph` (км/ч × 10). Значения меньше 1.0 в юнит-файлах — множитель
+    /// (`0.6` -> 60, как у кавалерии), от 1.0 — км/ч (`4.0` -> 40, `12` -> 120).
+    pub fn speed_kph(&self) -> Option<u32> {
+        let hundredths = u32::try_from(*self.fields.get("maximum_speed")?).ok().filter(|&h| h > 0)?;
+        Some(if hundredths < 100 { hundredths } else { hundredths / 10 })
+    }
+}
+
+/// Число Paradox (`4`, `0.30`, `-0.5`, `.25`) -> сотые доли без чисел с плавающей точкой. Мусор -> `None`.
+pub fn parse_hundredths(text: &str) -> Option<i32> {
+    let (negative, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+    if (int_part.is_empty() && frac_part.is_empty())
+        || int_part.len() > 6
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let whole: i32 = if int_part.is_empty() { 0 } else { int_part.parse().ok()? };
+    let mut digits = frac_part.bytes().take(2).map(|b| i32::from(b - b'0'));
+    let tens = digits.next().unwrap_or(0);
+    let ones = digits.next().unwrap_or(0);
+    let value = whole * 100 + tens * 10 + ones;
+    Some(if negative { -value } else { value })
+}
+
+/// Разбирает `sub_units = { имя = { поля.. need = { .. } } }`. Вложенные блоки (`river`, модификаторы
+/// местности и т. п.) не читаются: берутся только поля самого батальона. Мусор не вызывает паник.
+pub fn parse_unit_stats(text: &str) -> BTreeMap<String, UnitStats> {
+    let tokens = crate::map::tokenize(text);
+    let mut stack: Vec<String> = Vec::new();
+    let mut out: BTreeMap<String, UnitStats> = BTreeMap::new();
+    for i in 0..tokens.len() {
+        match tokens[i].as_str() {
+            "{" => {
+                let key = if i >= 2 && tokens[i - 1] == "=" { tokens[i - 2].clone() } else { String::new() };
+                stack.push(key);
+                if let [root, name] = stack.as_slice() {
+                    if root == "sub_units" {
+                        out.entry(name.clone()).or_default();
+                    }
+                }
+            }
+            "}" => {
+                stack.pop();
+            }
+            "=" => {}
+            key => {
+                if tokens.get(i + 1).map(String::as_str) != Some("=") {
+                    continue;
+                }
+                let Some(value) = tokens.get(i + 2).filter(|v| !matches!(v.as_str(), "{" | "}")) else { continue };
+                match stack.as_slice() {
+                    [root, name] if root == "sub_units" && UNIT_FIELDS.contains(&key) => {
+                        if let (Some(v), Some(stats)) = (parse_hundredths(value), out.get_mut(name)) {
+                            stats.fields.insert(key.to_string(), v);
+                        }
+                    }
+                    [root, name, need] if root == "sub_units" && need == "need" => {
+                        if let (Some(v), Some(stats)) = (parse_hundredths(value), out.get_mut(name)) {
+                            stats.needs.insert(key.to_string(), u32::try_from(v / 100).unwrap_or(0));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Читает все `common/units/*.txt` игры (только верхний уровень каталога). Нет папки или файла — пустая карта.
+pub fn load_unit_stats(root: &std::path::Path) -> BTreeMap<String, UnitStats> {
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("common").join("units"))
+        .map(|dir| {
+            dir.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "txt"))
+                .collect()
+        })
+        .unwrap_or_default();
+    paths.sort();
+    let mut all: BTreeMap<String, UnitStats> = BTreeMap::new();
+    for path in paths {
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let text = String::from_utf8_lossy(&bytes);
+        for (name, stats) in parse_unit_stats(text.trim_start_matches('\u{feff}')) {
+            all.entry(name).or_insert(stats);
+        }
+    }
+    all
+}
+
+/// Тип снаряжения по ключу `need` игры.
+fn equipment_of_need(key: &str) -> Option<EquipmentType> {
+    match key {
+        "infantry_equipment" => Some(EquipmentType::InfantryEquipment),
+        "support_equipment" => Some(EquipmentType::SupportEquipment),
+        "artillery_equipment" => Some(EquipmentType::Artillery),
+        "light_tank_chassis" => Some(EquipmentType::LightTank),
+        "medium_tank_chassis" => Some(EquipmentType::MediumTank),
+        _ => None,
+    }
+}
+
+/// Накладывает реальные цифры игры на встроенный батальон: личный состав, организацию и ширину боевых
+/// батальонов, скорость и потребность в снаряжении своего типа. Атака, защита и прочность в юнит-файлах —
+/// относительные модификаторы или в другой шкале (их даёт техника), поэтому остаются встроенными.
+fn apply_real_stats(def: &mut BattalionDef, kind: &str, stats: &BTreeMap<String, UnitStats>) {
+    let Some(real) = stats.get(kind) else { return };
+    if let Some(v) = real.uint("manpower").filter(|&v| v > 0) {
+        def.manpower = v;
+    }
+    if !def.is_support {
+        if let Some(v) = real.uint("max_organisation") {
+            def.max_org = v;
+        }
+        if let Some(v) = real.uint("combat_width") {
+            def.combat_width = v;
+        }
+        if let Some(v) = real.speed_kph() {
+            def.speed_kph = v;
+        }
+    }
+    let own = def.equipment_needs.0;
+    if let Some((_, amount)) = real.needs.iter().find(|(k, n)| **n > 0 && equipment_of_need(k.as_str()) == Some(own)) {
+        def.equipment_needs.1 = *amount;
+    }
+}
+
+/// Встроенные копии германских шаблонов (как в `Default`): через них же накладываются реальные статы.
+fn ger_builtin_specs() -> Vec<TemplateSpec> {
+    let spec = |name: &str, regiments: &[(&str, usize)], support: &[&str]| TemplateSpec {
+        name: name.to_string(),
+        regiments: regiments.iter().flat_map(|&(k, n)| std::iter::repeat(k.to_string()).take(n)).collect(),
+        support: support.iter().map(|k| k.to_string()).collect(),
+    };
+    vec![
+        spec(BASE_TEMPLATE, &[("infantry", 9)], &["engineer", "artillery"]),
+        spec("Infanterie-Division (mot.)", &[("motorized", 9)], &[]),
+        spec("Panzer-Division", &[("light_armor", 4), ("motorized", 2)], &[]),
+    ]
 }
 
 /// Встроенные копии французских шаблонов (состав как в `FRA_1936.txt`) — запас, если игры нет.
@@ -604,6 +794,14 @@ impl DivisionTemplates {
     /// остаётся встроенная копия (никаких паник).
     pub fn with_game_files(root: &std::path::Path) -> Self {
         let mut registry = Self::default();
+        let stats = load_unit_stats(root);
+        println!("[ШАБЛОН] Типов батальонов прочитано из common/units: {}", stats.len());
+        // встроенные шаблоны Германии и Франции пересобираются с реальными цифрами батальонов
+        for spec in ger_builtin_specs().iter().chain(fra_fallback_specs().iter()) {
+            if let Some(template) = build_template_with(spec, &stats) {
+                registry.templates.insert(spec.name.clone(), template);
+            }
+        }
         let path = root.join("history").join("units").join("FRA_1936.txt");
         let Ok(bytes) = std::fs::read(&path) else {
             eprintln!("[ПРЕДУПРЕЖДЕНИЕ] шаблоны FRA: {:?} не прочитан, используются встроенные", path);
@@ -616,7 +814,7 @@ impl DivisionTemplates {
             if !FRA_TEMPLATE_NAMES.contains(&spec.name.as_str()) {
                 continue;
             }
-            if let Some(template) = build_template(&spec) {
+            if let Some(template) = build_template_with(&spec, &stats) {
                 registry.templates.insert(spec.name.clone(), template);
                 loaded += 1;
             }
@@ -910,7 +1108,7 @@ mod fra_template_tests {
         assert_eq!(stats("Brigade Coloniale").0, 6);
     }
 
-    /// Реальный FRA_1936.txt (пропускается без игры): все 8 шаблонов разобраны и совпадают со встроенными копиями.
+    /// Реальный FRA_1936.txt (пропускается без игры): все 8 шаблонов разобраны, состав совпадает со встроенными копиями.
     #[test]
     fn real_file_templates_match_the_builtin_copies() {
         let root = Path::new(GAME);
@@ -925,8 +1123,125 @@ mod fra_template_tests {
         let (builtin, real) = (DivisionTemplates::default(), DivisionTemplates::with_game_files(root));
         for name in FRA_TEMPLATE_NAMES {
             let (a, b) = (builtin.get(name).expect("встроенный"), real.get(name).expect("из файла"));
-            assert_eq!(a.calculate_stats(), b.calculate_stats(), "{name}");
+            // состав и символ совпадают; цифры батальонов в файле игры могут отличаться от встроенных
+            assert_eq!(a.battalion_count(), b.battalion_count(), "{name}");
+            assert_eq!(a.battalions.len(), b.battalions.len(), "{name}");
             assert_eq!(a.nato_symbol(), b.nato_symbol(), "{name}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod real_stats_tests {
+    use super::*;
+    use std::path::Path;
+
+    const GAME: &str = "D:\\SteamLibrary\\steamapps\\common\\Hearts of Iron IV";
+
+    const SAMPLE: &str = "sub_units = {\n\tinfantry = { # пехота\n\t\tcombat_width = 2\n\t\tmax_strength = 25\n\t\tmax_organisation = 60\n\t\tdefault_morale = 0.3\n\t\tmanpower = 1000\n\t\tneed = {\n\t\t\tinfantry_equipment = 100\n\t\t}\n\t\tforest = {\n\t\t\tmovement = 0.1\n\t\t\tdefense = 0.9\n\t\t}\n\t}\n\tcavalry = {\n\t\tmax_organisation = 70\n\t\tmaximum_speed = 0.6\n\t\tmanpower = 1200\n\t\tentrenchment = 2\n\t\tsoft_attack = -0.5\n\t\tneed = { infantry_equipment = 120 support_equipment = 10 }\n\t}\n}";
+
+    #[test]
+    fn hundredths_parsing_is_integer_only() {
+        assert_eq!(parse_hundredths("4"), Some(400));
+        assert_eq!(parse_hundredths("4.0"), Some(400));
+        assert_eq!(parse_hundredths("0.30"), Some(30));
+        assert_eq!(parse_hundredths("0.6"), Some(60));
+        assert_eq!(parse_hundredths(".25"), Some(25));
+        assert_eq!(parse_hundredths("-0.5"), Some(-50));
+        assert_eq!(parse_hundredths("12.349"), Some(1234), "лишние знаки отбрасываются");
+        assert_eq!(parse_hundredths("abc"), None);
+        assert_eq!(parse_hundredths(""), None);
+        assert_eq!(parse_hundredths("."), None);
+        assert_eq!(parse_hundredths("1.2.3"), None);
+        assert_eq!(parse_hundredths("99999999"), None, "переполнение отклоняется");
+    }
+
+    #[test]
+    fn battalion_block_is_parsed_without_nested_modifiers() {
+        let stats = parse_unit_stats(SAMPLE);
+        let inf = &stats["infantry"];
+        assert_eq!(inf.uint("combat_width"), Some(2));
+        assert_eq!(inf.uint("max_strength"), Some(25));
+        assert_eq!(inf.uint("max_organisation"), Some(60));
+        assert_eq!(inf.fields["default_morale"], 30);
+        assert_eq!(inf.uint("manpower"), Some(1000));
+        assert_eq!(inf.needs.get("infantry_equipment"), Some(&100));
+        assert_eq!(inf.fields.get("defense"), None, "защита из блока местности не читается");
+        assert_eq!(inf.fields.get("movement"), None);
+        let cav = &stats["cavalry"];
+        assert_eq!(cav.fields["soft_attack"], -50);
+        assert_eq!(cav.uint("soft_attack"), None, "отрицательное не беззнаковое");
+        assert_eq!(cav.fields["entrenchment"], 200);
+        assert_eq!(cav.needs.len(), 2);
+    }
+
+    #[test]
+    fn maximum_speed_maps_to_the_integer_scale() {
+        let speed = |v: &str| {
+            let text = format!("sub_units = {{ u = {{ maximum_speed = {v} }} }}");
+            parse_unit_stats(&text)["u"].speed_kph()
+        };
+        assert_eq!(speed("4.0"), Some(40));
+        assert_eq!(speed("8.0"), Some(80));
+        assert_eq!(speed("12"), Some(120));
+        assert_eq!(speed("0.6"), Some(60), "множитель юнит-файла: как у кавалерии");
+        assert_eq!(speed("0"), None);
+        assert_eq!(parse_unit_stats("sub_units = { u = { } }")["u"].speed_kph(), None);
+    }
+
+    #[test]
+    fn real_stats_override_the_builtin_battalion_and_missing_ones_keep_it() {
+        let stats = parse_unit_stats(SAMPLE);
+        let spec = |kind: &str| TemplateSpec { name: "T".into(), regiments: vec![kind.into()], support: vec![] };
+        let cav = build_template_with(&spec("cavalry"), &stats).expect("шаблон").battalions[0].clone();
+        assert_eq!((cav.manpower, cav.max_org, cav.speed_kph), (1200, 70, 60));
+        assert_eq!(cav.equipment_needs, (EquipmentType::InfantryEquipment, 120));
+        // типа нет в файле -> встроенные значения
+        let mot = build_template_with(&spec("motorized"), &stats).expect("шаблон").battalions[0].clone();
+        assert_eq!(mot, BattalionDef::motorized());
+        // пустая карта = встроенный шаблон
+        assert_eq!(build_template(&spec("infantry")).expect("шаблон").battalions[0], BattalionDef::infantry());
+    }
+
+    #[test]
+    fn without_the_game_templates_stay_builtin() {
+        let none = DivisionTemplates::with_game_files(Path::new("Z:\\нет\\игры"));
+        let builtin = DivisionTemplates::default();
+        for name in [BASE_TEMPLATE, "Infanterie-Division (mot.)", "Panzer-Division"].into_iter().chain(FRA_TEMPLATE_NAMES) {
+            assert_eq!(
+                none.get(name).map(DivisionTemplate::calculate_stats),
+                builtin.get(name).map(DivisionTemplate::calculate_stats),
+                "{name}"
+            );
+        }
+        assert!(load_unit_stats(Path::new("Z:\\нет\\игры")).is_empty());
+    }
+
+    /// Реальные common/units (пропускается без игры).
+    #[test]
+    fn real_game_stats_feed_the_templates() {
+        let root = Path::new(GAME);
+        if !root.exists() {
+            return;
+        }
+        let stats = load_unit_stats(root);
+        for kind in ["infantry", "motorized", "mountaineers", "cavalry", "light_armor", "medium_armor", "artillery", "engineer", "recon", "mot_recon"] {
+            assert!(stats.contains_key(kind), "{kind}");
+        }
+        let inf = &stats["infantry"];
+        assert_eq!((inf.uint("manpower"), inf.uint("max_organisation"), inf.uint("combat_width")), (Some(1000), Some(60), Some(2)));
+        assert_eq!(inf.needs.get("infantry_equipment"), Some(&100));
+        assert_eq!(stats["cavalry"].speed_kph(), Some(60));
+        assert_eq!(stats["motorized"].uint("manpower"), Some(1200));
+        // шаблоны собраны с реальными цифрами: мотопехота тяжелее по личному составу, структура прежняя
+        let (builtin, real) = (DivisionTemplates::default(), DivisionTemplates::with_game_files(root));
+        let mot = "Division d'Infanterie Motorisée";
+        assert_eq!(real.get(mot).map(DivisionTemplate::battalion_count), builtin.get(mot).map(DivisionTemplate::battalion_count));
+        let manpower = |r: &DivisionTemplates| r.get(mot).map(|t| t.calculate_stats().total_manpower).unwrap_or(0);
+        assert!(manpower(&real) > manpower(&builtin), "1200 против 1000 на батальон");
+        for name in FRA_TEMPLATE_NAMES {
+            let stats = real.get(name).map(DivisionTemplate::calculate_stats).expect("шаблон");
+            assert!(stats.total_manpower > 0 && stats.max_speed > 0, "{name}");
         }
     }
 }

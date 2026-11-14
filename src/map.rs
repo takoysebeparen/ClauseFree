@@ -395,6 +395,7 @@ impl Plugin for MapPlugin {
         // Order of Battle 1936 (GER, FRA): читается на лету, спавн — в division.rs
         app.insert_resource(crate::oob::load_oob(&self.root));
         app.insert_resource(crate::units::DivisionTemplates::with_game_files(&self.root));
+        app.insert_resource(crate::command::load_commander_pool(&self.root));
 
         // Логистика: узлы снабжения и железные дороги
         let supply_nodes = load_supply_nodes(&self.root);
