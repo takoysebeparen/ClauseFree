@@ -283,8 +283,22 @@ impl BattalionDef {
         }
     }
 
+    /// Конный батальон: 600 человек, 6.0 км/ч, разведка 2.
+    pub fn cavalry() -> Self {
+        Self { manpower: 600, max_org: 40, soft_attack: 8, defense: 15, speed_kph: 60, recon: 2, ..Self::infantry() }
+    }
+
+    /// Горные стрелки: пехота с повышенной организацией и защитой.
+    pub fn mountaineers() -> Self {
+        Self { max_org: 65, defense: 30, ..Self::infantry() }
+    }
+
+    /// Моторизованная рота разведки (бронеавтомобили и мотоциклы): разведка 3.
+    pub fn support_mot_recon() -> Self {
+        Self { recon: 3, ..Self::support_recon() }
+    }
+
     /// Рота разведки: разведка 2.
-    #[allow(dead_code)]
     pub fn support_recon() -> Self {
         Self {
             manpower: 200,
@@ -415,6 +429,119 @@ impl DivisionTemplate {
     }
 }
 
+/// Названия французских шаблонов из `history/units/FRA_1936.txt`.
+pub const FRA_TEMPLATE_NAMES: [&str; 8] = [
+    "Division d'Infanterie",
+    "Division Coloniale",
+    "Division d'Infanterie Motorisée",
+    "Division d'Infanterie Alpine",
+    "Division de Cavalerie",
+    "Division Légère Mécanique",
+    "Brigade de Chars de Combat",
+    "Brigade Coloniale",
+];
+
+/// Шаблон дивизии из скрипта: имя, типы полков и рот поддержки по порядку файла.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TemplateSpec {
+    pub name: String,
+    pub regiments: Vec<String>,
+    pub support: Vec<String>,
+}
+
+/// Читает все `division_template = { name = ".." regiments = { тип = { x y } .. } support = { .. } }`.
+/// Мусор и обрезанный текст дают меньше шаблонов, но не панику.
+pub fn parse_division_templates(text: &str) -> Vec<TemplateSpec> {
+    let tokens = crate::map::tokenize(text);
+    let mut stack: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    let mut current: Option<TemplateSpec> = None;
+    for i in 0..tokens.len() {
+        match tokens[i].as_str() {
+            "{" => {
+                let key = if i >= 2 && tokens[i - 1] == "=" { tokens[i - 2].clone() } else { String::new() };
+                stack.push(key);
+                if stack.len() == 1 && stack[0] == "division_template" {
+                    current = Some(TemplateSpec::default());
+                }
+            }
+            "}" => {
+                if stack.len() == 1 && stack[0] == "division_template" {
+                    if let Some(spec) = current.take().filter(|s| !s.name.is_empty()) {
+                        out.push(spec);
+                    }
+                }
+                stack.pop();
+            }
+            "=" => {}
+            key => {
+                if tokens.get(i + 1).map(String::as_str) != Some("=") {
+                    continue;
+                }
+                let (Some(value), Some(spec)) = (tokens.get(i + 2), current.as_mut()) else { continue };
+                match stack.as_slice() {
+                    [t] if t == "division_template" && key == "name" => spec.name = value.clone(),
+                    [t, r] if t == "division_template" && r == "regiments" && value == "{" => spec.regiments.push(key.to_string()),
+                    [t, r] if t == "division_template" && r == "support" && value == "{" => spec.support.push(key.to_string()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Собирает шаблон по скрипту. Неизвестный тип полка или роты -> `None` (шаблон остаётся прежним).
+/// Роты поддержки едут со скоростью самого медленного боевого батальона, чтобы не тормозить колонну.
+pub fn build_template(spec: &TemplateSpec) -> Option<DivisionTemplate> {
+    let mut battalions = Vec::new();
+    for kind in &spec.regiments {
+        battalions.push(match kind.as_str() {
+            "infantry" => BattalionDef::infantry(),
+            "motorized" => BattalionDef::motorized(),
+            "mountaineers" => BattalionDef::mountaineers(),
+            "cavalry" => BattalionDef::cavalry(),
+            "light_armor" => BattalionDef::light_tank(),
+            _ => return None,
+        });
+    }
+    if battalions.is_empty() {
+        return None;
+    }
+    let speed = battalions.iter().map(|b| b.speed_kph).min().unwrap_or(INFANTRY_SPEED_KPH);
+    for kind in &spec.support {
+        let mut def = match kind.as_str() {
+            "artillery" => BattalionDef::support_artillery(),
+            "engineer" => BattalionDef::engineers(),
+            "recon" => BattalionDef::support_recon(),
+            "mot_recon" => BattalionDef::support_mot_recon(),
+            _ => return None,
+        };
+        def.speed_kph = speed;
+        battalions.push(def);
+    }
+    Some(DivisionTemplate { name: spec.name.clone(), battalions })
+}
+
+/// Встроенные копии французских шаблонов (состав как в `FRA_1936.txt`) — запас, если игры нет.
+fn fra_fallback_specs() -> Vec<TemplateSpec> {
+    let spec = |name: &str, regiments: &[(&str, usize)], support: &[&str]| TemplateSpec {
+        name: name.to_string(),
+        regiments: regiments.iter().flat_map(|&(k, n)| std::iter::repeat(k.to_string()).take(n)).collect(),
+        support: support.iter().map(|k| k.to_string()).collect(),
+    };
+    vec![
+        spec(FRA_TEMPLATE_NAMES[0], &[("infantry", 9)], &["artillery", "engineer"]),
+        spec(FRA_TEMPLATE_NAMES[1], &[("infantry", 9)], &["artillery"]),
+        spec(FRA_TEMPLATE_NAMES[2], &[("motorized", 9)], &["mot_recon", "artillery", "engineer"]),
+        spec(FRA_TEMPLATE_NAMES[3], &[("mountaineers", 12)], &[]),
+        spec(FRA_TEMPLATE_NAMES[4], &[("cavalry", 4)], &["recon"]),
+        spec(FRA_TEMPLATE_NAMES[5], &[("light_armor", 2), ("motorized", 4)], &["mot_recon", "engineer"]),
+        spec(FRA_TEMPLATE_NAMES[6], &[("light_armor", 4)], &[]),
+        spec(FRA_TEMPLATE_NAMES[7], &[("infantry", 6)], &[]),
+    ]
+}
+
 /// Шаблон из списка «(тип батальона, сколько)».
 fn template(name: &str, composition: &[(BattalionDef, usize)]) -> DivisionTemplate {
     let battalions = composition.iter().flat_map(|(def, n)| std::iter::repeat(def.clone()).take(*n)).collect();
@@ -446,6 +573,7 @@ impl Default for DivisionTemplates {
             template("Infanterie-Division (mot.)", &[(BattalionDef::motorized(), 9)]),
             template("Panzer-Division", &[(BattalionDef::light_tank(), 4), (BattalionDef::motorized(), 2)]),
         ];
+        defs.extend(fra_fallback_specs().iter().filter_map(build_template));
         #[cfg(test)]
         defs.push(template(PLAIN_INFANTRY_TEMPLATE, &[(BattalionDef::infantry(), 9)]));
         Self { templates: defs.into_iter().map(|t| (t.name.clone(), t)).collect() }
@@ -456,12 +584,47 @@ impl Default for DivisionTemplates {
 fn available_template_names(country: &str) -> &'static [&'static str] {
     match country {
         "GER" => &[BASE_TEMPLATE, "Infanterie-Division (mot.)", "Panzer-Division"],
-        "FRA" => &[BASE_TEMPLATE, "Infanterie-Division (mot.)"],
+        "FRA" => &[
+            FRA_TEMPLATE_NAMES[0],
+            FRA_TEMPLATE_NAMES[1],
+            FRA_TEMPLATE_NAMES[2],
+            FRA_TEMPLATE_NAMES[3],
+            FRA_TEMPLATE_NAMES[4],
+            FRA_TEMPLATE_NAMES[5],
+            FRA_TEMPLATE_NAMES[6],
+            FRA_TEMPLATE_NAMES[7],
+            BASE_TEMPLATE,
+        ],
         _ => &[BASE_TEMPLATE],
     }
 }
 
 impl DivisionTemplates {
+    /// Реестр с шаблонами Франции из `history/units/FRA_1936.txt` игры. Нет файла или шаблон не разобран —
+    /// остаётся встроенная копия (никаких паник).
+    pub fn with_game_files(root: &std::path::Path) -> Self {
+        let mut registry = Self::default();
+        let path = root.join("history").join("units").join("FRA_1936.txt");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("[ПРЕДУПРЕЖДЕНИЕ] шаблоны FRA: {:?} не прочитан, используются встроенные", path);
+            return registry;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let mut loaded = 0;
+        for spec in parse_division_templates(text.trim_start_matches('\u{feff}')) {
+            // заменяем только известные нации шаблоны
+            if !FRA_TEMPLATE_NAMES.contains(&spec.name.as_str()) {
+                continue;
+            }
+            if let Some(template) = build_template(&spec) {
+                registry.templates.insert(spec.name.clone(), template);
+                loaded += 1;
+            }
+        }
+        println!("[ШАБЛОН] FRA: прочитано шаблонов из FRA_1936.txt: {loaded}");
+        registry
+    }
+
     /// Шаблон по имени или базовый, если такого нет в реестре.
     pub fn get_or_base(&self, name: &str) -> &DivisionTemplate {
         self.templates
@@ -652,7 +815,9 @@ mod tests {
         assert!(registry.get("Нет такого").is_none(), "get не подставляет базовый шаблон");
         // у Германии есть танковая дивизия, у Франции — нет; прочим странам доступна только пехота
         assert_eq!(registry.available_names("GER"), vec![BASE_TEMPLATE, "Infanterie-Division (mot.)", "Panzer-Division"]);
-        assert_eq!(registry.available_names("FRA"), vec![BASE_TEMPLATE, "Infanterie-Division (mot.)"]);
+        let mut fra: Vec<&str> = FRA_TEMPLATE_NAMES.to_vec();
+        fra.push(BASE_TEMPLATE);
+        assert_eq!(registry.available_names("FRA"), fra);
         assert_eq!(registry.available_names("ITA"), vec![BASE_TEMPLATE]);
         assert!(registry.is_available("GER", "Panzer-Division"));
         assert!(!registry.is_available("FRA", "Panzer-Division"));
@@ -665,5 +830,103 @@ mod tests {
         // 3 средних танка + 3 пехотных: макс. 50, средняя 25 -> (50 * 30 + 25 * 70) / 100 = 32
         let stats = template("m", &[(BattalionDef::medium_tank(), 3), (BattalionDef::infantry(), 3)]).calculate_stats();
         assert_eq!(stats.armor, 32);
+    }
+}
+
+#[cfg(test)]
+mod fra_template_tests {
+    use super::*;
+    use std::path::Path;
+
+    const GAME: &str = "D:\\SteamLibrary\\steamapps\\common\\Hearts of Iron IV";
+
+    fn symbol(registry: &DivisionTemplates, name: &str) -> NatoSymbol {
+        registry.get(name).map(DivisionTemplate::nato_symbol).unwrap_or_default()
+    }
+
+    #[test]
+    fn parser_reads_names_regiments_and_support() {
+        let text = "division_template = {\n name = \"Division d'Infanterie\" # комментарий\n division_names_group = FRA_INF_01\n regiments = {\n  infantry = { x = 0 y = 0 }\n  infantry = { x = 0 y = 1 }\n }\n support = {\n  artillery = { x = 0 y = 0 }\n  engineer = { x = 0 y = 1 }\n }\n}\ndivision_template = {\n name = \"Brigade\"\n regiments = { cavalry = { x = 0 y = 0 } }\n priority = 0\n}\nunits = { division = { division_template = \"Brigade\" } }";
+        let specs = parse_division_templates(text);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "Division d'Infanterie");
+        assert_eq!(specs[0].regiments, vec!["infantry", "infantry"]);
+        assert_eq!(specs[0].support, vec!["artillery", "engineer"]);
+        assert_eq!((specs[1].name.as_str(), specs[1].regiments.len(), specs[1].support.len()), ("Brigade", 1, 0));
+    }
+
+    #[test]
+    fn broken_scripts_and_unknown_kinds_never_panic() {
+        assert!(parse_division_templates("").is_empty());
+        assert!(parse_division_templates("division_template = { name = ").is_empty());
+        assert!(parse_division_templates("}}}} = = { {").is_empty());
+        let unknown = TemplateSpec { name: "X".into(), regiments: vec!["spaceship".into()], support: vec![] };
+        assert!(build_template(&unknown).is_none());
+        let empty = TemplateSpec { name: "Y".into(), ..Default::default() };
+        assert!(build_template(&empty).is_none());
+        // нет папки игры -> встроенные шаблоны
+        let registry = DivisionTemplates::with_game_files(Path::new("Z:\\нет\\игры"));
+        assert!(FRA_TEMPLATE_NAMES.iter().all(|n| registry.get(n).is_some()));
+    }
+
+    #[test]
+    fn french_templates_are_available_to_france_only() {
+        let registry = DivisionTemplates::default();
+        for name in FRA_TEMPLATE_NAMES {
+            assert!(registry.is_available("FRA", name), "{name}");
+            assert!(!registry.is_available("GER", name), "{name} у Германии");
+        }
+    }
+
+    #[test]
+    fn french_templates_have_the_right_nato_symbols() {
+        let r = DivisionTemplates::default();
+        assert_eq!(symbol(&r, "Division d'Infanterie"), NatoSymbol::Infantry);
+        assert_eq!(symbol(&r, "Division Coloniale"), NatoSymbol::Infantry);
+        assert_eq!(symbol(&r, "Division d'Infanterie Alpine"), NatoSymbol::Infantry);
+        assert_eq!(symbol(&r, "Brigade Coloniale"), NatoSymbol::Infantry);
+        assert_eq!(symbol(&r, "Division d'Infanterie Motorisée"), NatoSymbol::Motorized);
+        assert_eq!(symbol(&r, "Division de Cavalerie"), NatoSymbol::Cavalry);
+        assert_eq!(symbol(&r, "Division Légère Mécanique"), NatoSymbol::Armored);
+        assert_eq!(symbol(&r, "Brigade de Chars de Combat"), NatoSymbol::Armored);
+    }
+
+    #[test]
+    fn french_templates_have_the_authentic_composition() {
+        let r = DivisionTemplates::default();
+        let stats = |n: &str| r.get(n).map(|t| (t.battalion_count(), t.calculate_stats())).expect("шаблон");
+        let (n, di) = stats("Division d'Infanterie");
+        assert_eq!((n, di.combat_width, di.has_engineers, di.max_speed), (9, 18, true, 40));
+        let (n, col) = stats("Division Coloniale");
+        assert_eq!((n, col.has_engineers), (9, false), "у колониальной сапёров нет");
+        let (n, mot) = stats("Division d'Infanterie Motorisée");
+        assert_eq!((n, mot.max_speed, mot.recon), (9, 120, 3));
+        assert_eq!(stats("Division d'Infanterie Alpine").0, 12);
+        let (n, cav) = stats("Division de Cavalerie");
+        assert_eq!((n, cav.recon, cav.max_speed), (4, 2, 60));
+        let (n, dlm) = stats("Division Légère Mécanique");
+        assert_eq!((n, dlm.max_speed, dlm.armor > 0, dlm.has_engineers), (6, 80, true, true));
+        assert_eq!(stats("Brigade de Chars de Combat").0, 4);
+        assert_eq!(stats("Brigade Coloniale").0, 6);
+    }
+
+    /// Реальный FRA_1936.txt (пропускается без игры): все 8 шаблонов разобраны и совпадают со встроенными копиями.
+    #[test]
+    fn real_file_templates_match_the_builtin_copies() {
+        let root = Path::new(GAME);
+        if !root.exists() {
+            return;
+        }
+        let text = std::fs::read(root.join("history/units/FRA_1936.txt")).map(|b| String::from_utf8_lossy(&b).to_string()).unwrap_or_default();
+        let names: Vec<String> = parse_division_templates(&text).into_iter().map(|s| s.name).collect();
+        for expected in FRA_TEMPLATE_NAMES {
+            assert!(names.iter().any(|n| n == expected), "{expected} есть в файле");
+        }
+        let (builtin, real) = (DivisionTemplates::default(), DivisionTemplates::with_game_files(root));
+        for name in FRA_TEMPLATE_NAMES {
+            let (a, b) = (builtin.get(name).expect("встроенный"), real.get(name).expect("из файла"));
+            assert_eq!(a.calculate_stats(), b.calculate_stats(), "{name}");
+            assert_eq!(a.nato_symbol(), b.nato_symbol(), "{name}");
+        }
     }
 }

@@ -495,11 +495,11 @@ units = {
         assert_eq!(resolve_template(&t, "GER", "Kavallerie-Brigade"), "Infanterie-Division (mot.)");
         assert_eq!(resolve_template(&t, "GER", "Gebirgs-Brigade"), "Infanterie-Division");
         assert_eq!(resolve_template(&t, "GER", "Panzer-Brigade Neu"), "Panzer-Division");
-        // у Франции танковой дивизии нет: бронетехника -> моторизованная, колониальные -> пехота
-        assert_eq!(resolve_template(&t, "FRA", "Division Légère Mécanique"), "Infanterie-Division (mot.)");
-        assert_eq!(resolve_template(&t, "FRA", "Brigade de Chars de Combat"), "Infanterie-Division (mot.)");
-        assert_eq!(resolve_template(&t, "FRA", "Division d'Infanterie Motorisée"), "Infanterie-Division (mot.)");
-        assert_eq!(resolve_template(&t, "FRA", "Division Coloniale"), "Infanterie-Division");
+        // у Франции собственные шаблоны из FRA_1936.txt: точное совпадение берётся как есть
+        for name in crate::units::FRA_TEMPLATE_NAMES {
+            assert_eq!(resolve_template(&t, "FRA", name), name);
+        }
+        assert_eq!(resolve_template(&t, "FRA", "Division Inconnue"), "Infanterie-Division", "неизвестный -> базовый");
         assert_eq!(resolve_template(&t, "ITA", "Panzer-Division"), "Infanterie-Division", "чужая нация без шаблона");
         assert_eq!(resolve_template(&t, "GER", ""), "Infanterie-Division");
     }
@@ -561,5 +561,41 @@ mod start_factor_tests {
         }
         let divisions = load_country_oob(root, "GER").expect("GER_1936.txt");
         assert!(divisions.iter().all(|d| d.experience_pct == 30 && d.equipment_pct == 100));
+    }
+}
+
+#[cfg(test)]
+mod fra_oob_tests {
+    use super::*;
+    use crate::units::FRA_TEMPLATE_NAMES;
+
+    /// Реальный FRA_1936 (пропускается без игры): дивизии Франции, их шаблоны и стартовые коэффициенты.
+    #[test]
+    fn real_data_fra_1936_is_deployed() {
+        let root = Path::new("D:\\SteamLibrary\\steamapps\\common\\Hearts of Iron IV");
+        if !root.exists() {
+            return;
+        }
+        let divisions = load_country_oob(root, "FRA").unwrap_or_default();
+        assert!(divisions.len() >= 60, "найдено {}", divisions.len());
+        assert!(divisions.iter().all(|d| d.owner == "FRA" && d.location > 0 && !d.name.is_empty()));
+        assert!(divisions.iter().any(|d| d.name.contains("Brigade de Chars de Combat")));
+        // каждый шаблон файла — французский, доступный нации и переносится без подмены
+        let templates = DivisionTemplates::with_game_files(root);
+        for d in &divisions {
+            assert!(FRA_TEMPLATE_NAMES.contains(&d.template.as_str()), "шаблон {:?}", d.template);
+            assert_eq!(resolve_template(&templates, "FRA", &d.template), d.template);
+        }
+        // стартовые коэффициенты: проценты 0..=100, есть и вторая линия (50% техники), и опыт 20/30%
+        assert!(divisions.iter().all(|d| d.experience_pct <= 100 && d.equipment_pct <= 100));
+        assert!(divisions.iter().any(|d| d.equipment_pct == 50), "резервная линия");
+        assert!(divisions.iter().any(|d| d.equipment_pct == 100), "первая линия");
+        assert!(divisions.iter().any(|d| d.experience_pct == 30) && divisions.iter().any(|d| d.experience_pct == 20));
+    }
+
+    #[test]
+    fn missing_game_folder_is_an_error_not_a_panic() {
+        assert!(load_country_oob(Path::new("Z:\\нет\\игры"), "FRA").is_err());
+        assert!(load_oob(Path::new("Z:\\нет\\игры")).0.is_empty());
     }
 }

@@ -5030,9 +5030,9 @@ mod refit_tests {
         order(&mut app, ids[3], "Нет такого");
         order(&mut app, ids[3], PLAIN_INFANTRY_TEMPLATE);
         assert_eq!(template_of(&app, ids[3]), BASE_TEMPLATE);
-        // французам доступна моторизованная пехота
-        order(&mut app, ids[1], "Infanterie-Division (mot.)");
-        assert_eq!(template_of(&app, ids[1]), "Infanterie-Division (mot.)");
+        // французам доступна их моторизованная дивизия (скорость 12.0 км/ч, роты поддержки не тормозят)
+        order(&mut app, ids[1], "Division d'Infanterie Motorisée");
+        assert_eq!(template_of(&app, ids[1]), "Division d'Infanterie Motorisée");
         assert_eq!(app.world().get::<Division>(ids[1]).unwrap().max_speed, 120);
     }
 
