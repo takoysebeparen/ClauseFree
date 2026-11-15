@@ -8,6 +8,7 @@ mod diplomacy;
 mod division;
 mod economy;
 mod flags;
+mod fonts;
 mod frontline;
 mod map;
 mod oob;

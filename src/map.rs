@@ -419,6 +419,13 @@ impl Plugin for MapPlugin {
         app.insert_resource(crate::command::load_commander_pool(&self.root));
         app.insert_resource(crate::air::load_strategic_regions(&self.root));
         app.insert_resource(crate::ui::load_country_names(&self.root));
+        app.insert_resource(crate::ui::GameIcons::new(self.root.clone()));
+        let map_font = crate::fonts::load_map_font(&self.root);
+        match &map_font {
+            Some(f) => println!("[ШРИФТ] hoi_mapfont4: {} глифов, атлас {}x{}", f.font.glyphs.len(), f.width, f.height),
+            None => eprintln!("[ПРЕДУПРЕЖДЕНИЕ] шрифт карты не найден, надписи шрифтом egui"),
+        }
+        app.insert_resource(crate::fonts::MapFontRes(map_font));
 
         // Логистика: узлы снабжения и железные дороги
         let supply_nodes = load_supply_nodes(&self.root);
@@ -1083,6 +1090,7 @@ fn ui_state_panel(
     controllers: Res<ProvinceControllers>,
     colors: Res<CountryColors>,
     mut flags: ResMut<crate::flags::FlagTextures>,
+    names: Res<crate::ui::CountryNames>,
 ) {
     let Some(id) = selected.id else { return };
     let Some(ctx) = contexts.try_ctx_mut() else { return };
@@ -1106,7 +1114,7 @@ fn ui_state_panel(
                     // Контроллер может отличаться от владельца (оккупация)
                     let controller = controllers.0.get(&id).unwrap_or(&s.owner);
                     ui.label("Контролирует:");
-                    crate::ui::country_header(ui, &mut flags, &colors, controller, "");
+                    crate::ui::country_header(ui, &mut flags, &colors, &names, controller, "");
                     ui.horizontal(|ui| {
                         ui.label("(Владелец:");
                         flags.show(ui, &s.owner, &colors);

@@ -1664,6 +1664,21 @@ pub fn resources_text(eco: &CountryEconomy) -> String {
     )
 }
 
+/// Количества ресурсов для верхней панели рядом с иконками: сталь `свободно/всего`, остальные — свободно.
+pub fn resource_amounts(eco: &CountryEconomy) -> Vec<(ResourceType, String)> {
+    ResourceType::ALL
+        .into_iter()
+        .map(|r| {
+            let text = if r == ResourceType::Steel {
+                format!("{}/{}", eco.resource_free(r), eco.total_resource(r))
+            } else {
+                eco.resource_free(r).to_string()
+            };
+            (r, text)
+        })
+        .collect()
+}
+
 /// Статус сырья линии: `Сырьё: 100%` или `Дефицит Стали: -45% к выпуску`.
 pub fn resource_status_text(eco: &CountryEconomy, equipment: EquipmentType) -> String {
     match eco.resource_shortage(equipment) {
@@ -1704,8 +1719,10 @@ fn trade_panel(
     let Some(ctx) = contexts.try_ctx_mut() else { return };
     let Some(eco) = economies.0.get(&player.0) else { return };
     let frame = egui::Frame::window(&ctx.style()).fill(crate::ui::PANEL_FILL);
-    egui::Window::new(crate::ui::window_title("Торговля"))
-        .anchor(egui::Align2::LEFT_TOP, [10.0, 52.0])
+    let offset = crate::ui::column_offset(ctx, &["Производство", "Строительство"]);
+    let shown = egui::Window::new(crate::ui::window_title("Торговля"))
+        .anchor(egui::Align2::RIGHT_TOP, [-10.0, offset])
+        .default_open(false)
         .resizable(false)
         .collapsible(true)
         .frame(frame)
@@ -1766,6 +1783,9 @@ fn trade_panel(
                 });
             }
         });
+    if let Some(r) = shown {
+        crate::ui::remember_height(ctx, "Торговля", r.response.rect.height());
+    }
 }
 
 /// Верхняя плашка: фабрики и склад страны игрока.
@@ -1776,6 +1796,9 @@ fn economy_bar(
     experience: Res<ArmyExperience>,
     colors: Res<CountryColors>,
     mut flags: ResMut<crate::flags::FlagTextures>,
+    mut icons: ResMut<crate::ui::GameIcons>,
+    names: Res<crate::ui::CountryNames>,
+    divisions: Query<&crate::division::Division>,
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else { return };
     // Рамка и тег нации — в её настоящем цвете
@@ -1793,21 +1816,29 @@ fn economy_bar(
             Some(eco) => {
                 ui.horizontal(|ui| {
                     flags.show(ui, &player.0, &colors);
-                    ui.label(egui::RichText::new(format!("[{}]", player.0)).color(country_color).strong());
-                    ui.label(format!(
-                        "🏭 {} | 🔨 Военные заводы: {} | {} | {} | {}",
-                        civilian_text(eco),
-                        eco.military_factories,
-                        resources_text(eco),
-                        stockpile_text(eco),
-                        army_xp_text(experience.get(&player.0))
-                    ));
+                    ui.label(egui::RichText::new(names.header_text(&player.0)).color(country_color).strong());
+                    // оригинальные иконки игры; без файлов — прежние значки
+                    icons.show(ui, crate::ui::IconKey::CivFactory, "🏭");
+                    ui.label(civilian_text(eco));
+                    icons.show(ui, crate::ui::IconKey::MilFactory, "🔨");
+                    ui.label(format!("Военные заводы: {}", eco.military_factories));
+                    ui.separator();
+                    // людские ресурсы: личный состав дивизий страны
+                    let personnel: u32 = divisions.iter().filter(|d| d.owner == player.0).map(|d| d.current_manpower()).sum();
+                    icons.show(ui, crate::ui::IconKey::Manpower, "Люди");
+                    ui.label(personnel.to_string());
+                    for (resource, amount) in resource_amounts(eco) {
+                        icons.show(ui, crate::ui::IconKey::Resource(resource), resource.label());
+                        ui.label(amount).on_hover_text(resources_text(eco));
+                    }
+                    ui.separator();
+                    ui.label(format!("{} | {}", stockpile_text(eco), army_xp_text(experience.get(&player.0))));
                 });
             }
             None => {
                 ui.horizontal(|ui| {
                     flags.show(ui, &player.0, &colors);
-                    ui.label(egui::RichText::new(format!("[{}]", player.0)).color(country_color).strong());
+                    ui.label(egui::RichText::new(names.header_text(&player.0)).color(country_color).strong());
                     ui.label(format!("нет данных об экономике | {}", army_xp_text(experience.get(&player.0))));
                 });
             }
@@ -1827,8 +1858,10 @@ fn production_panel(
     let frame = egui::Frame::window(&ctx.style()).fill(crate::ui::PANEL_FILL);
     let working = eco.effective_factories();
 
-    egui::Window::new(crate::ui::window_title("Производство"))
-        .anchor(egui::Align2::RIGHT_TOP, [-10.0, 52.0])
+    let offset = crate::ui::column_offset(ctx, &[]);
+    let shown = egui::Window::new(crate::ui::window_title("Производство"))
+        .anchor(egui::Align2::RIGHT_TOP, [-10.0, offset])
+        .default_open(false)
         .resizable(false)
         .collapsible(true)
         .frame(frame)
@@ -1865,6 +1898,9 @@ fn production_panel(
                 });
             }
         });
+    if let Some(r) = shown {
+        crate::ui::remember_height(ctx, "Производство", r.response.rect.height());
+    }
 }
 
 /// Окно «Строительство»: кнопка постановки военного завода в выбранном на карте стейте и очередь проектов.
@@ -1885,8 +1921,10 @@ fn construction_panel(
     let state = selected.id.and_then(|province| registry.state_of(province));
     let allocation = eco.construction.allocation(eco.available_civilian_factories());
 
-    egui::Window::new(crate::ui::window_title("Строительство"))
-        .anchor(egui::Align2::RIGHT_TOP, [-10.0, 260.0])
+    let offset = crate::ui::column_offset(ctx, &["Производство"]);
+    let shown = egui::Window::new(crate::ui::window_title("Строительство"))
+        .anchor(egui::Align2::RIGHT_TOP, [-10.0, offset])
+        .default_open(false)
         .resizable(false)
         .collapsible(true)
         .frame(frame)
@@ -1928,6 +1966,9 @@ fn construction_panel(
                 ui.label(project_text(project, *factories));
             }
         });
+    if let Some(r) = shown {
+        crate::ui::remember_height(ctx, "Строительство", r.response.rect.height());
+    }
 }
 
 #[cfg(test)]

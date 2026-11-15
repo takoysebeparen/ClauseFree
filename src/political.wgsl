@@ -24,6 +24,12 @@ const RIVER_SHADE_FOLLOW: f32 = 0.5;
 const COUNTRY_BORDER: vec3<f32> = vec3<f32>(0.0097, 0.0097, 0.0097);
 // 0.75 в sRGB-пространстве = 0.53 в линейном
 const PROVINCE_SHADE: f32 = 0.53;
+// Затухание сетки провинций при отдалении: масштаб = текселей карты на пиксель экрана (по fwidth(uv)).
+// До FADE_START (приближение) сетка в полную силу, к FADE_END (стратегический зум) почти исчезает.
+const FADE_START: f32 = 1.2;
+const FADE_END: f32 = 4.0;
+// Яркость внутренней границы при полном затухании (1.0 = границы нет).
+const PROVINCE_SHADE_FAR: f32 = 0.97;
 
 // Рельеф. Уровень моря в heightmap.bmp ~ 95 из 255: всё ниже считается берегом, чтобы дно моря
 // не давало ложных склонов на побережье.
@@ -86,6 +92,8 @@ fn color_of(id: i32) -> vec4<f32> {
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let dims = vec2<i32>(textureDimensions(ids));
+    // производные UV берутся до любых ранних возвратов (однородный поток управления)
+    let texels_per_pixel = max(fwidth(in.uv.x) * f32(dims.x), fwidth(in.uv.y) * f32(dims.y));
     let p = clamp(vec2<i32>(in.uv * vec2<f32>(dims)), vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
     let id = province_at(p, dims);
     let base = color_of(id);
@@ -128,7 +136,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let water = RIVER_COLOR * mix(1.0, shade, RIVER_SHADE_FOLLOW);
     let color = mix(land, water, river);
     if (province_border) {
-        return vec4<f32>(color * PROVINCE_SHADE, 1.0);
+        // внутренние границы гаснут при отдалении; границы государств (выше) остаются чёткими всегда
+        let fade = smoothstep(FADE_START, FADE_END, texels_per_pixel);
+        return vec4<f32>(color * mix(PROVINCE_SHADE, PROVINCE_SHADE_FAR, fade), 1.0);
     }
     return vec4<f32>(color, 1.0);
 }

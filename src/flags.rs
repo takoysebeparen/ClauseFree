@@ -81,6 +81,36 @@ pub fn ruling_party(root: &Path, tag: &str) -> Option<String> {
     None
 }
 
+/// `ruling_party` из текста файла истории страны (первое вхождение).
+pub fn ruling_party_in(text: &str) -> Option<String> {
+    let mut tokens = text.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "ruling_party" && tokens.next() == Some("=") {
+            return tokens.next().map(|p| p.trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+/// Правящие партии всех стран на старте: тег -> `ruling_party` по файлам `history/countries/<TAG> - *.txt`.
+/// Нет папки — пустая карта.
+pub fn load_ruling_parties(root: &Path) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Ok(dir) = std::fs::read_dir(root.join("history").join("countries")) else { return out };
+    for path in dir.filter_map(|e| e.ok().map(|e| e.path())) {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(tag) = name.strip_suffix(".txt").and_then(|n| n.split_once(" - ")).map(|(tag, _)| tag) else { continue };
+        if !valid_tag(tag) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        if let Some(party) = ruling_party_in(&String::from_utf8_lossy(&bytes)) {
+            out.insert(tag.to_string(), party);
+        }
+    }
+    out
+}
+
 /// Пути-кандидаты по убыванию приоритета: средний размер, затем крупный; сначала флаг партии у власти,
 /// потом `<TAG>.tga`, потом остальные идеологии.
 pub fn candidate_paths(root: &Path, tag: &str, party: Option<&str>) -> Vec<PathBuf> {

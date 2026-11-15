@@ -2946,6 +2946,7 @@ fn division_info_ui(
     templates: Res<DivisionTemplates>,
     colors: Res<CountryColors>,
     mut flags: ResMut<crate::flags::FlagTextures>,
+    names: Res<crate::ui::CountryNames>,
     mut refit_out: EventWriter<RefitDivision>,
 ) {
     let Some(entity) = selected.0 else { return };
@@ -2998,7 +2999,7 @@ fn division_info_ui(
         .frame(frame)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                crate::ui::country_header(ui, &mut flags, &colors, &d.owner, &format!("Дивизия \"{}\"", d.name));
+                crate::ui::country_header(ui, &mut flags, &colors, &names, &d.owner, &format!("Дивизия \"{}\"", d.name));
                 ui.label(nato_badge_text(d.nato_symbol));
             });
             crate::ui::readiness_bars(ui, (d.current_org, d.max_org), (d.current_strength, d.max_strength));
