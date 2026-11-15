@@ -84,6 +84,19 @@ pub fn height_image(heightmap: Option<&HeightMap>) -> Image {
     )
 }
 
+/// Площадь провинций в пикселях карты (для взвешивания хребта надписей). Только отображение.
+#[derive(Resource, Default, Debug, Clone)]
+pub struct ProvinceAreas(pub HashMap<u32, u32>);
+
+/// Считает пиксели каждой провинции по текстуре id (R, G = младший / старший байт id).
+pub fn count_province_pixels(ids: &[u8]) -> HashMap<u32, u32> {
+    let mut counts: HashMap<u32, u32> = HashMap::new();
+    for px in ids.chunks_exact(4) {
+        *counts.entry(u32::from(px[0]) + u32::from(px[1]) * 256).or_default() += 1;
+    }
+    counts
+}
+
 /// Цвета фона `rivers.bmp`: не река.
 const RIVER_BACKGROUND: [[u8; 3]; 2] = [[122, 122, 122], [255, 255, 255]];
 
@@ -616,6 +629,7 @@ pub fn setup_map(
     mut materials: ResMut<Assets<PoliticalMaterial>>,
 ) {
     let (ids, adjacency, rivers) = build_id_texture_and_adjacency(&map);
+    commands.insert_resource(ProvinceAreas(count_province_pixels(&ids)));
     commands.insert_resource(adjacency);
     commands.insert_resource(rivers);
 
@@ -1296,6 +1310,21 @@ mod relief_tests {
         assert_eq!(h.pixels.len(), (h.width * h.height) as usize);
         let (min, max) = (h.pixels.iter().min().copied().unwrap_or(0), h.pixels.iter().max().copied().unwrap_or(0));
         assert!(max > min + 50, "в рельефе есть перепад высот: {min}..{max}");
+    }
+}
+
+#[cfg(test)]
+mod area_tests {
+    use super::*;
+
+    #[test]
+    fn pixels_are_counted_per_province_id() {
+        // id = R + G * 256: три пикселя провинции 1, один — провинции 300
+        let ids = [1, 0, 0, 255, 1, 0, 0, 255, 44, 1, 0, 255, 1, 0, 0, 255];
+        let counts = count_province_pixels(&ids);
+        assert_eq!((counts[&1], counts[&300], counts.len()), (3, 1, 2));
+        assert!(count_province_pixels(&[]).is_empty());
+        assert!(count_province_pixels(&[1, 2, 3]).is_empty(), "неполный пиксель не считается");
     }
 }
 

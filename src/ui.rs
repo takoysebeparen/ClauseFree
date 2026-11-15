@@ -17,7 +17,9 @@ use crate::fonts::{
     build_ridge, fit_glyph_size, label_visible, layout_on_ridge, principal_axis, screen_letter_height, watermark_alpha,
     Axis, GlyphQuad, MapFont, MapFontRes, Ridge, TextMetrics,
 };
-use crate::map::{ProvinceAdjacency, ProvinceCenters, ProvinceControllerChanged, ProvinceControllers};
+use crate::map::{
+    ProvinceAdjacency, ProvinceAreas, ProvinceCenters, ProvinceControllerChanged, ProvinceControllers, ProvinceMap,
+};
 
 /// Фон окон и панелей: тёмная сталь.
 pub const PANEL_FILL: egui::Color32 = egui::Color32::from_rgb(22, 24, 28);
@@ -305,6 +307,8 @@ pub fn compute_labels(
     names: &CountryNames,
     capitals: &BTreeMap<String, u32>,
     font: Option<&MapFont>,
+    area_of: &dyn Fn(u32) -> f32,
+    locate: &dyn Fn(Vec2) -> Option<u32>,
 ) -> Vec<CountryLabel> {
     let mut by_country: BTreeMap<&str, BTreeSet<u32>> = BTreeMap::new();
     for (&province, tag) in &controllers.0 {
@@ -319,11 +323,24 @@ pub fn compute_labels(
         let metrics = TextMetrics::of(font, &text);
         let build = |cluster: &BTreeSet<u32>, secondary: bool| -> Option<CountryLabel> {
             let (center, span) = cluster_geometry(cluster, centers)?;
-            let points: Vec<Vec2> = cluster.iter().filter_map(|p| centers.get(p).copied()).collect();
+            let placed: Vec<(Vec2, f32)> =
+                cluster.iter().filter_map(|p| centers.get(p).map(|&c| (c, area_of(*p)))).collect();
+            let points: Vec<Vec2> = placed.iter().map(|&(c, _)| c).collect();
+            let weights: Vec<f32> = placed.iter().map(|&(_, a)| a).collect();
             let axis = principal_axis(&points)?;
-            let ridge = build_ridge(&points, &axis);
+            let ridge = build_ridge(&points, &weights, &axis);
             let fitted = fit_glyph_size(&axis, ridge.length(), &metrics);
-            let glyph_size = if secondary { fitted * SECONDARY_LABEL_FONT_PCT / 100.0 } else { fitted };
+            let mut glyph_size = if secondary { fitted * SECONDARY_LABEL_FONT_PCT / 100.0 } else { fitted };
+            // Буквы строго внутри страны: пока первая, средняя или последняя вылезают за территорию — кегль -10%
+            if let Some(f) = font {
+                for _ in 0..LABEL_SHRINK_STEPS {
+                    let quads = layout_on_ridge(&f.font, &text, &ridge, glyph_size);
+                    if letters_inside(&quads, tag, controllers, locate) {
+                        break;
+                    }
+                    glyph_size *= LABEL_SHRINK_FACTOR;
+                }
+            }
             Some(CountryLabel {
                 tag: tag.to_string(),
                 text: text.clone(),
@@ -347,8 +364,29 @@ pub fn compute_labels(
     labels
 }
 
-/// Цвет текста надписей без обводки: тёмно-угольный, альфа задаётся зумом.
-pub const LABEL_INK: [u8; 3] = [18, 20, 24];
+/// Цвет тела букв: тёмно-угольный, альфа задаётся зумом.
+pub const LABEL_INK: [u8; 3] = [22, 24, 28];
+/// Мягкий светлый ореол вокруг букв и его доля от альфы тела.
+pub const LABEL_HALO: [u8; 3] = [235, 225, 200];
+pub const LABEL_HALO_ALPHA: f32 = 0.45;
+/// Сколько раз кегль можно уменьшить на 10%, пока буквы не лягут внутрь страны.
+pub const LABEL_SHRINK_STEPS: u32 = 5;
+pub const LABEL_SHRINK_FACTOR: f32 = 0.9;
+
+/// Лежат ли первая, средняя и последняя буквы (все углы и центр квадрата) в провинциях этой страны.
+pub fn letters_inside(
+    quads: &[GlyphQuad],
+    tag: &str,
+    controllers: &ProvinceControllers,
+    locate: &dyn Fn(Vec2) -> Option<u32>,
+) -> bool {
+    let owned = |point: Vec2| locate(point).is_some_and(|p| controllers.0.get(&p).is_some_and(|c| c == tag));
+    let picks = [quads.first(), quads.get(quads.len() / 2), quads.last()];
+    picks.into_iter().flatten().all(|q| {
+        let center = (q.corners[0] + q.corners[2]) * 0.5;
+        owned(center) && q.corners.iter().all(|&c| owned(c))
+    })
+}
 
 /// Вершины квадратов букв в экранных координатах egui (мир -> экран: сдвиг `origin`, деление на масштаб камеры,
 /// ось Y вниз). Текстура — белый атлас с покрытием в альфа-канале, цвет — тёмно-угольный с альфой зума.
@@ -380,19 +418,27 @@ fn country_labels_ui(
     network: Option<Res<crate::economy::SupplyNetwork>>,
     names: Res<CountryNames>,
     font: Res<MapFontRes>,
+    map: Option<Res<ProvinceMap>>,
+    areas: Option<Res<ProvinceAreas>>,
     cameras: Query<(&Camera, &GlobalTransform, &OrthographicProjection), With<MainCamera>>,
     mut changes: EventReader<ProvinceControllerChanged>,
     mut cache: Local<Vec<CountryLabel>>,
     mut ready: Local<bool>,
     mut cooldown: Local<u32>,
-    mut atlas: Local<Option<egui::TextureHandle>>,
+    mut atlas: Local<Option<(egui::TextureHandle, egui::TextureHandle)>>,
 ) {
     *cooldown = cooldown.saturating_sub(1);
     let dirty = changes.read().count() > 0;
     if let (Some(adjacency), Some(centers)) = (&adjacency, &centers) {
         if (!*ready && !adjacency.neighbors.is_empty()) || (*ready && dirty && *cooldown == 0) {
             let capitals = network.as_ref().map(|n| n.capitals.clone()).unwrap_or_default();
-            *cache = compute_labels(&controllers, adjacency, &centers.centers, &names, &capitals, font.0.as_ref());
+            let area_of = |p: u32| areas.as_ref().and_then(|a| a.0.get(&p)).map_or(1.0, |&n| n as f32);
+            let locate = |w: Vec2| {
+                let map = map.as_ref()?;
+                let (x, y) = map.world_to_pixel(w)?;
+                map.province_at_pixel(x, y).map(|p| p.id)
+            };
+            *cache = compute_labels(&controllers, adjacency, &centers.centers, &names, &capitals, font.0.as_ref(), &area_of, &locate);
             *ready = true;
             *cooldown = 120;
         }
@@ -406,19 +452,27 @@ fn country_labels_ui(
     let Some(ctx) = contexts.try_ctx_mut() else { return };
     let viewport = camera.logical_viewport_size().unwrap_or(Vec2::new(4096.0, 4096.0));
     let alpha = watermark_alpha(scale);
+    if alpha < 0.01 {
+        return; // планетарный зум: названия растворились
+    }
     let ink = egui::Color32::from_rgba_unmultiplied(LABEL_INK[0], LABEL_INK[1], LABEL_INK[2], (alpha * 255.0) as u8);
+    let halo =
+        egui::Color32::from_rgba_unmultiplied(LABEL_HALO[0], LABEL_HALO[1], LABEL_HALO[2], (alpha * LABEL_HALO_ALPHA * 255.0) as u8);
 
-    // атлас карты в текстуру egui: белый цвет, покрытие глифа в альфе
+    // атлас карты в две текстуры egui (белый цвет): покрытие тела букв и покрытие светлого ореола
     if atlas.is_none() {
         if let Some(f) = &font.0 {
-            let rgba: Vec<u8> = f.coverage.iter().flat_map(|&c| [255, 255, 255, c]).collect();
-            let image = egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &rgba);
-            *atlas = Some(ctx.load_texture("map_font_atlas", image, egui::TextureOptions::LINEAR));
+            let make = |name: &str, layer: &[u8]| {
+                let rgba: Vec<u8> = layer.iter().flat_map(|&c| [255, 255, 255, c]).collect();
+                let image = egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &rgba);
+                ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
+            };
+            *atlas = Some((make("map_font_body", &f.coverage), make("map_font_halo", &f.halo)));
         }
     }
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("country_labels")));
     let world_to_screen = |w: Vec2| Vec2::new(origin.x + w.x / scale, origin.y - w.y / scale);
-    let mut mesh = egui::Mesh::default();
+    let (mut body_mesh, mut halo_mesh) = (egui::Mesh::default(), egui::Mesh::default());
 
     for label in cache.iter() {
         if !label_visible(screen_letter_height(label.glyph_size, label.cap_ratio, scale)) {
@@ -431,25 +485,35 @@ fn country_labels_ui(
             continue;
         }
         match (&font.0, atlas.as_ref()) {
-            (Some(f), Some(texture)) => {
+            (Some(f), Some((body, light))) => {
                 let quads = layout_on_ridge(&f.font, &label.text, &label.ridge, label.glyph_size);
-                glyph_mesh(&quads, origin, scale, texture.id(), ink, &mut mesh);
+                glyph_mesh(&quads, origin, scale, light.id(), halo, &mut halo_mesh);
+                glyph_mesh(&quads, origin, scale, body.id(), ink, &mut body_mesh);
             }
             _ => {
                 // запасной путь: шрифт egui, слово целиком вдоль оси с поворотом
                 let px = (label.glyph_size / scale).clamp(1.0, 400.0);
-                let galley = painter.layout_no_wrap(label.text.clone(), egui::FontId::proportional(px), ink);
                 let angle = -label.axis.angle;
-                let (w, h) = (galley.size().x, galley.size().y);
                 let (sin, cos) = angle.sin_cos();
                 let mid = world_to_screen(label.ridge.at(label.ridge.length() * 0.5).0);
-                let top_left = egui::pos2(mid.x - (w * 0.5 * cos - h * 0.5 * sin), mid.y - (w * 0.5 * sin + h * 0.5 * cos));
-                painter.add(egui::epaint::TextShape::new(top_left, galley, ink).with_angle(angle));
+                // двухпроходный рендер: светлая подложка со сдвигом 1.5 px, затем тёмное тело
+                for (color, dx, dy) in [(halo, -1.5_f32, -1.5_f32), (halo, 1.5, 1.5), (halo, -1.5, 1.5), (halo, 1.5, -1.5), (ink, 0.0, 0.0)] {
+                    let galley = painter.layout_no_wrap(label.text.clone(), egui::FontId::proportional(px), color);
+                    let (w, h) = (galley.size().x, galley.size().y);
+                    let top_left = egui::pos2(
+                        mid.x + dx - (w * 0.5 * cos - h * 0.5 * sin),
+                        mid.y + dy - (w * 0.5 * sin + h * 0.5 * cos),
+                    );
+                    painter.add(egui::epaint::TextShape::new(top_left, galley, color).with_angle(angle));
+                }
             }
         }
     }
-    if !mesh.vertices.is_empty() {
-        painter.add(egui::Shape::mesh(mesh));
+    // сначала светлый ореол, поверх — тёмное тело букв
+    for mesh in [halo_mesh, body_mesh] {
+        if !mesh.vertices.is_empty() {
+            painter.add(egui::Shape::mesh(mesh));
+        }
     }
 }
 
@@ -808,7 +872,7 @@ mod tests {
     fn capital_cluster_wins_over_a_bigger_african_cluster_and_the_colony_gets_a_second_label() {
         let (controllers, adj, centers, capitals) = british_scene();
         let names = loc(&[("ENG", "Великобритания")], &[]);
-        let labels = compute_labels(&controllers, &adj, &centers, &names, &capitals, None);
+        let labels = compute_labels(&controllers, &adj, &centers, &names, &capitals, None, &|_| 1.0, &|_| None);
         assert_eq!(labels.len(), 2, "метрополия + крупная колония; остров из 3 провинций без подписи");
         let main = &labels[0];
         assert!(!main.secondary);
@@ -830,16 +894,16 @@ mod tests {
         let names = CountryNames::default();
         // столица потеряна: провинция 3 под контролем другой страны
         controllers.0.insert(3, "GER".to_string());
-        let labels = compute_labels(&controllers, &adj, &centers, &names, &capitals, None);
+        let labels = compute_labels(&controllers, &adj, &centers, &names, &capitals, None, &|_| 1.0, &|_| None);
         let eng: Vec<&CountryLabel> = labels.iter().filter(|l| l.tag == "ENG").collect();
         assert!(!eng[0].secondary && eng[0].provinces == 30, "главная — крупнейший кусок");
         // нет данных о столице вовсе — то же правило
-        let none = compute_labels(&controllers, &adj, &centers, &names, &BTreeMap::new(), None);
+        let none = compute_labels(&controllers, &adj, &centers, &names, &BTreeMap::new(), None, &|_| 1.0, &|_| None);
         assert_eq!(none.iter().find(|l| l.tag == "ENG").map(|l| l.provinces), Some(30));
         let ger = labels.iter().find(|l| l.tag == "GER").expect("GER");
         assert_eq!((ger.text.as_str(), ger.provinces), ("GER", 1), "одиночная провинция, без названия — тег");
         let lost = ProvinceControllers([(77, "ITA".to_string())].into());
-        assert!(compute_labels(&lost, &adj, &centers, &names, &capitals, None).is_empty(), "без центров нет надписи");
+        assert!(compute_labels(&lost, &adj, &centers, &names, &capitals, None, &|_| 1.0, &|_| None).is_empty(), "без центров нет надписи");
     }
 
     #[test]
@@ -856,10 +920,68 @@ mod tests {
     }
 
     #[test]
-    fn label_ink_is_clean_charcoal_without_a_halo() {
-        assert_eq!(LABEL_INK, [18, 20, 24]);
+    fn label_colors_are_charcoal_body_and_soft_light_halo() {
+        assert_eq!(LABEL_INK, [22, 24, 28]);
+        assert_eq!(LABEL_HALO, [235, 225, 200]);
+        assert_eq!(LABEL_HALO_ALPHA, 0.45);
         let ink = egui::Color32::from_rgba_unmultiplied(LABEL_INK[0], LABEL_INK[1], LABEL_INK[2], 180);
-        assert_eq!(ink.to_srgba_unmultiplied()[..3], [18, 20, 24]);
+        assert_eq!(ink.to_srgba_unmultiplied()[..3], [22, 24, 28]);
+    }
+
+    /// Полоса из трёх рядов провинций (y = -30, 0, 30) длиной 400: надпись в кегле по высоте упирается в границы.
+    fn wide_strip() -> (ProvinceControllers, ProvinceAdjacency, HashMap<u32, Vec2>) {
+        let mut controllers = BTreeMap::new();
+        let mut centers = HashMap::new();
+        let mut pairs = Vec::new();
+        for i in 0..40u32 {
+            for (row, y) in [-30.0_f32, 0.0, 30.0].into_iter().enumerate() {
+                let id = i * 3 + row as u32;
+                controllers.insert(id, "AAA".to_string());
+                centers.insert(id, Vec2::new(i as f32 * 10.0, y));
+                if i > 0 {
+                    pairs.push((id - 3, id));
+                }
+                if row > 0 {
+                    pairs.push((id - 1, id));
+                }
+            }
+        }
+        (ProvinceControllers(controllers), adjacency(&pairs), centers)
+    }
+
+    const FONT_H_I: &str = "common lineHeight=84 base=70 scaleW=2048 scaleH=1024\nchar id=72 x=10 y=20 width=40 height=55 xoffset=2 yoffset=17 xadvance=50\nchar id=73 x=60 y=20 width=10 height=55 xoffset=1 yoffset=17 xadvance=14\n";
+
+    #[test]
+    fn edge_letters_are_kept_inside_the_country_by_shrinking_the_font() {
+        let (controllers, adj, centers) = wide_strip();
+        let font = MapFont {
+            font: crate::fonts::parse_bmfont(FONT_H_I).expect("шрифт"),
+            width: 2048,
+            height: 1024,
+            coverage: Vec::new(),
+            halo: Vec::new(),
+        };
+        let names = loc(&[("AAA", "hihihi")], &[]);
+        let size_with = |land: &dyn Fn(Vec2) -> Option<u32>| {
+            let labels = compute_labels(&controllers, &adj, &centers, &names, &BTreeMap::new(), Some(&font), &|_| 1.0, land);
+            labels.first().map(|l| (l.glyph_size, l.ridge.clone(), l.text.clone()))
+        };
+        // вся полоса — суша: кегль остаётся подобранным по 0.65 W
+        let (free, _, _) = size_with(&|w: Vec2| (w.y.abs() <= 60.0).then_some(0)).expect("надпись");
+        // суша только в центральной полосе |y| <= 20: буквы высотой ~55 вылезали бы в «океан» — кегль уменьшается
+        let narrow = |w: Vec2| (w.y.abs() <= 20.0 && w.x >= -50.0 && w.x <= 450.0).then_some(0);
+        let (shrunk, ridge, text) = size_with(&narrow).expect("надпись");
+        assert!(shrunk < free, "{shrunk} < {free}");
+        assert!(shrunk >= free * 0.9_f32.powi(5) - 1e-3, "не более 5 шагов по 10%");
+        // после уменьшения первая, средняя и последняя буквы лежат внутри страны
+        let quads = layout_on_ridge(&font.font, &text, &ridge, shrunk);
+        assert!(letters_inside(&quads, "AAA", &controllers, &narrow));
+        let before = layout_on_ridge(&font.font, &text, &ridge, free);
+        assert!(!letters_inside(&before, "AAA", &controllers, &narrow), "исходный кегль выходил за границу");
+        // чужая страна на месте провинции — тоже «вне» страны
+        let foreign = ProvinceControllers([(0, "BBB".to_string())].into());
+        assert!(!letters_inside(&quads, "AAA", &foreign, &narrow));
+        assert!(letters_inside(&[], "AAA", &controllers, &narrow), "нет букв — нечему вылезать");
     }
 
     #[test]

@@ -22,14 +22,31 @@ pub const WORD_FILL: f32 = 0.75;
 pub const HEIGHT_FILL: f32 = 0.65;
 /// Доля длины хребта, которую слово не должно превосходить (запас на изгиб).
 const RIDGE_FILL: f32 = 0.9;
-/// Верхний предел прозрачности (дальний и обычный зум) и нижний (глубокое приближение).
-pub const ALPHA_MAX: f32 = 0.72;
-pub const ALPHA_MIN: f32 = 0.20;
-/// Масштаб камеры, ниже которого надпись становится водяным знаком, и масштаб, на котором достигается минимум.
-pub const WATERMARK_START: f32 = 0.7;
-pub const WATERMARK_FULL: f32 = 0.1;
-/// Буквы ниже этой экранной высоты (px) не рисуются: только на сильном отдалении мелкая страна пропадает.
+/// Трёхфазная кривая прозрачности по масштабу камеры (мировых единиц на пиксель).
+/// Тактический зум: водяной знак 0.16 (scale <= 0.25) -> 0.68 (scale = 0.55).
+pub const TACTICAL_FULL: f32 = 0.25;
+pub const TACTICAL_END: f32 = 0.55;
+pub const ALPHA_TACTICAL_MIN: f32 = 0.16;
+pub const ALPHA_TACTICAL_END: f32 = 0.68;
+/// Региональный зум 0.55..=1.65: пик читаемости 0.75 (на 0.75..=1.2), к концу зоны 0.72.
+pub const REGIONAL_PEAK_FROM: f32 = 0.75;
+pub const REGIONAL_PEAK_TO: f32 = 1.2;
+pub const REGIONAL_END: f32 = 1.65;
+pub const ALPHA_PEAK: f32 = 0.75;
+pub const ALPHA_REGIONAL_END: f32 = 0.72;
+/// Планетарный зум: названия растворяются от 0.72 (scale = 1.65) до 0 (scale >= 2.6).
+pub const PLANETARY_GONE: f32 = 2.6;
+/// Буквы ниже этой экранной высоты (px) не рисуются: мелкая страна на сильном отдалении не превращается в шум.
 pub const MIN_SCREEN_LETTER_PX: f32 = 7.0;
+/// Добавка межбуквенного интервала (доля ширины глифа) для коротких названий: чем короче слово, тем шире разрядка.
+pub fn tracking_for(chars: usize) -> f32 {
+    match chars {
+        0..=7 => 0.25,
+        8..=10 => 0.20,
+        11..=13 => 0.15,
+        _ => 0.0,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // BMFont
@@ -102,6 +119,7 @@ impl BmFont {
     }
 
     /// Ширина слова в высотах строки (сумма продвижений глифов; нет глифа — треть строки).
+    #[cfg(test)]
     pub fn width_em(&self, text: &str) -> f32 {
         let units: f32 = text
             .chars()
@@ -111,14 +129,28 @@ impl BmFont {
     }
 }
 
+impl BmFont {
+    /// Ширина слова с межбуквенным интервалом (`tracking_for` от числа букв) в высотах строки.
+    pub fn text_width_em(&self, text: &str) -> f32 {
+        let chars = text.chars().count();
+        let units: f32 = text
+            .chars()
+            .map(|c| self.glyphs.get(&u32::from(c)).map_or(self.line_height as f32 / 3.0, |g| g.xadvance as f32))
+            .sum();
+        units * (1.0 + tracking_for(chars)) / self.line_height as f32
+    }
+}
+
 /// Картографический шрифт: метрики и покрытие атласа (один байт на пиксель).
 #[derive(Debug, Clone)]
 pub struct MapFont {
     pub font: BmFont,
     pub width: usize,
     pub height: usize,
-    /// Покрытие глифа 0..=255 для пикселей атласа.
+    /// Покрытие тела глифа 0..=255 для пикселей атласа.
     pub coverage: Vec<u8>,
+    /// Покрытие светлого ореола вокруг букв 0..=255 (из того же атласа).
+    pub halo: Vec<u8>,
 }
 
 /// Ресурс шрифта карты; `None` — шрифта нет, надписи рисуются шрифтом egui.
@@ -132,6 +164,14 @@ pub fn glyph_coverage(r: u8, a: u8) -> u8 {
     ink.min(255) as u8
 }
 
+/// Покрытие светлого ореола: в атласе игры он лежит в тех же пикселях светлым цветом (R≈255) с альфой,
+/// убывающей от тела буквы наружу. Тело и ореол в сумме дают полное покрытие пикселя.
+pub fn glyph_halo(r: u8, a: u8) -> u8 {
+    // сам ореол в атласе мягкий (альфа до ~0.5), поэтому усилен в 1.6 раза до читаемой подложки
+    let light = u32::from(r) * u32::from(a) * 2 * 8 / (255 * 5);
+    light.min(255) as u8
+}
+
 /// Читает `gfx/fonts/hoi_mapfont4.{fnt,dds}`. Нет файлов, сжатый или битый атлас — `None`.
 pub fn load_map_font(root: &Path) -> Option<MapFont> {
     let dir = root.join("gfx").join("fonts");
@@ -141,7 +181,8 @@ pub fn load_map_font(root: &Path) -> Option<MapFont> {
         return None;
     }
     let coverage = atlas.rgba.chunks_exact(4).map(|p| glyph_coverage(p[0], p[3])).collect();
-    Some(MapFont { font, width: atlas.width, height: atlas.height, coverage })
+    let halo = atlas.rgba.chunks_exact(4).map(|p| glyph_halo(p[0], p[3])).collect();
+    Some(MapFont { font, width: atlas.width, height: atlas.height, coverage, halo })
 }
 
 // ---------------------------------------------------------------------------
@@ -259,30 +300,36 @@ fn chaikin(points: &[Vec2], iterations: u32) -> Vec<Vec2> {
     current
 }
 
-/// Хребет: кластер режется вдоль главной оси на K = 3..=5 сегментов, центроиды провинций сегментов
-/// сглаживаются кривой. Концы кривой доведены до крайних проекций, поэтому длина хребта не меньше размаха.
-pub fn build_ridge(points: &[Vec2], axis: &Axis) -> Ridge {
+/// Хребет: кластер режется вдоль главной оси на K = 3..=5 сегментов, центроиды сегментов взвешены по площади
+/// провинций (`weights`, пиксели; пустой или неподходящий по длине список — равные веса) и сглаживаются кривой.
+/// Концы кривой доведены до крайних проекций, поэтому длина хребта не меньше размаха.
+pub fn build_ridge(points: &[Vec2], weights: &[f32], axis: &Axis) -> Ridge {
     let u = axis.direction();
     let v = Vec2::new(-u.y, u.x);
     if points.is_empty() {
         return Ridge::new(vec![axis.center - u * axis.length * 0.5, axis.center + u * axis.length * 0.5]);
     }
+    let weight_of = |i: usize| if weights.len() == points.len() { weights[i].max(1e-3) } else { 1.0 };
     let projected: Vec<(f32, f32)> = points.iter().map(|&p| ((p - axis.center).dot(u), (p - axis.center).dot(v))).collect();
     let tmin = projected.iter().map(|p| p.0).fold(f32::MAX, f32::min);
     let tmax = projected.iter().map(|p| p.0).fold(f32::MIN, f32::max);
-    let mean_s = projected.iter().map(|p| p.1).sum::<f32>() / projected.len() as f32;
+    let total_weight: f32 = (0..projected.len()).map(weight_of).sum();
+    let mean_s = projected.iter().enumerate().map(|(i, p)| p.1 * weight_of(i)).sum::<f32>() / total_weight;
     let k = (points.len() / 4).clamp(3, 5);
     let step = ((tmax - tmin) / k as f32).max(1e-3);
     let mut centroids: Vec<(f32, f32)> = Vec::with_capacity(k);
     for bin in 0..k {
         let (lo, hi) = (tmin + step * bin as f32, tmin + step * (bin + 1) as f32);
-        let members: Vec<&(f32, f32)> =
-            projected.iter().filter(|p| p.0 >= lo && (p.0 < hi || (bin == k - 1 && p.0 <= hi))).collect();
+        let members: Vec<(usize, &(f32, f32))> =
+            projected.iter().enumerate().filter(|(_, p)| p.0 >= lo && (p.0 < hi || (bin == k - 1 && p.0 <= hi))).collect();
         if members.is_empty() {
             centroids.push(((lo + hi) * 0.5, mean_s));
         } else {
-            let n = members.len() as f32;
-            centroids.push((members.iter().map(|p| p.0).sum::<f32>() / n, members.iter().map(|p| p.1).sum::<f32>() / n));
+            let w: f32 = members.iter().map(|&(i, _)| weight_of(i)).sum();
+            centroids.push((
+                members.iter().map(|&(i, p)| p.0 * weight_of(i)).sum::<f32>() / w,
+                members.iter().map(|&(i, p)| p.1 * weight_of(i)).sum::<f32>() / w,
+            ));
         }
     }
     // концы — на крайних проекциях с поперечным смещением крайних сегментов
@@ -309,8 +356,11 @@ impl TextMetrics {
     /// Метрики шрифта игры; без шрифта — приблизительные метрики шрифта egui.
     pub fn of(font: Option<&MapFont>, text: &str) -> Self {
         match font {
-            Some(f) => Self { width_em: f.font.width_em(text), cap_ratio: f.font.cap_ratio() },
-            None => Self { width_em: text.chars().count() as f32 * 0.62, cap_ratio: 0.7 },
+            Some(f) => Self { width_em: f.font.text_width_em(text), cap_ratio: f.font.cap_ratio() },
+            None => {
+                let chars = text.chars().count();
+                Self { width_em: chars as f32 * 0.62 * (1.0 + tracking_for(chars)), cap_ratio: 0.7 }
+            }
         }
     }
 }
@@ -341,7 +391,8 @@ pub fn layout_on_ridge(font: &BmFont, text: &str, ridge: &Ridge, size: f32) -> V
         return Vec::new();
     }
     let k = size / font.line_height as f32;
-    let total: f32 = font.width_em(text) * size;
+    let tracking = 1.0 + tracking_for(text.chars().count());
+    let total: f32 = font.text_width_em(text) * size;
     let start = (ridge.length() - total) * 0.5;
     // вертикальный центр заглавных буквы относительно верха строки
     let cap_h = font.glyphs.get(&u32::from('H')).map_or(font.line_height as f32 * 0.65, |g| g.height as f32);
@@ -351,12 +402,13 @@ pub fn layout_on_ridge(font: &BmFont, text: &str, ridge: &Ridge, size: f32) -> V
     let mut quads = Vec::new();
     for c in text.chars() {
         let Some(g) = font.glyphs.get(&u32::from(c)) else {
-            pen += font.line_height as f32 / 3.0;
+            pen += font.line_height as f32 / 3.0 * tracking;
             continue;
         };
         let advance = g.xadvance as f32;
+        let cell = advance * tracking;
         if g.width > 0 && g.height > 0 {
-            let s = start + (pen + advance * 0.5) * k;
+            let s = start + (pen + cell * 0.5) * k;
             let (pos, tangent) = ridge.at(s);
             let right = tangent;
             let up = Vec2::new(-tangent.y, tangent.x);
@@ -374,7 +426,7 @@ pub fn layout_on_ridge(font: &BmFont, text: &str, ridge: &Ridge, size: f32) -> V
                 uv: [Vec2::new(u0, v0), Vec2::new(u1, v0), Vec2::new(u1, v1), Vec2::new(u0, v1)],
             });
         }
-        pen += advance;
+        pen += cell;
     }
     quads
 }
@@ -383,14 +435,30 @@ pub fn layout_on_ridge(font: &BmFont, text: &str, ridge: &Ridge, size: f32) -> V
 // Прозрачность и видимость при зуме
 // ---------------------------------------------------------------------------
 
-/// Прозрачность надписи. На отдалении и обычном зуме — 0.72. При приближении (`scale < 0.7`) надпись
-/// не исчезает, а плавно становится водяным знаком до 0.20 (к `scale = 0.1`).
+fn lerp_between(x: f32, x0: f32, x1: f32, y0: f32, y1: f32) -> f32 {
+    y0 + (y1 - y0) * ((x - x0) / (x1 - x0)).clamp(0.0, 1.0)
+}
+
+/// Трёхфазная прозрачность надписи по масштабу камеры.
+/// - тактический (`scale < 0.55`): водяной знак 0.16 (scale <= 0.25) -> 0.68 (scale = 0.55), надпись не исчезает;
+/// - региональный (0.55..=1.65): максимум читаемости 0.75, к концу зоны 0.72;
+/// - планетарный (`scale > 1.65`): плавное растворение от 0.72 до 0 (scale >= 2.6).
 pub fn watermark_alpha(camera_scale: f32) -> f32 {
-    if !camera_scale.is_finite() || camera_scale >= WATERMARK_START {
-        return ALPHA_MAX;
+    let x = camera_scale;
+    if !x.is_finite() {
+        return ALPHA_PEAK;
     }
-    let t = ((camera_scale - WATERMARK_FULL) / (WATERMARK_START - WATERMARK_FULL)).clamp(0.0, 1.0);
-    ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * t
+    if x <= TACTICAL_END {
+        lerp_between(x, TACTICAL_FULL, TACTICAL_END, ALPHA_TACTICAL_MIN, ALPHA_TACTICAL_END)
+    } else if x < REGIONAL_PEAK_FROM {
+        lerp_between(x, TACTICAL_END, REGIONAL_PEAK_FROM, ALPHA_TACTICAL_END, ALPHA_PEAK)
+    } else if x <= REGIONAL_PEAK_TO {
+        ALPHA_PEAK
+    } else if x <= REGIONAL_END {
+        lerp_between(x, REGIONAL_PEAK_TO, REGIONAL_END, ALPHA_PEAK, ALPHA_REGIONAL_END)
+    } else {
+        lerp_between(x, REGIONAL_END, PLANETARY_GONE, ALPHA_REGIONAL_END, 0.0)
+    }
 }
 
 /// Экранная высота заглавных букв, пиксели: размер глифа в мире / масштаб камеры × доля заглавных.
@@ -426,6 +494,8 @@ mod tests {
         assert!((f.cap_ratio() - 55.0 / 84.0).abs() < 1e-4);
         // ширина слова: H 50 + I 14 = 64 / 84; неизвестный символ — треть строки
         assert!((f.width_em("HI") - 64.0 / 84.0).abs() < 1e-4);
+        // короткое слово (2 буквы) растянуто на 25%
+        assert!((f.text_width_em("HI") - 64.0 / 84.0 * 1.25).abs() < 1e-4);
         assert!((f.width_em("?") - 1.0 / 3.0).abs() < 1e-4);
     }
 
@@ -442,6 +512,9 @@ mod tests {
 
     #[test]
     fn atlas_coverage_keeps_the_dark_fill_and_drops_the_halo() {
+        assert_eq!(glyph_halo(255, 128), 255, "светлый ореол — отдельное покрытие");
+        assert_eq!(glyph_halo(0, 128), 0, "в теле буквы ореола нет");
+        assert!(glyph_halo(111, 122) > 90 && glyph_coverage(111, 122) > 120, "край: тело и ореол делят пиксель");
         assert_eq!(glyph_coverage(0, 128), 255, "заливка глифа");
         assert_eq!(glyph_coverage(255, 128), 0, "светлый ореол не считается");
         assert_eq!(glyph_coverage(0, 0), 0, "прозрачный фон");
@@ -462,6 +535,14 @@ mod tests {
         }
         assert_eq!((font.width, font.height), (2048, 1024));
         assert_eq!(font.coverage.len(), font.width * font.height);
+        assert_eq!(font.halo.len(), font.coverage.len());
+        assert!(font.halo.iter().any(|&c| c > 180), "в атласе есть светлый ореол");
+        // кириллица читается тем же весом, что и латиница: ширина штриха «Н» равна «H»
+        for (latin, cyrillic) in [('H', 'Н')] {
+            let (a, b) = (font.font.glyphs[&u32::from(latin)], font.font.glyphs[&u32::from(cyrillic)]);
+            assert_eq!((a.width, a.height), (b.width, b.height));
+        }
+        assert!((0x0410..=0x044F).filter(|c| font.font.glyphs.contains_key(c)).count() >= 60, "кириллица 0x0410..0x044F в шрифте");
         assert!(font.coverage.iter().any(|&c| c > 200), "в атласе есть заливка глифов");
     }
 
@@ -502,11 +583,11 @@ mod tests {
     fn word_fits_into_three_quarters_of_the_length_and_below_the_height_limit() {
         let pts = strip(30.0, 400.0, 60.0);
         let axis = principal_axis(&pts).expect("ось");
-        let ridge = build_ridge(&pts, &axis);
+        let ridge = build_ridge(&pts, &[], &axis);
         assert!(ridge.length() >= 390.0, "хребет не короче размаха: {}", ridge.length());
         let f = font();
         for text in ["HI", "HIHIHIHIHIHIHI", "H"] {
-            let metrics = TextMetrics { width_em: f.width_em(text), cap_ratio: f.cap_ratio() };
+            let metrics = TextMetrics { width_em: f.text_width_em(text), cap_ratio: f.cap_ratio() };
             let size = fit_glyph_size(&axis, ridge.length(), &metrics);
             assert!(size > 0.0);
             let word = metrics.width_em * size;
@@ -536,9 +617,9 @@ mod tests {
             Vec2::new(x, -(x - 300.0).powi(2) / 600.0)
         }).collect();
         let axis = principal_axis(&pts).expect("ось");
-        let ridge = build_ridge(&pts, &axis);
+        let ridge = build_ridge(&pts, &[], &axis);
         let f = font();
-        let size = fit_glyph_size(&axis, ridge.length(), &TextMetrics { width_em: f.width_em("HIHIHI"), cap_ratio: f.cap_ratio() });
+        let size = fit_glyph_size(&axis, ridge.length(), &TextMetrics { width_em: f.text_width_em("HIHIHI"), cap_ratio: f.cap_ratio() });
         let quads = layout_on_ridge(&f, "HIHIHI", &ridge, size);
         assert_eq!(quads.len(), 6);
         let slope = |q: &GlyphQuad| {
@@ -557,17 +638,45 @@ mod tests {
     }
 
     #[test]
-    fn alpha_becomes_a_watermark_but_never_disappears() {
-        assert_eq!(watermark_alpha(2.0), ALPHA_MAX);
-        assert_eq!(watermark_alpha(1.0), ALPHA_MAX);
-        assert_eq!(watermark_alpha(0.7), ALPHA_MAX);
+    fn three_phase_alpha_curve() {
+        // тактический зум: водяной знак ~0.16 у самой земли, 0.68 на границе зоны, не исчезает
+        assert!((watermark_alpha(0.25) - 0.16).abs() < 1e-4);
+        assert!((watermark_alpha(0.05) - 0.16).abs() < 1e-4, "ниже 0.25 остаётся 0.16, а не ноль");
+        assert!((watermark_alpha(0.55) - 0.68).abs() < 1e-4);
         let mid = watermark_alpha(0.4);
-        assert!(mid > ALPHA_MIN && mid < ALPHA_MAX, "{mid}");
-        assert!((watermark_alpha(0.1) - 0.20).abs() < 1e-4);
-        assert!((watermark_alpha(0.01) - 0.20).abs() < 1e-4, "водяной знак ~0.20, а не ноль");
-        assert!(watermark_alpha(f32::NAN) > 0.0);
-        // монотонность при приближении
-        assert!(watermark_alpha(0.5) > watermark_alpha(0.3));
+        assert!(mid > 0.16 && mid < 0.68, "{mid}");
+        assert!(watermark_alpha(0.5) > watermark_alpha(0.3), "растёт с отдалением");
+        // региональный зум: пик ~0.75, вся зона 0.72..0.78
+        for scale in [0.75, 0.9, 1.0, 1.2] {
+            assert!((watermark_alpha(scale) - 0.75).abs() < 1e-4, "{scale}");
+        }
+        for scale in [0.6, 0.7, 1.4, 1.65] {
+            let a = watermark_alpha(scale);
+            assert!(a >= 0.68 && a <= 0.78, "{scale}: {a}");
+        }
+        assert!((watermark_alpha(1.65) - 0.72).abs() < 1e-4);
+        // планетарный зум: плавное растворение до нуля
+        let fading = watermark_alpha(2.1);
+        assert!(fading > 0.0 && fading < 0.72, "{fading}");
+        assert!(watermark_alpha(1.8) > watermark_alpha(2.3));
+        assert_eq!(watermark_alpha(2.6), 0.0);
+        assert_eq!(watermark_alpha(5.0), 0.0);
+        assert!(watermark_alpha(f32::NAN) > 0.0, "мусор не обнуляет надписи");
+    }
+
+    #[test]
+    fn short_names_get_wider_tracking() {
+        assert_eq!(tracking_for(6), 0.25, "ИТАЛИЯ");
+        assert_eq!(tracking_for(7), 0.25, "ФРАНЦИЯ");
+        assert_eq!(tracking_for(9), 0.20);
+        assert_eq!(tracking_for(12), 0.15);
+        assert_eq!(tracking_for(30), 0.0, "длинное название не растягивается");
+        let f = font();
+        let flat = Ridge::new(vec![Vec2::new(0.0, 0.0), Vec2::new(2000.0, 0.0)]);
+        let q = layout_on_ridge(&f, "HIH", &flat, 84.0);
+        // расстояние между центрами двух H через «I»: (50 + 14) * 1.25 = 80 вместо 64
+        let c = |g: &GlyphQuad| (g.corners[0].x + g.corners[1].x) * 0.5;
+        assert!((c(&q[2]) - c(&q[0]) - 80.0).abs() < 1e-2, "{}", c(&q[2]) - c(&q[0]));
     }
 
     #[test]
