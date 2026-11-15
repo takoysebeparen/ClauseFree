@@ -10,7 +10,16 @@
 @group(2) @binding(2) var heights: texture_2d<f32>;
 @group(2) @binding(3) var heights_sampler: sampler;
 
+// маска рек (R8Unorm, >0 = река); текстура 1x1 — рек нет (файла не было)
+@group(2) @binding(4) var rivers: texture_2d<f32>;
+@group(2) @binding(5) var rivers_sampler: sampler;
+
 const PALETTE_WIDTH: i32 = 256;
+// Глубокий сине-голубой цвет русла и максимальная доля подмешивания (русла в маске тонкие — 1-3 пикселя).
+const RIVER_COLOR: vec3<f32> = vec3<f32>(0.16, 0.34, 0.56);
+const RIVER_STRENGTH: f32 = 0.9;
+// Река чуть темнеет на тенях рельефа, но не светлеет на склонах так же сильно, как суша.
+const RIVER_SHADE_FOLLOW: f32 = 0.5;
 // [25, 25, 25] в sRGB, переведённый в линейное пространство
 const COUNTRY_BORDER: vec3<f32> = vec3<f32>(0.0097, 0.0097, 0.0097);
 // 0.75 в sRGB-пространстве = 0.53 в линейном
@@ -47,6 +56,21 @@ fn relief_shade(uv: vec2<f32>) -> f32 {
     let n = normalize(vec3<f32>(-gx * RELIEF_SCALE, -gy * RELIEF_SCALE, 1.0));
     let l = normalize(LIGHT_DIR);
     return clamp(1.0 + (dot(n, l) - l.z) * SHADE_GAIN, SHADE_MIN, SHADE_MAX);
+}
+
+// Доля реки в точке: билинейная выборка маски с лёгким сглаживанием по соседним текселям (усиливает тонкие русла).
+fn river_amount(uv: vec2<f32>) -> f32 {
+    let rd = vec2<f32>(textureDimensions(rivers));
+    if (rd.x <= 1.0) {
+        return 0.0;
+    }
+    let px = vec2<f32>(1.0 / rd.x, 1.0 / rd.y);
+    let center = textureSampleLevel(rivers, rivers_sampler, uv, 0.0).r;
+    let around = (textureSampleLevel(rivers, rivers_sampler, uv + vec2<f32>(px.x, 0.0), 0.0).r
+        + textureSampleLevel(rivers, rivers_sampler, uv - vec2<f32>(px.x, 0.0), 0.0).r
+        + textureSampleLevel(rivers, rivers_sampler, uv + vec2<f32>(0.0, px.y), 0.0).r
+        + textureSampleLevel(rivers, rivers_sampler, uv - vec2<f32>(0.0, px.y), 0.0).r) * 0.25;
+    return clamp(center * 0.6 + around * 0.8, 0.0, 1.0);
 }
 
 fn province_at(p: vec2<i32>, dims: vec2<i32>) -> i32 {
@@ -98,8 +122,13 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     // Рельеф только на суше (вода вернулась выше); границы государств остаются чёткими
     let shade = relief_shade(in.uv);
+    // Реки на суше: подмешиваем сине-голубой цвет, приглушённый рельефом (hillshading)
+    let river = river_amount(in.uv) * RIVER_STRENGTH;
+    let land = base.rgb * shade;
+    let water = RIVER_COLOR * mix(1.0, shade, RIVER_SHADE_FOLLOW);
+    let color = mix(land, water, river);
     if (province_border) {
-        return vec4<f32>(base.rgb * shade * PROVINCE_SHADE, 1.0);
+        return vec4<f32>(color * PROVINCE_SHADE, 1.0);
     }
-    return vec4<f32>(base.rgb * shade, 1.0);
+    return vec4<f32>(color, 1.0);
 }

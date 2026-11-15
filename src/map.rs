@@ -84,6 +84,27 @@ pub fn height_image(heightmap: Option<&HeightMap>) -> Image {
     )
 }
 
+/// Цвета фона `rivers.bmp`: не река.
+const RIVER_BACKGROUND: [[u8; 3]; 2] = [[122, 122, 122], [255, 255, 255]];
+
+/// Текстура маски рек для шейдера: R8Unorm, 255 — река / рукав, 0 — нет. Без маски (нет файла, другой размер) —
+/// заглушка 1x1 из нулей: шейдер видит размер 1x1 и реки не рисует.
+pub fn river_image(mask: Option<&[bool]>, width: u32, height: u32) -> Image {
+    let (w, h, data) = match mask {
+        Some(m) if width > 0 && height > 0 && m.len() == width as usize * height as usize => {
+            (width, height, m.iter().map(|&river| if river { 255u8 } else { 0 }).collect())
+        }
+        _ => (1, 1, vec![0u8]),
+    };
+    Image::new(
+        Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        data,
+        TextureFormat::R8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+}
+
 /// Пары смежных провинций (меньший id, больший id), между которыми проходит река:
 /// атака через такую границу — форсирование реки. Строится вместе с графом смежности.
 #[derive(Resource, Default, Debug)]
@@ -397,6 +418,7 @@ impl Plugin for MapPlugin {
         app.insert_resource(crate::units::DivisionTemplates::with_game_files(&self.root));
         app.insert_resource(crate::command::load_commander_pool(&self.root));
         app.insert_resource(crate::air::load_strategic_regions(&self.root));
+        app.insert_resource(crate::ui::load_country_names(&self.root));
 
         // Логистика: узлы снабжения и железные дороги
         let supply_nodes = load_supply_nodes(&self.root);
@@ -470,6 +492,10 @@ pub struct PoliticalMaterial {
     #[texture(2)]
     #[sampler(3)]
     pub heights: Handle<Image>,
+    /// Маска рек (R8Unorm, 255 — река); текстура 1x1 означает «рек нет».
+    #[texture(4)]
+    #[sampler(5)]
+    pub rivers: Handle<Image>,
 }
 
 impl Material2d for PoliticalMaterial {
@@ -624,8 +650,9 @@ pub fn setup_map(
             None => "карта высот недоступна, плоский режим".to_string(),
         }
     );
+    let rivers = images.add(river_image(map.river_mask.as_deref(), map.width(), map.height()));
     let material =
-        materials.add(PoliticalMaterial { ids: images.add(ids_image), palette: palette_handle.clone(), heights });
+        materials.add(PoliticalMaterial { ids: images.add(ids_image), palette: palette_handle.clone(), heights, rivers });
     commands.insert_resource(MapPaint { palette: palette_handle, material: material.clone() });
 
     // Меш-прямоугольник по центру (0,0), масштаб 1:1. Оригинальный provinces.bmp остаётся в RAM
@@ -950,12 +977,21 @@ fn load_heightmap(root: &Path) -> Option<HeightMap> {
 /// а фоном служат серый (122,122,122) и белый (255,255,255). Нет файла или размер не совпал — рек нет.
 fn load_river_mask(root: &Path, width: u32, height: u32) -> Option<Vec<bool>> {
     let bytes = std::fs::read(root.join("map").join("rivers.bmp")).ok()?;
-    let rivers = image::load_from_memory(&bytes).ok()?.to_rgb8();
+    let mask = decode_river_mask(&bytes, width, height);
+    if mask.is_none() {
+        eprintln!("[ПРЕДУПРЕЖДЕНИЕ] rivers.bmp не декодирован или другого размера, реки не учитываются");
+    }
+    mask
+}
+
+/// Байты `rivers.bmp` -> маска «пиксель принадлежит реке» ровно `width * height`. Серый и белый фон — не река.
+/// Битый файл или несовпадение размера — `None`.
+pub fn decode_river_mask(bytes: &[u8], width: u32, height: u32) -> Option<Vec<bool>> {
+    let rivers = image::load_from_memory(bytes).ok()?.to_rgb8();
     if rivers.width() != width || rivers.height() != height {
-        eprintln!("[ПРЕДУПРЕЖДЕНИЕ] rivers.bmp другого размера, реки не учитываются");
         return None;
     }
-    Some(rivers.pixels().map(|p| p.0 != [122, 122, 122] && p.0 != [255, 255, 255]).collect())
+    Some(rivers.pixels().map(|p| !RIVER_BACKGROUND.contains(&p.0)).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,6 +1288,64 @@ mod relief_tests {
         assert_eq!(h.pixels.len(), (h.width * h.height) as usize);
         let (min, max) = (h.pixels.iter().min().copied().unwrap_or(0), h.pixels.iter().max().copied().unwrap_or(0));
         assert!(max > min + 50, "в рельефе есть перепад высот: {min}..{max}");
+    }
+}
+
+#[cfg(test)]
+mod river_mask_tests {
+    use super::*;
+
+    fn bmp(width: u32, height: u32, f: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(width, height, |x, y| image::Rgb(f(x, y)));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Bmp).expect("запись BMP");
+        out.into_inner()
+    }
+
+    #[test]
+    fn background_colors_are_filtered_out_and_palette_colors_are_rivers() {
+        // 0: серый фон, 1: белый фон, 2: исток (зелёный), 3: русло (голубой), 4: рукав (красный)
+        let colors = [[122, 122, 122], [255, 255, 255], [0, 255, 0], [0, 200, 255], [255, 0, 0]];
+        let bytes = bmp(5, 2, |x, _| colors[x as usize]);
+        let mask = decode_river_mask(&bytes, 5, 2).expect("маска");
+        assert_eq!(mask, vec![false, false, true, true, true, false, false, true, true, true]);
+    }
+
+    #[test]
+    fn wrong_size_or_garbage_gives_no_mask() {
+        let bytes = bmp(4, 4, |_, _| [0, 255, 0]);
+        assert!(decode_river_mask(&bytes, 8, 8).is_none(), "другой размер");
+        assert!(decode_river_mask(b"", 1, 1).is_none());
+        assert!(decode_river_mask(b"BM garbage", 4, 4).is_none());
+        assert!(load_river_mask(Path::new("Z:\\нет\\игры"), 4, 4).is_none());
+    }
+
+    #[test]
+    fn mask_texture_is_r8_and_fallback_is_a_1x1_zero() {
+        let mask = [true, false, false, true, true, false];
+        let image = river_image(Some(&mask), 3, 2);
+        assert_eq!((image.width(), image.height()), (3, 2));
+        assert_eq!(image.texture_descriptor.format, TextureFormat::R8Unorm);
+        assert_eq!(image.data, vec![255, 0, 0, 255, 255, 0]);
+        for fallback in [river_image(None, 3, 2), river_image(Some(&mask), 4, 4), river_image(Some(&[]), 0, 0)] {
+            assert_eq!((fallback.width(), fallback.height()), (1, 1));
+            assert_eq!(fallback.data, vec![0u8]);
+            assert_eq!(fallback.texture_descriptor.format, TextureFormat::R8Unorm);
+        }
+    }
+
+    /// Реальный rivers.bmp (пропускается без игры): маска размером с карту, реки есть, но суша в основном без рек.
+    #[test]
+    fn real_rivers_match_the_province_map() {
+        let root = Path::new("D:\\SteamLibrary\\steamapps\\common\\Hearts of Iron IV");
+        if !root.exists() {
+            return;
+        }
+        let Ok(map) = load_province_map(root) else { return };
+        let mask = map.river_mask.as_deref().unwrap_or(&[]);
+        assert_eq!(mask.len(), (map.width() * map.height()) as usize);
+        let river = mask.iter().filter(|&&r| r).count();
+        assert!(river > 10_000 && river * 10 < mask.len(), "речных пикселей {river} из {}", mask.len());
     }
 }
 
