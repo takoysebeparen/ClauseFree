@@ -15,7 +15,7 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::camera::MainCamera;
 use crate::clock::{ClockSet, DailyTickEvent, HourTick};
-use crate::air::{air_attack_bonus_pct, air_defense_penalty_pct, air_status, side_edge, AirSuperiorityMap};
+use crate::air::{air_attack_bonus_pct, air_defense_penalty_pct, air_line, StrategicAirRegions};
 use crate::colors::CountryColors;
 use crate::command::{
     resolve_counters, side_mods, CombatPhase, CombatTactic, ATTACKER_TACTICS, DEFENDER_TACTICS,
@@ -2228,8 +2228,7 @@ fn resolve_combats(
     adjacency: Res<ProvinceAdjacency>,
     map: Res<ProvinceMap>,
     rivers: Res<ProvinceRivers>,
-    registry: Res<StateRegistry>,
-    air: Res<AirSuperiorityMap>,
+    air: Res<StrategicAirRegions>,
     mut experience: ResMut<ArmyExperience>,
     mut controllers: ResMut<ProvinceControllers>,
     mut controller_changed: EventWriter<ProvinceControllerChanged>,
@@ -2353,9 +2352,8 @@ fn resolve_combats(
                 &def_line.iter().map(|(_, d)| d.recon).collect::<Vec<_>>(),
             );
             // Небо над стейтом провинции: перевес даёт до +10% к атаке, давление врага — до -15% к защите
-            let air_value = registry.state_of(province).map_or(0, |s| air.get(s.id));
-            let (att_air, def_air) =
-                (side_edge(air_value, &state.attacker_owner), side_edge(air_value, &state.defender_owner));
+            let att_air = air.edge(province, &state.attacker_owner, &state.defender_owner);
+            let def_air = -att_air;
             let advantage = |damage: u32, has_advantage: bool| {
                 if has_advantage { damage * (100 + TACTICAL_ADVANTAGE_PCT) / 100 } else { damage }
             };
@@ -2812,12 +2810,11 @@ fn attack_label(d: &Division) -> String {
 }
 
 /// Строка разведки и неба в окне боя: `Разведка: 3.0 vs 1.0 | Небо: Германия +40`.
-fn recon_air_label(att: &SideStats, def: &SideStats, air_value: i32) -> String {
+fn recon_air_label(att: &SideStats, def: &SideStats, air_line: &str) -> String {
     format!(
-        "Разведка: {} vs {} | Небо: {}",
+        "Разведка: {} vs {} | {air_line}",
         recon_text(att.recon_sum, att.active),
         recon_text(def.recon_sum, def.active),
-        air_status(air_value)
     )
 }
 
@@ -2849,8 +2846,7 @@ fn combat_ui(
     centers: Res<ProvinceCenters>,
     map: Res<ProvinceMap>,
     rivers: Res<ProvinceRivers>,
-    registry: Res<StateRegistry>,
-    air: Res<AirSuperiorityMap>,
+    air: Res<StrategicAirRegions>,
     colors: Res<CountryColors>,
     cameras: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     mut open: ResMut<OpenCombats>,
@@ -2902,8 +2898,9 @@ fn combat_ui(
         let attacker_color = colors.ui_color32(&combat.attacker_owner);
         let defender_color = colors.ui_color32(&combat.defender_owner);
         let terrain_text = terrain_label(map.terrain_of(combat.province_id), river_penalty);
-        let air_value = registry.state_of(combat.province_id).map_or(0, |s| air.get(s.id));
-        let recon_text = recon_air_label(&att, &def, air_value);
+        let edge = air.edge(combat.province_id, &combat.attacker_owner, &combat.defender_owner);
+        let sky = air_line(air.region_name(combat.province_id), edge, &combat.attacker_owner, &combat.defender_owner);
+        let recon_text = recon_air_label(&att, &def, &sky);
 
         egui::Area::new(egui::Id::new(("combat_plate", ce)))
             .fixed_pos(egui::pos2(screen.x + radius + 6.0, screen.y - DIVISION_SIZE.y - radius * 2.0 - 8.0))
@@ -3203,7 +3200,7 @@ mod tests {
             .insert_resource(ProvinceMap::empty_for_test())
             .init_resource::<ProvinceRivers>()
             .init_resource::<StateRegistry>()
-            .init_resource::<AirSuperiorityMap>()
+            .init_resource::<StrategicAirRegions>()
             .init_resource::<ArmyExperience>()
             .insert_resource(ProvinceAdjacency { neighbors })
             .insert_resource(controllers)
@@ -3477,7 +3474,12 @@ mod tests {
         let mut registry = StateRegistry::default();
         registry.province_to_state.insert(2, state);
         app.insert_resource(registry);
-        app.insert_resource(AirSuperiorityMap { air_superiority: BTreeMap::from([(7, air_value)]) });
+        // провинция 2 лежит в стратегическом регионе 7; положительное небо — авиация Германии, отрицательное — Франции
+        let mut air = StrategicAirRegions::default();
+        air.insert(crate::air::StrategicRegion { id: 7, name: "Западная Германия".into(), provinces: vec![2] });
+        air.set_power(7, "GER", air_value.max(0));
+        air.set_power(7, "FRA", (-air_value).max(0));
+        app.insert_resource(air);
         (app, att, def)
     }
 
@@ -4670,9 +4672,13 @@ mod recon_air_tests {
         assert_eq!(recon_text(3, 1), "3.0");
         assert_eq!(recon_text(5, 2), "2.5");
         assert_eq!(recon_text(0, 0), "0.0");
-        assert_eq!(recon_air_label(&side(9, 3), &side(4, 4), 40), "Разведка: 3.0 vs 1.0 | Небо: Германия +40");
-        assert_eq!(recon_air_label(&side(1, 1), &side(1, 1), -15), "Разведка: 1.0 vs 1.0 | Небо: Франция +15");
-        assert_eq!(recon_air_label(&side(1, 1), &side(1, 1), 0), "Разведка: 1.0 vs 1.0 | Небо: паритет");
+        let sky = |region: Option<&str>, edge: i32| air_line(region, edge, "GER", "FRA");
+        assert_eq!(
+            recon_air_label(&side(9, 3), &side(4, 4), &sky(Some("Западная Германия"), 40)),
+            "Разведка: 3.0 vs 1.0 | Небо (Западная Германия): Германия +40"
+        );
+        assert_eq!(recon_air_label(&side(1, 1), &side(1, 1), &sky(None, -15)), "Разведка: 1.0 vs 1.0 | Небо: Франция +15");
+        assert_eq!(recon_air_label(&side(1, 1), &side(1, 1), &sky(None, 0)), "Разведка: 1.0 vs 1.0 | Небо: паритет");
     }
 }
 
