@@ -5,8 +5,8 @@ long-term volunteer project, and correctness comes before speed.
 
 | # | Milestone | Done when |
 |---|-----------|-----------|
-| M0 | Foundation | Workspace, documents, conventions, frozen prototype in `legacy/`. **(in progress)** |
-| M1 | Parser + VFS | `clausewitz` parses **every** file of the base game and installed DLC with zero errors; `vfs` layers base/DLC/mod directories correctly. A report lists unknown constructs. |
+| M0 | Foundation | Workspace, documents, conventions, frozen prototype in `legacy/`. **(done)** |
+| M1 | Parser + VFS | `clausewitz` parses **every** file of the base game and installed DLC with zero new errors (a baseline records the 40 files that are malformed in the original); `vfs` layers base/DLC/mod directories correctly. **(done; see crates `clausewitz` and `vfs`)** |
 | M2 | Data model | `data` loads core definitions (countries, states, provinces, units, equipment, terrain, ...) with a coverage report; unsupported keys are listed, not dropped. |
 | M3 | Headless core | `sim` runs the clock, a command queue, deterministic RNG and a state hash; a scenario runs N days headless and is bit-reproducible across runs and machines. |
 | M4 | First oracle-verified system | Land combat reproduces measured results from the original within documented tolerances. Establishes the oracle workflow. |

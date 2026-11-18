@@ -30,8 +30,8 @@ This document is the contract for the new engine. If code and this document disa
  clausewitz     lossless lexer/parser for Paradox script and localisation files
 ```
 
-Planned crates (created as milestones are reached): `clausewitz`, `vfs`, `data`, `script`, `sim`, `render`, `ui`,
-`app`. Shared small utilities live in `common`.
+Crates: `clausewitz` and `vfs` exist (M1). Planned: `data`, `script`, `sim`, `render`, `ui`, `app`, and `common` for
+shared small utilities.
 
 ## 3. Virtual file system and layering
 

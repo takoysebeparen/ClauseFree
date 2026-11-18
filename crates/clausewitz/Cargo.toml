@@ -1,0 +1,8 @@
+[package]
+name = "clausewitz"
+description = "Lossless parser for Paradox (Clausewitz) script files"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]

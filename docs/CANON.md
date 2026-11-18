@@ -48,4 +48,23 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
 
 ## Verified entries
 
-_None yet. The first verified entry will come with the first oracle-tested system (land combat)._
+### Script syntax and malformed original files
+- Status: verified (by parsing a full installation)
+- Source: all `.txt/.gfx/.gui/.asset/.mod/.map` files of game revision `7c6c1c59` (base game, `integrated_dlc/`, `dlc/`).
+- Behaviour: the original ships files with defects and still runs, so it evidently tolerates them: an unclosed `{` at end of file (60 occurrences), a stray `}`,
+  stray quotes, a key with no value. 40 files are affected; they are listed in
+  `crates/clausewitz/baseline/hoi4-7c6c1c59.txt`. `interface/credits.txt` is plain text, not script.
+- Ours: the parser reports each defect as a diagnostic and recovers (the tree keeps everything parsed so far), so
+  engine behaviour for these files matches "tolerate". **Unmeasured:** how the original recovers (for example whether a
+  quoted string may span lines). To be checked with an oracle scenario before relying on it.
+- Test: `crates/clausewitz/tests/parser.rs`, `cargo run --release -p clausewitz --example parse_all -- --baseline ...`
+
+### Layering of base game, DLC and mods
+- Status: knowingly-simplified (order of DLC is a guess)
+- Source: descriptor files (`*.dlc`, `*.mod`) in the installation; `replace_path` semantics from the mod format.
+- Behaviour: a later layer overrides a same-named file of an earlier one; `replace_path` drops earlier content of a
+  directory.
+- Ours: base, then `integrated_dlc/*`, then `dlc/*`, each sorted by folder name; mods on top in the order given by
+  the caller. **The relative order of DLC layers is an assumption.** Case-insensitive paths. Whether the original merges
+  some directories by *file name* and others by *definition id* is a concern of the data layer, not the VFS.
+- Test: `crates/vfs/tests/layers.rs`

@@ -1,0 +1,9 @@
+[package]
+name = "vfs"
+description = "Layered virtual file system for game data (base game, DLC, mods)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+clausewitz = { path = "../clausewitz" }
