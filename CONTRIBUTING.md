@@ -17,6 +17,11 @@ ClauseFree reimplements an engine. To stay on the right side of copyright and li
 - **No circumvention.** Do not add or discuss tools that bypass licence or DLC checks.
 - **Do not use the *Hearts of Iron* name or logos** as the name of the product or in its branding.
 
+## Licensing
+
+By contributing you agree that your contribution is licensed under GPL-3.0-only, the licence of this project.
+Only submit code you have the right to submit.
+
 ## Conventions
 
 - Language: **English** for code, comments, identifiers, logs, commit messages and docs.

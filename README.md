@@ -38,5 +38,7 @@ Please read [CONTRIBUTING.md](CONTRIBUTING.md) first — in particular the clean
 
 ## Legal
 
+ClauseFree is licensed under the **GNU General Public License v3.0 only** (see [LICENSE](LICENSE)).
+
 ClauseFree is an independent fan project. It is not affiliated with or endorsed by Paradox Interactive.
 *Hearts of Iron* is a trademark of Paradox Interactive AB. No game assets or proprietary code are included.
