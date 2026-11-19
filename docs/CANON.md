@@ -109,6 +109,39 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
   `color_ui`).
 - Ours: all three are stored; which one the map uses is decided (and verified) by the renderer.
 
+### Sub-unit stats are modifiers on top of equipment
+- Status: wiki-only
+- Source: community wiki, "Unit modding" (https://hoi4.paradoxwikis.com/Unit_modding), section "Modifiers": e.g.
+  `soft_attack = -0.1` on a unit means "10% less Soft Attack than they would usually get from its equipment";
+  `maximum_speed` acts as a bonus multiplier: `<base speed> * (1 + maximum_speed)`. Other keys (`max_organisation`,
+  `combat_width`, `max_strength`, `manpower`, `training_time`) are absolute values of the unit.
+- Ours: `data::units` stores every number as written; the combat and division systems decide which rule applies and
+  must verify it against the original (oracle).
+
+### Equipment syntax, archetypes and duplicate archetypes
+- Status: verified (official syntax reference shipped with the game)
+- Source: `common/units/equipment/_documentation.md`; header of `common/units/equipment/x_plane_airframes.txt`
+  ("This file must be evaluated after the file(s) defining the archetypes being duplicated. The equipment
+  attributes alias, type, variant_name, and derived_variant_name are not duplicated.").
+- Ours: `data::equipment` loads `equipments` and `duplicate_archetypes`; entries of the latter count as archetypes.
+  Inheritance (variant -> archetype -> parent) and modular equipment (`module_slots`, `default_modules`, ...) are
+  not resolved yet (reported as deferred).
+- Original defects found: `max_strength = 250§` in `ship_hull_carrier.txt`; several duplicated stat keys in equipment
+  and sub-units (first one kept, reported).
+
+### Terrain-like combat situations
+- Status: guess (list observed in files)
+- Source: sub-unit blocks `river`, `amphibious`, `fort` and `snow` take the same shape as terrain blocks but are not
+  categories in `common/terrain`.
+- Ours: `data::units::COMBAT_SITUATIONS`; any other block name must be a terrain category or it is reported.
+
+### Balance constants live in Lua
+- Status: verified (files exist)
+- Source: `common/resources/_documentation.md` refers to the define `NAI::MIN_FACTORIES_TO_WANT_TO_IMPORT`; defines are
+  in `common/defines/*.lua`.
+- Ours: not loaded yet. Many combat, supply and production constants are there; a small Lua-table reader is needed
+  before those systems are built (no guessing their values).
+
 ### Localisation precedence
 - Status: guess
 - Source: files under `localisation/**/replace/` exist to override keys, which suggests that ordinary duplicates do

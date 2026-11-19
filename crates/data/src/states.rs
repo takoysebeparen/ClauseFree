@@ -16,8 +16,7 @@ use vfs::Vfs;
 use crate::provinces::ProvinceId;
 use crate::report::{IssueKind, Report};
 use crate::source::{Ctx, Fields, Source, evaluation_order};
-use crate::terrain::NumberList;
-use crate::types::{Date, Tag};
+use crate::types::{Date, NumberList, Tag};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct StateId(pub u32);

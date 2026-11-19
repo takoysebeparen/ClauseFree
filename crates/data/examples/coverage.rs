@@ -40,6 +40,10 @@ fn main() {
     println!("  countries     {}", db.countries.len());
     println!("  states        {}", db.states.len());
     println!("  localisation  {} keys ({})", db.localisation.len(), db.localisation.language);
+    println!("  resources     {}", db.resources.len());
+    println!("  unit categories {}", db.units.categories.len());
+    println!("  sub-units     {}", db.units.sub_units.len());
+    println!("  equipment     {}", db.equipment.len());
 
     let errors = report.errors().count();
     println!("\nIssues: {} total, {errors} errors", report.issues.len());

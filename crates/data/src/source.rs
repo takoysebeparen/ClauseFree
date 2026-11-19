@@ -1,6 +1,7 @@
 //! Reading files from the VFS and checking parsed blocks against what a loader understands.
 
 use clausewitz::{Block, Entry, LineIndex, Scalar, Span, Value};
+
 use common::Fixed;
 use vfs::{FileEntry, Vfs};
 
@@ -136,6 +137,43 @@ impl Ctx<'_, '_> {
         }
     }
 
+    /// Every `name = number` entry of a block, in order (no other content allowed).
+    pub fn numbers(&mut self, block: &Block<'_>, schema: &str) -> crate::types::NumberList {
+        let mut out = Vec::new();
+        let mut fields = Fields::new(block, schema);
+        for entry in fields.take_matching(|_| true) {
+            if let Some(v) = self.fixed(entry, &format!("{schema}.{}", entry.key.text)) {
+                out.push((entry.key.text.to_string(), v));
+            }
+        }
+        fields.finish(self);
+        out
+    }
+
+    /// Names given either as one value (`type = infantry`) or as a list (`type = { infantry support }`).
+    pub fn names(&mut self, entry: &Entry<'_>, path: &str) -> Vec<String> {
+        match &entry.value {
+            Value::Scalar(s) => vec![s.unescaped().into_owned()],
+            Value::Block(b) => {
+                let mut out = Vec::new();
+                for v in b.values() {
+                    match v.as_scalar() {
+                        Some(s) => out.push(s.unescaped().into_owned()),
+                        None => self.issue(v.span(), path, IssueKind::InvalidValue("a list of names")),
+                    }
+                }
+                for e in b.entries() {
+                    self.issue(e.span, path, IssueKind::InvalidValue("a list of names"));
+                }
+                out
+            }
+            other => {
+                self.issue(other.span(), path, IssueKind::InvalidValue("a name or a list of names"));
+                Vec::new()
+            }
+        }
+    }
+
     /// Bare scalars of a list block as unsigned integers (`provinces = { 1 2 3 }`).
     pub fn u32_list(&mut self, block: &Block<'_>, path: &str) -> Vec<u32> {
         let mut out = Vec::new();
@@ -211,6 +249,21 @@ impl<'b, 'a> Fields<'b, 'a> {
                 continue;
             }
             if let Some(e) = self.entry_at(i).filter(|e| pred(e.key.text)) {
+                self.used[i] = true;
+                out.push(e);
+            }
+        }
+        out
+    }
+
+    /// Every unused entry for which the predicate holds, in order.
+    pub fn take_entries(&mut self, mut pred: impl FnMut(&Entry<'a>) -> bool) -> Vec<&'b Entry<'a>> {
+        let mut out = Vec::new();
+        for i in 0..self.used.len() {
+            if self.used[i] {
+                continue;
+            }
+            if let Some(e) = self.entry_at(i).filter(|e| pred(e)) {
                 self.used[i] = true;
                 out.push(e);
             }

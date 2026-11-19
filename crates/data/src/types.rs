@@ -5,6 +5,9 @@ use std::fmt;
 use clausewitz::Value;
 use common::Fixed;
 
+/// A list of `name = number` pairs, kept in file order.
+pub type NumberList = Vec<(String, Fixed)>;
+
 /// Country tag: exactly three ASCII letters or digits (`GER`, `D01`).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Tag([u8; 3]);

@@ -12,13 +12,16 @@
 
 pub mod countries;
 mod database;
+pub mod equipment;
 pub mod localisation;
 pub mod provinces;
 pub mod report;
+pub mod resources;
 pub mod source;
 pub mod states;
 pub mod terrain;
 pub mod types;
+pub mod units;
 
 pub use database::{Database, LoadOptions};
 pub use report::{Issue, IssueKind, Report};

@@ -2,11 +2,14 @@ use std::path::{Path, PathBuf};
 
 use common::Fixed;
 use data::countries::{self, Countries, CountryDef};
+use data::equipment::{self, Equipment};
 use data::localisation::{self, Localisation};
 use data::provinces::{self, ProvinceId, ProvinceKind};
+use data::resources::{self, Resources};
 use data::source::{Source, evaluation_order};
 use data::states::{self, StateId, States};
 use data::terrain::{self, Terrain};
+use data::units::{self, Units};
 use data::{Color, Database, IssueKind, LoadOptions, Report, Tag};
 
 fn src(path: &str, text: &str) -> Source {
@@ -276,6 +279,160 @@ fn empty_or_missing_game_does_not_panic() {
     assert!(report.issues.iter().any(|i| matches!(i.kind, IssueKind::Missing(_))));
 }
 
+#[test]
+fn resources_in_definition_order() {
+    let mut report = Report::default();
+    let mut r = Resources::default();
+    resources::parse_file(
+        &src(
+            "common/resources/00_resources.txt",
+            "resources = {\n oil = { icon_frame = 1 cic = 0.125 convoys = 0.1 }\n steel = { icon_frame = 5 }\n oil = { icon_frame = 9 }\n}\n",
+        ),
+        &mut report,
+        &mut r,
+    );
+    assert_eq!(r.list.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), vec!["oil", "steel"]);
+    let oil = r.get("oil").expect("oil");
+    assert_eq!((oil.icon_frame, oil.cic, oil.convoys), (Some(1), Some(fixed("0.125")), Some(fixed("0.1"))));
+    assert_eq!(report.count(&IssueKind::Redefinition("first")), 1);
+}
+
+const SUB_UNITS: &str = r#"
+sub_units = {
+    infantry = {
+        abbreviation = "INF"
+        sprite = infantry
+        map_icon_category = infantry
+        priority = 600
+        active = no
+        type = { infantry }
+        group = infantry
+        categories = { category_front_line category_all_infantry }
+        combat_width = 2
+        max_strength = 25
+        max_organisation = 60
+        default_morale = 0.3
+        manpower = 1000
+        weight = 0.5
+        weight = 0.7
+        need = { infantry_equipment = 100 }
+        forest = { attack = -0.2 movement = -0.4 }
+        river = { attack = 0.4 }
+        battalion_mult = { category = category_all_infantry add = yes breakthrough = 0.15 }
+        deployed_leader_modifiers = { x = 1 }
+        mystery = yes
+    }
+    fighter = { type = fighter sprite = light_plane }
+}
+"#;
+
+#[test]
+fn sub_units_keep_numbers_terrain_and_flags() {
+    let mut report = Report::default();
+    let mut u = Units::default();
+    units::parse_categories(
+        &src(
+            "common/unit_tags/00_categories.txt",
+            "sub_unit_categories = { category_front_line category_all_infantry }",
+        ),
+        &mut report,
+        &mut u,
+    );
+    units::parse_sub_units(&src("common/units/infantry.txt", SUB_UNITS), &mut report, &mut u);
+    assert_eq!(u.categories, vec!["category_front_line", "category_all_infantry"]);
+    let inf = &u.sub_units["infantry"];
+    assert_eq!(inf.types, vec!["infantry"]);
+    assert_eq!(u.sub_units["fighter"].types, vec!["fighter"], "a single type without braces");
+    assert_eq!(inf.need, vec![("infantry_equipment".to_string(), fixed("100"))]);
+    assert_eq!((inf.number("max_strength"), inf.number("default_morale")), (Some(fixed("25")), Some(fixed("0.3"))));
+    assert_eq!(inf.number("weight"), Some(fixed("0.5")), "first of two");
+    assert_eq!(inf.flags, vec![("active".to_string(), false)]);
+    assert_eq!(
+        inf.terrain["forest"],
+        vec![("attack".to_string(), fixed("-0.2")), ("movement".to_string(), fixed("-0.4"))]
+    );
+    assert!(inf.terrain.contains_key("river"));
+    assert_eq!(inf.battalion_mult.len(), 1);
+    assert!(inf.battalion_mult[0].add);
+    assert_eq!(inf.battalion_mult[0].values, vec![("breakthrough".to_string(), fixed("0.15"))]);
+    assert_eq!(report.count(&IssueKind::Duplicate), 1, "second weight");
+    assert_eq!(report.count(&IssueKind::UnknownKey), 1, "mystery");
+    assert_eq!(report.count(&IssueKind::Deferred), 1, "deployed_leader_modifiers");
+}
+
+const EQUIPMENT: &str = r#"
+equipments = {
+    infantry_equipment = {
+        year = 1918
+        is_archetype = yes
+        is_buildable = no
+        type = infantry
+        group_by = archetype
+        soft_attack = 3
+        hard_attack = 0.5
+        build_cost_ic = 0.43
+        resources = { steel = 1 }
+        can_be_produced = { always = yes }
+    }
+    infantry_equipment_1 = {
+        year = 1936
+        archetype = infantry_equipment
+        priority = 10
+        upgrades = { up_a up_b }
+        type = { infantry support }
+        soft_attack = 4
+    }
+}
+duplicate_archetypes = {
+    copy_equipment = { archetype = infantry_equipment }
+}
+search_filters = { x = 1 }
+"#;
+
+#[test]
+fn equipment_archetypes_variants_and_duplicates() {
+    let mut report = Report::default();
+    let mut e = Equipment::default();
+    equipment::parse_file(&src("common/units/equipment/infantry.txt", EQUIPMENT), &mut report, &mut e);
+    assert_eq!(e.len(), 3);
+    let arch = e.get("infantry_equipment").expect("archetype");
+    assert!(arch.is_archetype() && arch.flag("is_buildable") == Some(false));
+    assert_eq!((arch.number("soft_attack"), arch.number("build_cost_ic")), (Some(fixed("3")), Some(fixed("0.43"))));
+    assert_eq!(arch.resources, vec![("steel".to_string(), fixed("1"))]);
+    let v1 = e.get("infantry_equipment_1").expect("variant");
+    assert_eq!(v1.text("archetype"), Some("infantry_equipment"));
+    assert_eq!(v1.types, vec!["infantry".to_string(), "support".to_string()]);
+    assert_eq!(v1.upgrades.len(), 2);
+    assert!(!v1.is_archetype());
+    assert!(e.get("copy_equipment").is_some_and(|c| c.duplicate && c.is_archetype()));
+    assert_eq!(report.count(&IssueKind::Deferred), 2, "can_be_produced and search_filters");
+    assert_eq!(report.count(&IssueKind::UnknownKey), 0);
+}
+
+#[test]
+fn unit_and_equipment_references_are_checked() {
+    let game = Scratch::new("units");
+    game.write("common/terrain/00_terrain.txt", "categories = { forest = { } }");
+    game.write("common/resources/00_resources.txt", "resources = { steel = { } }");
+    game.write("common/unit_tags/00_categories.txt", "sub_unit_categories = { category_a }");
+    game.write(
+        "common/units/equipment/eq.txt",
+        "equipments = { gun = { is_archetype = yes resources = { steel = 1 gold = 2 } } gun_1 = { archetype = gun parent = nope } bad_1 = { archetype = gun_1 } }",
+    );
+    game.write(
+        "common/units/u.txt",
+        "sub_units = { inf = { categories = { category_a category_b } need = { gun = 1 laser = 2 } forest = { attack = 1 } swamp = { attack = 1 } river = { attack = 1 } battalion_mult = { category = category_z } } }",
+    );
+    let vfs = vfs::Vfs::new(vec![vfs::Layer::new("base", game.path())]);
+    let (_, report) = Database::load(&vfs, &LoadOptions::default());
+    let broken = |what: &'static str| report.count(&IssueKind::BrokenReference(what));
+    assert_eq!(broken("resource"), 1, "gold");
+    assert_eq!(broken("equipment"), 2, "parent nope, need laser");
+    assert_eq!(broken("archetype (not marked is_archetype)"), 1, "bad_1 -> gun_1");
+    assert_eq!(broken("sub-unit category"), 2, "category_b and battalion_mult category_z");
+    assert_eq!(broken("terrain"), 1, "swamp; river is a combat situation");
+}
+
 /// The real installation (skipped without `HOI4_DIR`).
 #[test]
 fn real_installation_loads_with_full_key_coverage() {
@@ -292,6 +449,9 @@ fn real_installation_loads_with_full_key_coverage() {
     let corsica = db.states.get(StateId(1)).expect("state 1");
     assert_eq!(corsica.history.owner, Some(tag("FRA")));
     assert!(db.localisation.get("GER_fascism").is_some());
+    assert!(db.units.sub_units.len() > 100 && db.equipment.len() > 300 && db.resources.len() >= 6);
+    assert!(db.units.sub_units["infantry"].need.iter().any(|(k, _)| k == "infantry_equipment"));
+    assert_eq!(db.equipment.get("infantry_equipment_1").and_then(|e| e.text("archetype")), Some("infantry_equipment"));
     // Every key in the loaded folders is understood: nothing unknown, no broken references.
     let unknown: Vec<String> =
         report.issues.iter().filter(|i| i.kind == IssueKind::UnknownKey).map(|i| i.to_string()).take(5).collect();

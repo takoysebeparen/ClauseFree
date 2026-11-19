@@ -13,8 +13,7 @@ use crate::report::{IssueKind, Report};
 use crate::source::{Ctx, Fields, Source, evaluation_order};
 use crate::types::Color;
 
-/// A list of `name = number` pairs, kept in file order.
-pub type NumberList = Vec<(String, Fixed)>;
+pub use crate::types::NumberList;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TerrainCategory {
@@ -99,15 +98,7 @@ pub fn parse_file(src: &Source, report: &mut Report, terrain: &mut Terrain) {
 }
 
 fn number_list(block: &Block<'_>, schema: &str, ctx: &mut Ctx<'_, '_>) -> NumberList {
-    let mut out = Vec::new();
-    let mut fields = Fields::new(block, schema);
-    for entry in fields.take_matching(|_| true) {
-        if let Some(v) = ctx.fixed(entry, &format!("{schema}.{}", entry.key.text)) {
-            out.push((entry.key.text.to_string(), v));
-        }
-    }
-    fields.finish(ctx);
-    out
+    ctx.numbers(block, schema)
 }
 
 fn parse_category(name: &str, block: &Block<'_>, ctx: &mut Ctx<'_, '_>) -> TerrainCategory {
