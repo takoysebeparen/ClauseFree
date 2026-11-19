@@ -71,9 +71,12 @@ pub fn tokenize(src: &str, diags: &mut Vec<Diagnostic>) -> Vec<Token> {
                 let start = i + 1;
                 let mut j = start;
                 let mut closed = false;
+                // A newline ends an unterminated string (community wiki, "Modding": "A space will not interrupt the
+                // string, but a direct newline will"), so one stray quote cannot swallow the rest of the file.
                 while j < bytes.len() {
                     match bytes[j] {
-                        b'\\' => j += 2,
+                        b'\n' => break,
+                        b'\\' if bytes.get(j + 1).is_some_and(|&c| c != b'\n') => j += 2,
                         b'"' => {
                             closed = true;
                             break;
@@ -81,7 +84,10 @@ pub fn tokenize(src: &str, diags: &mut Vec<Diagnostic>) -> Vec<Token> {
                         _ => j += 1,
                     }
                 }
-                let end = j.min(bytes.len());
+                let mut end = j.min(bytes.len());
+                if !closed && end > start && bytes[end - 1] == b'\r' {
+                    end -= 1;
+                }
                 if !closed {
                     diags.push(Diagnostic::new(DiagKind::UnterminatedString, Span::new(i, end)));
                 }

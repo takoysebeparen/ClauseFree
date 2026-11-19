@@ -140,6 +140,12 @@ fn missing_value_and_stray_operator() {
 fn unterminated_string_and_math() {
     let p = parse("a = \"never closed\nb = 1");
     assert!(p.diagnostics.iter().any(|d| d.kind == DiagKind::UnterminatedString));
+    // A newline ends the string, so the next line is still parsed.
+    assert_eq!(p.root.get("a").and_then(|e| e.value.as_str()), Some("never closed"));
+    assert_eq!(p.root.get("b").and_then(|e| e.value.as_str()), Some("1"));
+    let crlf = parse("a = \"x\r\nb = 2");
+    assert_eq!(crlf.root.get("a").and_then(|e| e.value.as_str()), Some("x"), "CR is not part of the text");
+    assert_eq!(crlf.root.get("b").and_then(|e| e.value.as_str()), Some("2"));
     let q = parse("a = @[ 1 + ");
     assert!(q.diagnostics.iter().any(|d| d.kind == DiagKind::UnterminatedMath));
 }

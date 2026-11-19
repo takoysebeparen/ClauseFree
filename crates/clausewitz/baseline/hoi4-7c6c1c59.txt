@@ -38,4 +38,3 @@ interface/ger_monroe_doctrine_scripted_gui.gui	1
 interface/powerbalanceview.gfx	1
 interface/sia_movie_theater_campaigns_scripted_gui.gui	1
 interface/sov_propaganda_campaigns_scripted_gui.gui	1
-licenses.txt	102

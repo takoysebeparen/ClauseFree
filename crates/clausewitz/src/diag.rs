@@ -4,7 +4,7 @@ use std::fmt;
 
 use crate::ast::Span;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DiagKind {
     UnterminatedString,
     UnterminatedMath,

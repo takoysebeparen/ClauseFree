@@ -1,0 +1,11 @@
+[package]
+name = "data"
+description = "Typed game definitions loaded from the virtual file system, with coverage reporting"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+clausewitz = { path = "../clausewitz" }
+common = { path = "../common" }
+vfs = { path = "../vfs" }

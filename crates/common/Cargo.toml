@@ -1,0 +1,8 @@
+[package]
+name = "common"
+description = "Small shared building blocks: fixed-point numbers"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]

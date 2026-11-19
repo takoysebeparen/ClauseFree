@@ -60,11 +60,58 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
 - Test: `crates/clausewitz/tests/parser.rs`, `cargo run --release -p clausewitz --example parse_all -- --baseline ...`
 
 ### Layering of base game, DLC and mods
-- Status: knowingly-simplified (order of DLC is a guess)
-- Source: descriptor files (`*.dlc`, `*.mod`) in the installation; `replace_path` semantics from the mod format.
-- Behaviour: a later layer overrides a same-named file of an earlier one; `replace_path` drops earlier content of a
-  directory.
-- Ours: base, then `integrated_dlc/*`, then `dlc/*`, each sorted by folder name; mods on top in the order given by
-  the caller. **The relative order of DLC layers is an assumption.** Case-insensitive paths. Whether the original merges
-  some directories by *file name* and others by *definition id* is a concern of the data layer, not the VFS.
+- Status: wiki-only
+- Source: community wiki, "Modding", section "Loading files" (https://hoi4.paradoxwikis.com/Modding).
+- Behaviour (wiki): load order is base game, then DLC "in the order of their internal ID (follows release date)", then
+  the user directory, then mods ordered by the file names of their descriptors (overridable with `dependencies`). A
+  same-named file in a later source replaces the earlier one; `replace_path` unloads everything previously loaded from
+  a folder.
+- Ours: base, then `integrated_dlc/*`, then `dlc/*`, each sorted by folder name (`dlcNNN_...`, i.e. internal id);
+  mods on top in the order given by the caller. **Not yet implemented:** the user-directory layer and ordering mods by
+  descriptor file name / `dependencies`. **Unverified:** where `integrated_dlc` sits (the wiki does not mention it).
 - Test: `crates/vfs/tests/layers.rs`
+
+### Evaluation order of files and duplicate definitions
+- Status: wiki-only
+- Source: https://hoi4.paradoxwikis.com/Modding, section "Loading files".
+- Behaviour (wiki): for most folders files are evaluated in ASCII order of their file names (upper case before lower
+  case). How duplicate definitions are resolved depends on the kind of object ("some prefer the first-created entry,
+  some prefer the last-created entry"). For states, the wiki's example shows the **first** evaluated definition kept.
+  The order of tags in `common/country_tags` matters.
+- Ours: `data::source::evaluation_order` sorts by file name bytes. States: first definition kept (wiki). Terrain
+  categories, country tags, province ids/colours: first kept, **guess**, reported as `Redefinition`.
+- Test: `crates/data/tests/loaders.rs` (`first_state_definition_wins_in_evaluation_order`)
+
+### Quoted strings end at a newline
+- Status: wiki-only
+- Source: https://hoi4.paradoxwikis.com/Modding, section "Code structure": "A space will not interrupt the string, but a direct newline will." The
+  same section says strings are limited to 255 characters (not enforced by us yet).
+- Ours: the lexer ends an unterminated string at the end of the line. On the real installation this turned all stray
+  quotes in the original files into local problems (39 malformed files remain, all unclosed braces).
+- Test: `crates/clausewitz/tests/parser.rs` (`unterminated_string_and_math`)
+
+### Number representation
+- Status: wiki-only, contradictory
+- Source: community wiki, "Data structures" (variables): a signed 32-bit whole part plus a fraction from 0 to 99 999;
+  elsewhere: modifiers support at most 3 decimals.
+- Ours: `common::Fixed`, i64 scaled by 100 000 (5 decimals); parsing drops digits beyond the fifth (toward zero) and
+  rejects whole parts beyond the 32-bit range. **To measure:** precision, rounding, overflow behaviour (oracle).
+- Test: `crates/common/src/fixed.rs`
+
+### Duplicate keys inside one block
+- Status: guess
+- Source: real data, e.g. some states define `state_category` twice and one defines `resources` twice.
+- Ours: the first is used and the rest are reported as `Duplicate`. Which one the original uses is unmeasured.
+
+### Country colours
+- Status: open question
+- Source: a colour exists both in the country file (`color`) and in `common/countries/colors.txt` (`color`,
+  `color_ui`).
+- Ours: all three are stored; which one the map uses is decided (and verified) by the renderer.
+
+### Localisation precedence
+- Status: guess
+- Source: files under `localisation/**/replace/` exist to override keys, which suggests that ordinary duplicates do
+  not override.
+- Ours: `replace` files first, then the rest in evaluation order; the first definition of a key wins.
+- Test: `crates/data/tests/loaders.rs` (`localisation_lines_and_precedence`)

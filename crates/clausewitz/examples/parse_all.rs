@@ -22,7 +22,7 @@ use std::time::Instant;
 use clausewitz::{DiagKind, LineIndex, decode, parse};
 
 /// Files with a script extension that are plain text, not script.
-const NON_SCRIPT_FILES: [&str; 1] = ["interface/credits.txt"];
+const NON_SCRIPT_FILES: [&str; 2] = ["interface/credits.txt", "licenses.txt"];
 
 /// Extensions that contain Paradox script.
 const SCRIPT_EXTENSIONS: [&str; 6] = ["txt", "gfx", "gui", "asset", "mod", "map"];
