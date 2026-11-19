@@ -44,6 +44,8 @@ fn main() {
     println!("  unit categories {}", db.units.categories.len());
     println!("  sub-units     {}", db.units.sub_units.len());
     println!("  equipment     {}", db.equipment.len());
+    let ndefines = db.defines.section("NDefines").map_or(0, |t| t.leaf_count());
+    println!("  defines       {ndefines} values in NDefines");
 
     let errors = report.errors().count();
     println!("\nIssues: {} total, {errors} errors", report.issues.len());

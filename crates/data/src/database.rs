@@ -3,6 +3,7 @@
 use vfs::Vfs;
 
 use crate::countries::{self, Countries};
+use crate::defines::{self, Defines};
 use crate::equipment::{self, Equipment};
 use crate::localisation::{self, Localisation};
 use crate::provinces::{self, Provinces};
@@ -35,6 +36,7 @@ pub struct Database {
     pub resources: Resources,
     pub units: Units,
     pub equipment: Equipment,
+    pub defines: Defines,
 }
 
 impl Database {
@@ -49,6 +51,7 @@ impl Database {
             resources: resources::load(vfs, &mut report),
             units: units::load(vfs, &mut report),
             equipment: equipment::load(vfs, &mut report),
+            defines: defines::load(vfs, &mut report),
         };
         db.check_references(&mut report);
         (db, report)

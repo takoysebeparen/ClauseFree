@@ -136,11 +136,18 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
 - Ours: `data::units::COMBAT_SITUATIONS`; any other block name must be a terrain category or it is reported.
 
 ### Balance constants live in Lua
-- Status: verified (files exist)
-- Source: `common/resources/_documentation.md` refers to the define `NAI::MIN_FACTORIES_TO_WANT_TO_IMPORT`; defines are
-  in `common/defines/*.lua`.
-- Ours: not loaded yet. Many combat, supply and production constants are there; a small Lua-table reader is needed
-  before those systems are built (no guessing their values).
+- Status: verified (files load completely)
+- Source: `common/defines/00_defines.lua`, `00_graphics.lua`, `01_career_profile.lua` (revision `7c6c1c59`).
+- Behaviour: three global tables (`NDefines`, `NDefines_Graphics`, `NDefines_CareerProfile`); the last two are copied
+  into `NDefines` by a `for k,v in pairs(...) do NDefines[k] = v end` loop at the end of their files. Five constants
+  are written as products (`7 * 24`). Mods override single values with `NDefines.<section>.<key> = <value>`.
+- Ours: `data::lua` reads this subset (tables, numbers, strings, booleans, `nil`, `+ - * /` with parentheses, the merge
+  loop); anything else is reported as unsupported, never guessed. Files run in evaluation order, so later
+  assignments win. The whole installation loads with no problems.
+- **To measure:** Lua computes in floating point and the engine then stores the result; we compute in `Fixed`
+  directly. For the products in the base game this is exact; a division that does not terminate (`1 / 3`) may differ
+  in the last digit.
+- Test: `crates/data/tests/defines.rs`
 
 ### Localisation precedence
 - Status: guess

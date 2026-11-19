@@ -26,6 +26,8 @@ pub enum IssueKind {
     BrokenReference(&'static str),
     /// A second definition of an object that already exists; the payload says which one was kept.
     Redefinition(&'static str),
+    /// Valid syntax of the file's language that the engine does not support (yet); skipped, never guessed.
+    Unsupported(&'static str),
 }
 
 impl IssueKind {
@@ -40,6 +42,7 @@ impl IssueKind {
             IssueKind::Missing(what) => format!("missing {what}"),
             IssueKind::BrokenReference(what) => format!("unknown {what}"),
             IssueKind::Redefinition(kept) => format!("redefinition ({kept} kept)"),
+            IssueKind::Unsupported(what) => format!("unsupported {what}"),
         }
     }
 

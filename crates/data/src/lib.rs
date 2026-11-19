@@ -12,8 +12,10 @@
 
 pub mod countries;
 mod database;
+pub mod defines;
 pub mod equipment;
 pub mod localisation;
+pub mod lua;
 pub mod provinces;
 pub mod report;
 pub mod resources;
