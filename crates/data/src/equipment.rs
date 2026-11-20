@@ -188,6 +188,67 @@ impl Equipment {
     pub fn is_empty(&self) -> bool {
         self.by_name.is_empty()
     }
+
+    /// The equipment with everything it inherits through its `archetype` chain filled in.
+    ///
+    /// Rules (community wiki "Equipment modding": "Archetype equipment is used to assign more general attributes
+    /// that regular equipment then inherits via the archetype attribute"; `parent` is only "the previous version"
+    /// and is not inherited from):
+    /// - a value written on the equipment wins over the inherited one;
+    /// - `is_archetype` and `is_buildable` describe the entry itself and are never inherited (the base game's
+    ///   archetypes are all `is_buildable = no`, while their variants are buildable) — an assumption;
+    /// - a duplicate archetype does not take `alias`, `type`, `variant_name` and `derived_variant_name` from the
+    ///   archetype it copies (header of `x_plane_airframes.txt`);
+    /// - list-valued attributes (`type`, `upgrades`, `resources`, ...) are replaced as a whole, not merged — an
+    ///   assumption.
+    ///
+    /// `None` if the name is unknown or the chain is broken or circular.
+    pub fn effective(&self, name: &str) -> Option<EquipmentDef> {
+        self.resolve(name, 0)
+    }
+
+    fn resolve(&self, name: &str, depth: usize) -> Option<EquipmentDef> {
+        // The base game's chains are at most three long; anything deeper is a loop.
+        if depth > 16 {
+            return None;
+        }
+        let own = self.get(name)?;
+        let Some(base_name) = own.text("archetype") else { return Some(own.clone()) };
+        let mut base = self.resolve(base_name, depth + 1)?;
+        base.flags.retain(|(k, _)| k != "is_archetype" && k != "is_buildable");
+        if own.duplicate {
+            base.texts.retain(|(k, _)| k != "alias" && k != "derived_variant_name");
+            base.types.clear();
+        }
+        let mut out = own.clone();
+        merge_pairs(&mut out.numbers, &base.numbers);
+        merge_pairs(&mut out.flags, &base.flags);
+        merge_pairs(&mut out.texts, &base.texts);
+        for (mine, inherited) in [
+            (&mut out.types, &base.types),
+            (&mut out.upgrades, &base.upgrades),
+            (&mut out.can_convert_from, &base.can_convert_from),
+            (&mut out.allowed_types, &base.allowed_types),
+            (&mut out.allow_mission_type, &base.allow_mission_type),
+        ] {
+            if mine.is_empty() {
+                mine.clone_from(inherited);
+            }
+        }
+        if out.resources.is_empty() {
+            out.resources.clone_from(&base.resources);
+        }
+        Some(out)
+    }
+}
+
+/// Adds the inherited `(key, value)` pairs whose key the equipment does not set itself.
+fn merge_pairs<V: Clone>(own: &mut Vec<(String, V)>, inherited: &[(String, V)]) {
+    for (k, v) in inherited {
+        if !own.iter().any(|(ok, _)| ok == k) {
+            own.push((k.clone(), v.clone()));
+        }
+    }
 }
 
 const DIR: &str = "common/units/equipment";

@@ -16,6 +16,7 @@ pub mod defines;
 pub mod equipment;
 pub mod localisation;
 pub mod lua;
+pub mod oob;
 pub mod provinces;
 pub mod report;
 pub mod resources;

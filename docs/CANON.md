@@ -149,6 +149,27 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
   in the last digit.
 - Test: `crates/data/tests/defines.rs`
 
+### Equipment inheritance
+- Status: wiki-only, partly guessed
+- Source: community wiki, "Equipment modding": "Archetype equipment is used to assign more general attributes that
+  regular equipment then inherits via the archetype attribute"; `parent` is "the previous version of equipment".
+- Ours: `Equipment::effective` follows the `archetype` chain; own values win; `parent` is not followed for stats.
+  **Guesses:** `is_archetype` and `is_buildable` are never inherited (base-game archetypes are all unbuildable while
+  their variants are buildable); list attributes (`type`, `upgrades`, `resources`) are replaced as a whole, not
+  merged. All 342 equipment entries of the real installation resolve.
+- Test: `crates/data/tests/oob.rs` (`equipment_inherits_from_its_archetype`)
+
+### Orders of battle (history/units)
+- Status: verified (files load completely)
+- Source: 609 files in `history/units` (revision `7c6c1c59`).
+- Ours: `data::oob` reads division templates (regiments, support, regimental support grid) and divisions (name or
+  ordered name, location, template, start experience and equipment factors, forced variants). Fleets, air wings,
+  officers and `instant_effect` (starting production, a script) are deferred. 804 templates and 5074 divisions load.
+- Open: 22 files set `start_equipment_factor` at the top level; how it combines with a division's own factor is
+  unknown. 32 divisions use templates that no OOB defines (`SWI_1939_BBA`, `AST_TFV_*`): those templates are created
+  by script (decisions, focuses) before the OOB is loaded, so the reference is resolved by the script VM.
+- Test: `crates/data/tests/oob.rs`
+
 ### Localisation precedence
 - Status: guess
 - Source: files under `localisation/**/replace/` exist to override keys, which suggests that ordinary duplicates do

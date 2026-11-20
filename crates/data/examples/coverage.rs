@@ -44,6 +44,9 @@ fn main() {
     println!("  unit categories {}", db.units.categories.len());
     println!("  sub-units     {}", db.units.sub_units.len());
     println!("  equipment     {}", db.equipment.len());
+    let divisions: usize = db.oobs.by_name.values().map(|o| o.divisions.len()).sum();
+    let templates: usize = db.oobs.by_name.values().map(|o| o.templates.len()).sum();
+    println!("  OOB files     {} ({templates} templates, {divisions} divisions)", db.oobs.len());
     let ndefines = db.defines.section("NDefines").map_or(0, |t| t.leaf_count());
     println!("  defines       {ndefines} values in NDefines");
 

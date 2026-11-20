@@ -6,6 +6,7 @@ use crate::countries::{self, Countries};
 use crate::defines::{self, Defines};
 use crate::equipment::{self, Equipment};
 use crate::localisation::{self, Localisation};
+use crate::oob::{self, Oobs};
 use crate::provinces::{self, Provinces};
 use crate::report::{IssueKind, Report};
 use crate::resources::{self, Resources};
@@ -37,6 +38,7 @@ pub struct Database {
     pub units: Units,
     pub equipment: Equipment,
     pub defines: Defines,
+    pub oobs: Oobs,
 }
 
 impl Database {
@@ -52,6 +54,7 @@ impl Database {
             units: units::load(vfs, &mut report),
             equipment: equipment::load(vfs, &mut report),
             defines: defines::load(vfs, &mut report),
+            oobs: oob::load(vfs, &mut report),
         };
         db.check_references(&mut report);
         (db, report)
@@ -61,6 +64,7 @@ impl Database {
     /// equipment and sub-unit references resolve.
     pub fn check_references(&self, report: &mut Report) {
         self.check_unit_references(report);
+        self.check_oob_references(report);
         for p in self.provinces.by_id.values() {
             if self.terrain.get(&p.terrain).is_none() {
                 report.push("map/definition.csv", 0, "map.definition.terrain", IssueKind::BrokenReference("terrain"));
@@ -139,6 +143,55 @@ impl Database {
             for m in &u.battalion_mult {
                 if !self.units.categories.contains(&m.category) {
                     broken(report, &u.file, "sub_unit.battalion_mult.category", "sub-unit category");
+                }
+            }
+        }
+    }
+
+    fn check_oob_references(&self, report: &mut Report) {
+        for oob in self.oobs.by_name.values() {
+            for t in &oob.templates {
+                for slot in t.regiments.iter().chain(&t.support).chain(&t.regimental_support) {
+                    if !self.units.sub_units.contains_key(&slot.sub_unit) {
+                        report.push(
+                            &oob.file,
+                            0,
+                            "oob.division_template.<sub_unit>",
+                            IssueKind::BrokenReference("sub-unit"),
+                        );
+                    }
+                }
+            }
+            // Templates are looked up among this file and the other OOB files of the same country (same tag prefix),
+            // because some files only add divisions to templates defined in the country's main OOB.
+            let tag = oob.name.split('_').next().unwrap_or("");
+            let known = |name: &str| {
+                self.oobs
+                    .by_name
+                    .values()
+                    .filter(|o| o.name == oob.name || o.name.split('_').next() == Some(tag))
+                    .any(|o| o.templates.iter().any(|t| t.name == name))
+            };
+            for d in &oob.divisions {
+                if !d.template.is_empty() && !known(&d.template) {
+                    // Not defined by any OOB of the country: some templates are created by script effects
+                    // (decisions, focuses) before such an OOB is loaded, so this is resolved by the script VM.
+                    report.push(&oob.file, 0, "oob.division.division_template (not in any OOB)", IssueKind::Deferred);
+                }
+                if let Some(p) = d.location
+                    && self.provinces.get(p).is_none()
+                {
+                    report.push(&oob.file, 0, "oob.division.location", IssueKind::BrokenReference("province"));
+                }
+                for v in &d.force_equipment_variants {
+                    if self.equipment.get(&v.equipment).is_none() {
+                        report.push(
+                            &oob.file,
+                            0,
+                            "oob.division.force_equipment_variants",
+                            IssueKind::BrokenReference("equipment"),
+                        );
+                    }
                 }
             }
         }
