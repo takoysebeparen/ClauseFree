@@ -1,7 +1,7 @@
 //! Loads the database from an installation and prints what was loaded and what was not understood.
 //!
 //! ```text
-//! cargo run --release -p data --example coverage -- [--language russian] [--all] [<game directory>]
+//! cargo run --release -p data --example coverage -- [--language russian] [--all] [--errors <path prefix>] [<game directory>]
 //! ```
 //!
 //! Without a directory the `HOI4_DIR` environment variable is used.
@@ -13,17 +13,19 @@ use data::{Database, LoadOptions};
 fn main() {
     let mut language = "english".to_string();
     let mut show_all = false;
+    let mut errors_under = None;
     let mut dir = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--language" => language = args.next().unwrap_or(language),
             "--all" => show_all = true,
+            "--errors" => errors_under = args.next(),
             _ => dir = Some(arg),
         }
     }
     let Some(dir) = dir.or_else(|| std::env::var("HOI4_DIR").ok()) else {
-        eprintln!("usage: coverage [--language L] [--all] <game directory>   (or set HOI4_DIR)");
+        eprintln!("usage: coverage [--language L] [--all] [--errors P] <game directory>   (or set HOI4_DIR)");
         std::process::exit(2);
     };
 
@@ -52,6 +54,10 @@ fn main() {
         db.technologies.categories.len(),
         db.technologies.folders.len()
     );
+    println!("  equipment groups {}", db.equipment_groups.len());
+    println!("  ideas         {} ({} categories)", db.ideas.len(), db.ideas.categories.len());
+    println!("  characters    {}", db.characters.len());
+    println!("  country history {}", db.country_history.len());
     let divisions: usize = db.oobs.by_name.values().map(|o| o.divisions.len()).sum();
     let templates: usize = db.oobs.by_name.values().map(|o| o.templates.len()).sum();
     println!("  OOB files     {} ({templates} templates, {divisions} divisions)", db.oobs.len());
@@ -66,5 +72,13 @@ fn main() {
     }
     if !show_all {
         println!("  (use --all for every group)");
+    }
+    // `--errors <prefix>`: every error (not deferred, not unknown) whose schema path starts with the prefix; an empty
+    // prefix also matches issues without a path, such as parse errors.
+    if let Some(prefix) = errors_under {
+        println!("\nErrors under `{prefix}`:");
+        for issue in report.errors().filter(|i| i.path.starts_with(&prefix)) {
+            println!("  {issue}");
+        }
     }
 }

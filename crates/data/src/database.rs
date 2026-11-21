@@ -1,12 +1,18 @@
 //! Loading everything and checking references between definitions.
 
+use std::collections::BTreeSet;
+
 use vfs::Vfs;
 
 use crate::buildings::{self, Buildings};
+use crate::characters::{self, Characters};
 use crate::countries::{self, Countries};
+use crate::country_history::{self, CountryHistories};
 use crate::defines::{self, Defines};
 use crate::equipment::{self, Equipment};
 use crate::equipment::{LimitMatch, ModuleSlots, SlotSpec};
+use crate::equipment_groups::{self, EquipmentGroups};
+use crate::ideas::{self, Ideas};
 use crate::localisation::{self, Localisation};
 use crate::modules::{self, ConvertFrom, Modules};
 use crate::oob::{self, Oobs};
@@ -46,6 +52,10 @@ pub struct Database {
     pub oobs: Oobs,
     pub buildings: Buildings,
     pub technologies: Technologies,
+    pub equipment_groups: EquipmentGroups,
+    pub ideas: Ideas,
+    pub characters: Characters,
+    pub country_history: CountryHistories,
 }
 
 impl Database {
@@ -65,6 +75,10 @@ impl Database {
             oobs: oob::load(vfs, &mut report),
             buildings: buildings::load(vfs, &mut report),
             technologies: technologies::load(vfs, &mut report),
+            equipment_groups: equipment_groups::load(vfs, &mut report),
+            ideas: ideas::load(vfs, &mut report),
+            characters: characters::load(vfs, &mut report),
+            country_history: country_history::load(vfs, &mut report),
         };
         db.check_references(&mut report);
         (db, report)
@@ -78,6 +92,9 @@ impl Database {
         self.check_building_references(report);
         self.check_module_references(report);
         self.check_technology_references(report);
+        self.check_idea_references(report);
+        self.check_character_references(report);
+        self.check_country_history_references(report);
         for p in self.provinces.by_id.values() {
             if self.terrain.get(&p.terrain).is_none() {
                 report.push("map/definition.csv", 0, "map.definition.terrain", IssueKind::BrokenReference("terrain"));
@@ -432,6 +449,135 @@ impl Database {
                     if !is_unit_category(&m.category) {
                         broken(report, f, "technology.<unit>.battalion_mult.category", "sub-unit category");
                     }
+                }
+            }
+        }
+    }
+}
+
+impl Database {
+    /// Names an `equipment_bonus` or an equipment group may use: an equipment (or duplicate-archetype copy), an
+    /// equipment `type`, an equipment `alias` (`alias = destroyer` in `ship_hull_light.txt`) or an equipment group.
+    fn equipment_targets(&self) -> BTreeSet<&str> {
+        let mut out: BTreeSet<&str> = BTreeSet::new();
+        for e in self.equipment.by_name.values() {
+            out.insert(e.name.as_str());
+            out.extend(e.types.iter().map(String::as_str));
+            out.extend(e.text("alias"));
+        }
+        out.extend(self.equipment_groups.list.iter().map(|g| g.name.as_str()));
+        out
+    }
+
+    /// Idea groups are idea categories or slots; research bonuses name technology categories; equipment bonuses and
+    /// equipment groups name equipment (see [`Database::equipment_targets`]).
+    fn check_idea_references(&self, report: &mut Report) {
+        let ideas = &self.ideas;
+        let is_group =
+            |g: &str| ideas.category(g).is_some() || ideas.category_of_slot(g).is_some() || ideas.has_character_slot(g);
+        let targets = self.equipment_targets();
+        let is_equipment_target = |t: &str| targets.contains(t) || self.equipment.exists(t);
+        for g in &self.equipment_groups.list {
+            for m in &g.members {
+                if !is_equipment_target(m) {
+                    report.push(
+                        &g.file,
+                        0,
+                        "equipment_group.equipment_type",
+                        IssueKind::BrokenReference("equipment, equipment type or group"),
+                    );
+                }
+            }
+        }
+        for d in &ideas.list {
+            let f = d.file.as_str();
+            if !is_group(&d.group) {
+                report.push(f, 0, "ideas.<group>", IssueKind::BrokenReference("idea category or slot"));
+            }
+            for (c, _) in &d.research_bonus {
+                if !self.technologies.has_category(c) {
+                    report.push(f, 0, "idea.research_bonus", IssueKind::BrokenReference("technology category"));
+                }
+            }
+            for b in &d.equipment_bonus {
+                if !is_equipment_target(&b.target) {
+                    report.push(
+                        f,
+                        0,
+                        "idea.equipment_bonus.<equipment>",
+                        IssueKind::BrokenReference("equipment, equipment type or group"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Advisor slots are character slots of an idea category; research bonuses name technology categories.
+    fn check_character_references(&self, report: &mut Report) {
+        for c in &self.characters.list {
+            for a in c.bodies().flat_map(|b| &b.advisors) {
+                if let Some(slot) = &a.slot
+                    && !self.ideas.has_character_slot(slot)
+                {
+                    report.push(&c.file, 0, "character.advisor.slot", IssueKind::BrokenReference("character slot"));
+                }
+                for (cat, _) in &a.research_bonus {
+                    if !self.technologies.has_category(cat) {
+                        report.push(
+                            &c.file,
+                            0,
+                            "character.advisor.research_bonus",
+                            IssueKind::BrokenReference("technology category"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The tag, capital, OOB, technologies, ideas and characters named by a country history exist. `add_ideas` may
+    /// also name the `idea_token` of an advisor role (`add_ideas = SOV_genrikh_yagoda` in the Soviet history).
+    fn check_country_history_references(&self, report: &mut Report) {
+        let advisor_ideas: BTreeSet<&str> = self
+            .characters
+            .list
+            .iter()
+            .flat_map(|c| c.bodies())
+            .flat_map(|b| &b.advisors)
+            .filter_map(|a| a.idea_token.as_deref())
+            .collect();
+        for h in self.country_history.by_tag.values() {
+            let broken = |report: &mut Report, path: &str, what: &'static str| {
+                report.push(&h.file, 0, path, IssueKind::BrokenReference(what));
+            };
+            if let Some(tag) = h.tag
+                && self.countries.get(tag).is_none()
+            {
+                broken(report, "country_history", "country tag");
+            }
+            if let Some(id) = h.capital
+                && self.states.get(id).is_none()
+            {
+                broken(report, "country_history.capital", "state");
+            }
+            if let Some(oob) = &h.oob
+                && !self.oobs.by_name.contains_key(oob)
+            {
+                broken(report, "country_history.oob", "OOB file");
+            }
+            for (t, _) in &h.technologies {
+                if self.technologies.get(t).is_none() {
+                    broken(report, "country_history.set_technology.<technology>", "technology");
+                }
+            }
+            for i in &h.ideas {
+                if self.ideas.get(i).is_none() && !advisor_ideas.contains(i.as_str()) {
+                    broken(report, "country_history.add_ideas", "idea");
+                }
+            }
+            for c in &h.characters {
+                if self.characters.get(c).is_none() {
+                    broken(report, "country_history.recruit_character", "character");
                 }
             }
         }

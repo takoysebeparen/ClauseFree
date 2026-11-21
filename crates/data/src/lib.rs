@@ -11,10 +11,14 @@
 //! ```
 
 pub mod buildings;
+pub mod characters;
 pub mod countries;
+pub mod country_history;
 mod database;
 pub mod defines;
 pub mod equipment;
+pub mod equipment_groups;
+pub mod ideas;
 pub mod localisation;
 pub mod lua;
 pub mod modules;

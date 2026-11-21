@@ -456,9 +456,10 @@ fn real_installation_loads_with_full_key_coverage() {
     let unknown: Vec<String> =
         report.issues.iter().filter(|i| i.kind == IssueKind::UnknownKey).map(|i| i.to_string()).take(5).collect();
     assert!(unknown.is_empty(), "{unknown:?}");
-    // Both broken references are defects of the original: `ship_hull_escort_carrier` gives a default module
-    // (`empty`) for `mid_2_custom_slot`, a slot it does not have, and `advanced_modern_tank_turret_tech` enables the
-    // module `advanced_modern_tank_turret`, which no file defines.
+    // Every broken reference is a defect of the original: `ship_hull_escort_carrier` gives a default module
+    // (`empty`) for `mid_2_custom_slot`, a slot it does not have; `advanced_modern_tank_turret_tech` enables the
+    // module `advanced_modern_tank_turret`, which no file defines; ten country histories name OOB files that do not
+    // exist (`ARM - Armenia.txt` names `AZR_1936`, which does not exist either).
     let broken: Vec<String> = report
         .issues
         .iter()
@@ -470,6 +471,16 @@ fn real_installation_loads_with_full_key_coverage() {
         [
             "common/units/equipment/ship_hull_carrier.txt equipment.default_modules.<slot>",
             "common/technologies/special_projects_tech.txt technology.enable_equipment_modules",
+            "history/countries/ARM - Armenia.txt country_history.oob",
+            "history/countries/AZR - Azerbaijan.txt country_history.oob",
+            "history/countries/BLR - Belarus.txt country_history.oob",
+            "history/countries/CAM - Cambodia.txt country_history.oob",
+            "history/countries/GEO - Georgia.txt country_history.oob",
+            "history/countries/KAZ - Kazakhstan.txt country_history.oob",
+            "history/countries/LAO - Laos.txt country_history.oob",
+            "history/countries/MNT - Montenegro.txt country_history.oob",
+            "history/countries/UKR - Ukraine.txt country_history.oob",
+            "history/countries/VIN - Vietnam.txt country_history.oob",
         ]
     );
 }

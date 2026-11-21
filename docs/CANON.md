@@ -257,6 +257,84 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
   `advanced_modern_tank_turret_tech` enables the module `advanced_modern_tank_turret`, which no file defines.
 - Test: `crates/data/tests/technologies.rs`
 
+### Ideas
+- Status: verified (files load completely); effects of ideas unmeasured
+- Source: `common/ideas/*.txt` and `common/idea_tags/00_idea.txt` (revision `8873ec77`, a key inventory of the files),
+  including the comments in `00_idea.txt`: the ledger "can be define for idea > idea slot > idea category", "first one
+  overrides the others"; `slot_ledgers` entries marked `invalid # must be overridden`.
+- Ours: `data::ideas` reads `idea_categories` (slots, character slots with repeats, type, hidden, `politics_tab`,
+  ledger, costs) and `slot_ledgers`, then every idea under its group key (an idea category or a slot) with the
+  group's `law`, `designer` and `use_list_view` switches. An idea keeps, as written: name key, picture, ledger, costs,
+  `level`, `default`, `cancel_if_invalid`, traits, `modifier` (country modifiers, `custom_modifier_tooltip`,
+  `hidden_modifier`), `targeted_modifier` (target and modifiers), `research_bonus`, `equipment_bonus` (stats and
+  `instant`) and `rule`. Triggers, effects and AI weights (`allowed`, `allowed_civil_war`, `allowed_to_remove`,
+  `available`, `visible`, `cancel`, `do_effect`, `on_add`, `on_remove`, `ai_will_do`) are deferred; which of them an
+  idea has is recorded. 6692 ideas and 14 categories load with no unknown keys. Every group is a category, slot or
+  character slot; every research bonus names a technology category; every equipment bonus names an equipment, an
+  equipment type, an equipment `alias` (`destroyer`) or an equipment group (see "Equipment groups").
+- **Guesses:** the group switches hold for the whole group wherever they are written (ethiopia.txt writes
+  `designer = yes` after the ideas, twice); repeated `equipment_bonus` / `research_bonus` blocks in one idea all apply
+  (16 ideas write one block per equipment); `instant = yes` holds for its whole equipment block (it is often repeated
+  after each stat). A `targeted_modifier` target may be a tag or a scope (`ROOT`, `event_target:...`,
+  `JAP.<variable>`), resolved by the script VM.
+- Original defects found: two `targeted_modifier` blocks without `tag` (denmark.txt, italy.txt; reported, dropped);
+  ten ideas with `picture` twice, two with `removal_cost` twice, one with `modifier` twice (first kept, see "Duplicate
+  keys inside one block"); unclosed braces in `SOV.txt`, `persia.txt` and `switzerland.txt` (see "Script syntax").
+- **To measure:** what `level`, `cost` / `removal_cost = -1` and `instant` do; whether a `law` group allows exactly
+  one idea; how a repeated group switch or bonus block behaves in game.
+- Test: `crates/data/tests/ideas_characters_history.rs`
+
+### Equipment groups
+- Status: verified (documented, files load completely)
+- Source: `common/equipment_groups/_documentation.md` (shipped): a group lists types, archetypes, categories or other
+  groups under `equipment_type`, has an optional `description`, and can be an `equipment_bonus` target.
+- Ours: `data::equipment_groups` stores the members as written; 24 groups load, every member resolves.
+- Test: `crates/data/tests/ideas_characters_history.rs` (`equipment_groups_list_members`)
+
+### Characters
+- Status: verified (files load completely); role mechanics unmeasured
+- Source: `common/characters/_documentation.md` (shipped: the `characters` root, `can_be_captured` with default yes,
+  the scientist role with skills defaulting to level 1) and a key inventory of `common/characters/*.txt` (revision
+  `8873ec77`) for the other roles.
+- Ours: `data::characters` keeps name, gender, `can_be_captured`, portraits (`army` / `civilian` / `navy`, `large` /
+  `small`), and the roles as written: country leader (one per ideology; ideology, `expire`, `id`, traits), advisor
+  (slot, `idea_token`, name, ledger, costs, `can_be_fired`, traits, modifier, `research_bonus`), corps commander, field
+  marshal and navy leader (skills, `legacy_id`, traits), scientist (desc, traits, skills). `instance = { ... }` blocks
+  are kept as alternative versions of the character; their `allowed` trigger, which picks one, is deferred, as are the
+  triggers and effects of roles (`visible`, `allowed`, `available`, `do_effect`, `on_add`, `on_remove`, `ai_will_do`)
+  and `allowed_civil_war`. 5470 characters load with no unknown keys; every advisor slot is a character slot of an
+  idea category, every advisor research bonus names a technology category.
+- **Guess:** portraits written in two blocks (PER.txt) are both used. **To check:** which instance the original picks
+  when several match, and what an absent `allowed` means for an instance.
+- Original defects found: `name` twice in six characters / instances, `cost` twice in five advisors, `ledger` twice in
+  four (first kept).
+- Traits (`common/country_leader`, `common/unit_leaders`, `common/scientist_traits`) and ideologies are not loaded
+  yet, so trait and ideology names are not checked.
+- Test: `crates/data/tests/ideas_characters_history.rs`
+
+### Country history
+- Status: files load completely; the file name rule is a guess
+- Source: `history/countries/*.txt` (revision `8873ec77`, 364 files) and `documentation/effects_documentation.md`
+  (`set_politics`, `set_popularities`: "If an ideology is not specified its popularity will be set to zero",
+  `set_oob`: "replacing any previously registered OOB", `set_research_slots`, `recruit_character`,
+  `set_grand_doctrine`, `set_sub_doctrine`, `set_fuel_ratio`, `add_ideas`, `load_oob`).
+- Behaviour: a history file is an effect block run for its country at game start; dated blocks run at their date.
+- Ours: `data::country_history` reads the plain top-level effects as start data: capital, OOB (`oob` / `set_oob`),
+  research slots, convoys, stability, war support, fuel ratio, `starting_train_buffer`, `set_technology`,
+  `set_politics`, `set_popularities`, `add_ideas`, `recruit_character`, grand doctrines and sub-doctrines. Everything
+  else (`if`, variables, scope blocks, other effects, dated blocks) is deferred; only the dates are kept. A plain value
+  written twice is taken from the last one, because effects run in order (`set_convoys`, `set_stability` repeat in six
+  files). `set_popularities` with variable values (PER) is deferred, leaving the plain value empty. 364 histories load
+  with no unknown keys; every tag, capital, technology, idea (or advisor `idea_token`: `add_ideas =
+  SOV_genrikh_yagoda`) and character they name exists.
+- **Guesses:** the tag is the first three characters of the file name (all base game files start with the tag; two
+  use an irregular separator, `HBC  - Hebei-Chahar.txt`, `KLT -Kalat.txt`); a second file for the same tag is
+  ignored (none in the base game); `OOB` in upper case (AFA, ALB) means `oob`. Note that an `if` elsewhere in the file
+  may still change a plain value when the script VM runs (GER picks its OOB inside `if` blocks).
+- Original defects found: ten histories name OOB files that no file defines (ARM names `AZR_1936`; AZR, BLR, CAM,
+  GEO, KAZ, LAO, MNT, UKR, VIN name `<TAG>_1936`).
+- Test: `crates/data/tests/ideas_characters_history.rs`
+
 ### Script constants (`@name`)
 - Status: guess
 - Source: `01_landmark_buildings.txt` defines `@landmark_repair_speed_factor = 0.15` at the top and uses it in the
