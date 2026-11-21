@@ -527,4 +527,5 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
 - Ours: PCG32 (XSH RR) by M. E. O'Neill, checked against the reference implementation's output; the generator is
   part of the world state. The state hash is FNV-1a 64 over explicitly ordered little-endian bytes. Results are
   meant to be statistically like the original, never draw-for-draw identical.
-- Test: `crates/sim/src/rng.rs`, `crates/sim/src/hash.rs`, golden hash in `crates/sim/tests/determinism.rs`
+- Test: `crates/sim/src/rng.rs`, `crates/sim/src/hash.rs`, golden hashes in `crates/sim/tests/determinism.rs`; CI
+  (`.github/workflows/ci.yml`) reproduces them on Linux, Windows and macOS (ARM), first on commit `42359e1`.
