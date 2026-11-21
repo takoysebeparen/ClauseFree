@@ -184,6 +184,60 @@ fn replay_from_log() {
     assert_eq!(replay.log(), original.log());
 }
 
+/// Every day, each state independently may pass to a random country: computed as a parallel stage, merged in
+/// state order.
+struct ParallelShuffle;
+
+impl System for ParallelShuffle {
+    fn name(&self) -> &str {
+        "parallel_shuffle"
+    }
+    fn pulse(&self) -> Pulse {
+        Pulse::Daily
+    }
+    fn run(&self, world: &mut World) {
+        let ids: Vec<StateId> = world.states.keys().copied().collect();
+        let countries = world.countries.clone();
+        let changes = sim::parallel::map_with_rng(&ids, &mut world.rng, |id, rng| {
+            let pick = rng.below(countries.len() as u32 * 10) as usize;
+            countries.get(pick).map(|tag| (*id, *tag))
+        });
+        for (id, tag) in changes.into_iter().flatten() {
+            if let Some(control) = world.states.get_mut(&id) {
+                control.controller = Some(tag);
+            }
+        }
+    }
+}
+
+fn parallel_run(threads: usize) -> u64 {
+    let mut world = synthetic_world(5);
+    for id in 51..=2000u32 {
+        world.states.insert(StateId(id), StateControl { owner: None, controller: None });
+    }
+    let mut sim = simulation(world);
+    sim.add_system(Box::new(ParallelShuffle));
+    sim::parallel::with_threads(threads, || {
+        sim.run_days(200);
+        sim.hash()
+    })
+    .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// The hash of [`parallel_run`]; pinned for the same reason as [`GOLDEN_400_DAYS`].
+const GOLDEN_PARALLEL_200_DAYS: u64 = 0xaa93_98fc_4510_954f;
+
+/// The result does not depend on the number of threads.
+#[test]
+fn parallel_stage_is_thread_count_independent() {
+    let one = parallel_run(1);
+    println!("parallel 200-day hash: {one:#018x}");
+    assert_eq!(one, GOLDEN_PARALLEL_200_DAYS, "hash differs from the recorded golden value");
+    for threads in [2, 8] {
+        assert_eq!(parallel_run(threads), one, "{threads} threads");
+    }
+}
+
 /// The real game's start: needs `HOI4_DIR`, skipped otherwise.
 #[test]
 fn real_game_runs_reproducibly() {

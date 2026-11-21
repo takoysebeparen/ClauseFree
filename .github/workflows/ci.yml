@@ -1,0 +1,47 @@
+# Builds and tests the engine crates on Linux, Windows and macOS.
+#
+# The determinism tests in crates/sim pin golden state hashes; passing on all three systems (and on the ARM CPU of the
+# macOS runner) is what proves the simulation is bit-reproducible across machines (milestone M3). Tests that need the
+# game files skip themselves because HOI4_DIR is not set here.
+#
+# `legacy/` (the frozen Bevy prototype) is not built: it needs system graphics/audio libraries and is not maintained.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CRATES: -p clausewitz -p common -p data -p sim -p vfs
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test (debug)
+        shell: bash
+        run: cargo test $CRATES
+      - name: Test (release)
+        shell: bash
+        run: cargo test --release $CRATES
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt $CRATES --check
+      - name: Clippy
+        run: cargo clippy $CRATES --all-targets -- -D warnings

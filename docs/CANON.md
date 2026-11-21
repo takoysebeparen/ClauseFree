@@ -503,11 +503,12 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
 
 ### Clock pulses
 - Status: guess
-- Source: none yet. The original has daily, weekly and monthly script hooks (on_actions), but when its daily and
-  monthly work runs relative to the hour is unmeasured.
+- Source: none yet for timing. `common/on_actions/_documentation.md` lists `on_daily`, `on_weekly`, `on_monthly` (and
+  `_TAG` variants), so the original has these pulses; when they run relative to the hour, and from which day weeks
+  are counted, is not documented and unmeasured.
 - Ours: each hour, commands due at that hour execute first, then hourly systems, then daily (at hour 0), monthly
-  (hour 0 of day 1) and yearly (hour 0 of 1 January) systems. No weekly pulse yet (how the original counts weeks is
-  unknown). A game starting at 12:00 therefore has its first daily pulse 12 hours in.
+  (hour 0 of day 1) and yearly (hour 0 of 1 January) systems. No weekly pulse yet: it is added with the script layer
+  (M5), after measuring which day of the week `on_weekly` fires on. A game starting at 12:00 therefore has its first daily pulse 12 hours in.
 - Test: `crates/sim/src/time.rs` (`pulses`)
 
 ### Start of a game

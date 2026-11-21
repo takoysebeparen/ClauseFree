@@ -62,8 +62,9 @@ checking. Unknown or unsupported keys are *reported*, never silently dropped, so
   influence results.
 - **Time:** discrete hourly ticks; daily/monthly work is triggered by the clock, not by wall time.
 - **Parallelism:** data-parallel stages with deterministic partitioning and ordered merges (rayon). A stage may run on
-  many threads only if its result is independent of scheduling. This is where the performance win over the
-  single-threaded original comes from.
+  many threads only if its result is independent of scheduling (`sim::parallel`: per-item results in item order,
+  per-item generators on separate streams; tested to give the same hash for 1, 2 and 8 threads). This is where the
+  performance win over the single-threaded original comes from.
 - **State hash:** a hash of the world is computed periodically and compared in multiplayer and tests to detect desyncs.
 
 ## 7. Commands, saves, multiplayer

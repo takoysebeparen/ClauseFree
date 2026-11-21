@@ -24,6 +24,7 @@
 
 pub mod command;
 pub mod hash;
+pub mod parallel;
 pub mod rng;
 pub mod time;
 pub mod world;

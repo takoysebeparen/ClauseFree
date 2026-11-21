@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 common = { path = "../common" }
 data = { path = "../data" }
+rayon = "1"
 
 [dev-dependencies]
 vfs = { path = "../vfs" }
