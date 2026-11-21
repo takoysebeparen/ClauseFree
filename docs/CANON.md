@@ -308,8 +308,9 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
   when several match, and what an absent `allowed` means for an instance.
 - Original defects found: `name` twice in six characters / instances, `cost` twice in five advisors, `ledger` twice in
   four (first kept).
-- Traits (`common/country_leader`, `common/unit_leaders`, `common/scientist_traits`) and ideologies are not loaded
-  yet, so trait and ideology names are not checked.
+- Commander traits are checked against `common/unit_leader` and country leader ideologies against the ideology
+  sub-types (see "Unit leader traits and skills", "Ideologies"). Country leader and scientist traits
+  (`common/country_leader`, `common/scientist_traits`) are not loaded yet, so their names are not checked.
 - Test: `crates/data/tests/ideas_characters_history.rs`
 
 ### Country history
@@ -334,6 +335,101 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
 - Original defects found: ten histories name OOB files that no file defines (ARM names `AZR_1936`; AZR, BLR, CAM,
   GEO, KAZ, LAO, MNT, UKR, VIN name `<TAG>_1936`).
 - Test: `crates/data/tests/ideas_characters_history.rs`
+
+### Continents
+- Status: verified from the files; how the original treats a bad index is unmeasured
+- Source: `map/default.map` (`continent = "continent.txt"`), `map/continent.txt` (`continents = { europe ... }`,
+  7 names), last column of `map/definition.csv` (values 0..7; 0 is used by all 3132 sea provinces, 77 lakes and one
+  land province).
+- Ours: `data::continents` keeps the names in order; index `i` of `definition.csv` is the `i`-th name (1-based), `0`
+  is none. A repeated name keeps its position (reported). Every index in the base game resolves.
+- Test: `crates/data/tests/map_and_military.rs` (`continents_are_indexed_from_one`)
+
+### Adjacencies
+- Status: file shape verified; crossing and rule mechanics unmeasured
+- Source: `map/adjacencies.csv` (its header names the columns `From;To;Type;Through;start_x;start_y;stop_x;stop_y;
+  adjacency_rule_name;Comment`; 251 lines, ended by a `-1;-1;;...` line), `map/adjacency_rules.txt` (its top comment
+  describes the contested / enemy / friend / neutral selection and the optional `is_enemy` / `is_friend` /
+  `is_neutral` triggers), paths from `map/default.map`.
+- Ours: `data::adjacencies` reads `Type` as `sea` (151), `impassable` (93) or empty (7: the straits, which only attach
+  a rule), `Through` and coordinates with `-1` as none, the rule name and the comment (which may contain `;`). Rules
+  keep the four passage tables (army, navy, submarine, trade), `required_provinces`, `icon` and `offset`; the
+  triggers (`is_disabled`, `is_friend`, ...) are deferred. Every province, through-province and rule named exists;
+  every sea crossing has a through-province. 251 adjacencies and 9 rules load with no unknown keys.
+- **Guesses:** the first line is a header when its first column is not a number; reading stops at the `-1` line
+  (lines after it are reported; none exist); lines starting with `#` are comments; a missing passage table means
+  nothing may pass (none is missing in the base game). **To check:** what an empty `Type` means for movement.
+- Test: `crates/data/tests/map_and_military.rs` (`adjacencies_and_rules`)
+
+### Strategic regions
+- Status: file shape verified; weather mechanics unmeasured
+- Source: `map/strategicregions/*.txt` (304 files, one region each): `id`, `name`, `provinces`, `naval_terrain`
+  (63 sea regions), `static_modifiers` (10 regions, `water_modifier_shark_infested = always`, a modifier defined in
+  `common/modifiers/00_static_modifiers.txt`), `weather = { period = { ... } }` (12 periods each).
+- `between = { a.b c.d }` is read as a *zero-based day.month*. Evidence from the files: every region has the same
+  twelve ranges, `0.0 30.0`, `0.1 27.1`, `0.2 30.2`, `0.3 29.3`, ..., `0.10 29.10`, `0.11 30.11`, that is, the
+  length of each month minus one (February ends on 27, April on 29). The text is split at the dot, not read as a
+  number (`0.10` is November, `0.1` is February).
+- Ours: `data::strategic_regions` stores the periods with the temperature range and the phenomenon weights as written
+  (`no_phenomenon`, `rain_light`, `rain_heavy`, `snow`, `blizzard`, `arctic_water`, `mud`, `sandstorm`,
+  `min_snow_level`). Every province except 0 is in exactly one region, every region province exists, every
+  `naval_terrain` is a terrain category. How the weights become weather is not modelled yet.
+- `map/supplyareas/` holds one file (`supply_area` id 1), apparently left from the supply system that supply nodes
+  replaced; it is not loaded. **To check:** whether the original reads it at all.
+- Test: `crates/data/tests/map_and_military.rs` (`strategic_regions_and_weather`)
+
+### Railways and supply nodes
+- Status: file shape verified; supply mechanics unmeasured
+- Source: `map/railways.txt` (924 lines `level count province...`, levels 1 to 4, one more line commented out with
+  `#`) and `map/supply_nodes.txt` (727 lines `level province`, all level 1). Neither is named in `default.map`.
+- Ours: `data::supply` keeps railways as ordered province lists with their level, and nodes with level and province.
+  A line whose count does not match the provinces given, or with fewer than two provinces, is reported. Every railway
+  and node province is a land province. Whether consecutive railway provinces are neighbours is not checked (that
+  needs the province bitmap).
+- **Guess:** `#` starts a comment, as in script files.
+- Test: `crates/data/tests/map_and_military.rs` (`railways_and_supply_nodes`)
+
+### Ideologies
+- Status: files load completely; effects unmeasured
+- Source: `common/ideologies/00_ideologies.txt` (4 ideologies; its comments explain `can_be_randomly_selected`,
+  `ai_<x> = yes`, `ai_ideology_wanted_units_factor`, `ai_give_core_state_control_threshold`).
+- Ours: `data::ideologies` keeps sub-types, `dynamic_faction_names`, colour, `rules` (yes/no), `modifiers` and
+  `faction_modifiers` (read like idea modifiers), the four numbers and the yes/no switches
+  (`can_host_government_in_exile`, `can_collaborate`, `ai_*`). Every country leader ideology in `common/characters`
+  is a sub-type; every ruling party and popularity in `history/countries` is an ideology.
+- Test: `crates/data/tests/map_and_military.rs` (`ideologies_with_types_and_rules`)
+
+### Combat tactics
+- Status: file loads completely; tactic selection unmeasured (needed by milestone M4)
+- Source: `common/combat_tactics.txt` (55 tactics, 5 phases). Its comments: tactics must start with `tactic_` to
+  work with technologies; `phase = no` (in triggers) is the standard phase; `phase = X` in a tactic "changes phase
+  to" X.
+- Ours: `data::combat_tactics` keeps `phases`, and per tactic `is_attacker`, `active`, `base = { factor }`,
+  `picture`, `countered_by`, `phase`, `display_phase`, `only_show_for` and the numbers `attacker`, `defender`,
+  `combat_width`, `attacker_movement_speed`, `attacker_org_damage_modifier`, `defender_org_damage_modifier`, as
+  written. `trigger` and the `modifier` blocks inside `base` are deferred. Every counter tactic exists, every phase is
+  declared, every `only_show_for` is a country.
+- **Guesses:** `phase = no` as a tactic's own key (`tactic_cc_withdraw`, `tactic_tw_intercept`) returns the battle to
+  the standard phase; every top-level block except `phases` is a tactic, whatever its name.
+- Test: `crates/data/tests/map_and_military.rs` (`combat_tactics_and_phases`)
+
+### Unit leader traits and skills
+- Status: files load completely; trait and skill effects unmeasured
+- Source: the schema comment at the top of `common/unit_leader/00_traits.txt` (shipped: the trait keys, parents and
+  their shorthands `any_parent` / `all_parents`, `num_parents_needed` "defaulted to 1", `gui_row` / `gui_column`),
+  and a key inventory of `common/unit_leader/*.txt` (revision `8873ec77`) for keys the comment does not list
+  (`unit_type`, `allowed_ship_equipments`, `leader_default_proximity_offset`, `unit_trigger`, `country_trigger`,
+  `slot` and the three advisor traits).
+- Ours: `data::unit_leader` reads `leader_traits` (196 traits) and the seven skill tables `leader_skills`,
+  `leader_attack_skills`, ... (169 levels, `<level> = { cost type modifier building_module_modifier }`). Trait
+  modifier blocks may hold terrain blocks (`desert = { movement = 0.1 }`), stored per terrain. Triggers, effects and
+  weights are deferred. Every trait named by a parent, an exclusion, `trait_xp_factor` or a commander role exists;
+  every sub-unit and ship equipment named exists; every advisor slot is a character slot; every terrain is a terrain
+  category or a terrain-like situation (`river`, `fort`).
+- Original defects found: `ARG_juan_tonazzi` lists `trait_cautious,` (the comma becomes part of the token, so the name
+  does not resolve); `PHI_okawachi_denshichi` gives a navy leader `navy_fleet_logistics_2`, an advisor trait that is
+  not a unit leader trait. **To check:** whether the original ignores both.
+- Test: `crates/data/tests/map_and_military.rs` (`leader_traits_and_skills`)
 
 ### Script constants (`@name`)
 - Status: guess

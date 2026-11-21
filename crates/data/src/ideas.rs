@@ -42,6 +42,9 @@ pub struct Modifiers {
     pub custom_tooltips: Vec<String>,
     /// `hidden_modifier = { ... }`: modifiers that apply but are not shown.
     pub hidden: NumberList,
+    /// `<terrain> = { movement = 0.1 }`: modifiers that apply in one terrain. Only read where a loader allows them
+    /// (leader traits, see [`parse_modifiers_with_terrain`]); the terrain names are checked by the database.
+    pub terrain: Vec<(String, NumberList)>,
 }
 
 impl Modifiers {
@@ -50,12 +53,22 @@ impl Modifiers {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty() && self.custom_tooltips.is_empty() && self.hidden.is_empty()
+        self.values.is_empty() && self.custom_tooltips.is_empty() && self.hidden.is_empty() && self.terrain.is_empty()
     }
 }
 
 /// Reads a modifier block. `path` is the schema path of the block.
 pub fn parse_modifiers(block: &Block<'_>, path: &str, ctx: &mut Ctx<'_, '_>) -> Modifiers {
+    read_modifiers(block, path, false, ctx)
+}
+
+/// Reads a modifier block that may also hold `<terrain> = { ... }` blocks (any other block-valued key is taken as a
+/// terrain and checked against the terrain categories by the database).
+pub fn parse_modifiers_with_terrain(block: &Block<'_>, path: &str, ctx: &mut Ctx<'_, '_>) -> Modifiers {
+    read_modifiers(block, path, true, ctx)
+}
+
+fn read_modifiers(block: &Block<'_>, path: &str, terrain: bool, ctx: &mut Ctx<'_, '_>) -> Modifiers {
     let mut f = Fields::new(block, path);
     let mut m = Modifiers::default();
     for e in f.take_all("custom_modifier_tooltip") {
@@ -70,6 +83,14 @@ pub fn parse_modifiers(block: &Block<'_>, path: &str, ctx: &mut Ctx<'_, '_>) -> 
     for e in f.take_entries(|e| e.value.as_scalar().is_some()) {
         if let Some(v) = ctx.fixed(e, &format!("{path}.<modifier>")) {
             m.values.push((e.key.text.to_string(), v));
+        }
+    }
+    if terrain {
+        for e in f.take_entries(|e| e.value.as_block().is_some()) {
+            let p = format!("{path}.<terrain>");
+            if let Some(b) = ctx.block(e, &p) {
+                m.terrain.push((e.key.text.to_string(), ctx.numbers(b, &p)));
+            }
         }
     }
     f.finish(ctx);

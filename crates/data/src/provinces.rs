@@ -68,6 +68,21 @@ pub fn definitions_path(vfs: &Vfs, report: &mut Report) -> String {
     format!("map/{name}")
 }
 
+/// VFS path of a map file named by `map/default.map` (`key = "file"`), or `map/<default>` if it does not say.
+///
+/// Problems reading `default.map` are not reported here: [`definitions_path`] already reports them once per load.
+pub fn map_file(vfs: &Vfs, key: &str, default: &str) -> String {
+    let name = vfs
+        .read_text(DEFAULT_MAP)
+        .ok()
+        .and_then(|text| {
+            let parsed = clausewitz::parse(&text);
+            parsed.root.get(key).and_then(|e| e.value.as_scalar()).map(|s| s.unescaped().into_owned())
+        })
+        .unwrap_or_else(|| default.to_string());
+    format!("map/{name}")
+}
+
 pub fn load(vfs: &Vfs, report: &mut Report) -> Provinces {
     let path = definitions_path(vfs, report);
     match Source::read(vfs, &path, report) {

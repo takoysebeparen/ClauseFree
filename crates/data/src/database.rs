@@ -4,8 +4,11 @@ use std::collections::BTreeSet;
 
 use vfs::Vfs;
 
+use crate::adjacencies::{self, Adjacencies, AdjacencyKind};
 use crate::buildings::{self, Buildings};
 use crate::characters::{self, Characters};
+use crate::combat_tactics::{self, CombatTactics};
+use crate::continents::{self, Continents};
 use crate::countries::{self, Countries};
 use crate::country_history::{self, CountryHistories};
 use crate::defines::{self, Defines};
@@ -13,15 +16,19 @@ use crate::equipment::{self, Equipment};
 use crate::equipment::{LimitMatch, ModuleSlots, SlotSpec};
 use crate::equipment_groups::{self, EquipmentGroups};
 use crate::ideas::{self, Ideas};
+use crate::ideologies::{self, Ideologies};
 use crate::localisation::{self, Localisation};
 use crate::modules::{self, ConvertFrom, Modules};
 use crate::oob::{self, Oobs};
-use crate::provinces::{self, Provinces};
+use crate::provinces::{self, ProvinceKind, Provinces};
 use crate::report::{IssueKind, Report};
 use crate::resources::{self, Resources};
 use crate::states::{self, States};
+use crate::strategic_regions::{self, StrategicRegions};
+use crate::supply::{self, Supply};
 use crate::technologies::{self, Technologies};
 use crate::terrain::{self, Terrain};
+use crate::unit_leader::{self, UnitLeaders};
 use crate::units::{self, COMBAT_SITUATIONS, Units};
 
 #[derive(Debug, Clone)]
@@ -56,6 +63,13 @@ pub struct Database {
     pub ideas: Ideas,
     pub characters: Characters,
     pub country_history: CountryHistories,
+    pub continents: Continents,
+    pub adjacencies: Adjacencies,
+    pub strategic_regions: StrategicRegions,
+    pub supply: Supply,
+    pub ideologies: Ideologies,
+    pub combat_tactics: CombatTactics,
+    pub unit_leaders: UnitLeaders,
 }
 
 impl Database {
@@ -79,6 +93,13 @@ impl Database {
             ideas: ideas::load(vfs, &mut report),
             characters: characters::load(vfs, &mut report),
             country_history: country_history::load(vfs, &mut report),
+            continents: continents::load(vfs, &mut report),
+            adjacencies: adjacencies::load(vfs, &mut report),
+            strategic_regions: strategic_regions::load(vfs, &mut report),
+            supply: supply::load(vfs, &mut report),
+            ideologies: ideologies::load(vfs, &mut report),
+            combat_tactics: combat_tactics::load(vfs, &mut report),
+            unit_leaders: unit_leader::load(vfs, &mut report),
         };
         db.check_references(&mut report);
         (db, report)
@@ -95,6 +116,10 @@ impl Database {
         self.check_idea_references(report);
         self.check_character_references(report);
         self.check_country_history_references(report);
+        self.check_map_references(report);
+        self.check_tactic_references(report);
+        self.check_unit_leader_references(report);
+        self.check_ideology_references(report);
         for p in self.provinces.by_id.values() {
             if self.terrain.get(&p.terrain).is_none() {
                 report.push("map/definition.csv", 0, "map.definition.terrain", IssueKind::BrokenReference("terrain"));
@@ -578,6 +603,211 @@ impl Database {
             for c in &h.characters {
                 if self.characters.get(c).is_none() {
                     broken(report, "country_history.recruit_character", "character");
+                }
+            }
+        }
+    }
+
+    /// Map topology: continent indices, adjacency provinces and rules, strategic region provinces and naval terrain,
+    /// railway and supply node provinces. Every province except `0` belongs to exactly one strategic region.
+    fn check_map_references(&self, report: &mut Report) {
+        for p in self.provinces.by_id.values() {
+            if p.continent != 0 && self.continents.by_index(p.continent).is_none() {
+                report.push(
+                    "map/definition.csv",
+                    0,
+                    "map.definition.continent",
+                    IssueKind::BrokenReference("continent"),
+                );
+            }
+        }
+        let exists = |id| self.provinces.get(id).is_some();
+        for a in &self.adjacencies.list {
+            let broken = |report: &mut Report, path: &str, what: &'static str| {
+                report.push("map/adjacencies.csv", a.line, path, IssueKind::BrokenReference(what));
+            };
+            if !exists(a.from) || !exists(a.to) {
+                broken(report, "map.adjacencies.from_to", "province");
+            }
+            match a.through {
+                Some(t) if !exists(t) => broken(report, "map.adjacencies.through", "province"),
+                None if a.kind == AdjacencyKind::Sea => report.push(
+                    "map/adjacencies.csv",
+                    a.line,
+                    "map.adjacencies.through",
+                    IssueKind::Missing("sea province"),
+                ),
+                _ => {}
+            }
+            if let Some(rule) = &a.rule
+                && self.adjacencies.rule(rule).is_none()
+            {
+                broken(report, "map.adjacencies.adjacency_rule_name", "adjacency rule");
+            }
+        }
+        for r in &self.adjacencies.rules {
+            if r.required_provinces.iter().chain(r.icon.iter()).any(|p| !exists(*p)) {
+                report.push(&r.file, 0, "adjacency_rule.<province>", IssueKind::BrokenReference("province"));
+            }
+        }
+        let mut region_of = std::collections::BTreeMap::new();
+        for r in self.strategic_regions.by_id.values() {
+            for p in &r.provinces {
+                if !exists(*p) {
+                    report.push(&r.file, 0, "strategic_region.provinces", IssueKind::BrokenReference("province"));
+                }
+                if region_of.insert(*p, r.id).is_some() {
+                    report.push(
+                        &r.file,
+                        0,
+                        "strategic_region.provinces",
+                        IssueKind::Redefinition("province in two regions"),
+                    );
+                }
+            }
+            if let Some(t) = &r.naval_terrain
+                && self.terrain.get(t).is_none()
+            {
+                report.push(&r.file, 0, "strategic_region.naval_terrain", IssueKind::BrokenReference("terrain"));
+            }
+        }
+        if !self.strategic_regions.is_empty() {
+            for id in self.provinces.by_id.keys().filter(|id| id.0 != 0) {
+                if !region_of.contains_key(id) {
+                    report.push("map/definition.csv", 0, "map.definition", IssueKind::Missing("strategic region"));
+                }
+            }
+        }
+        let is_land = |id| self.provinces.get(id).is_some_and(|p| p.kind == ProvinceKind::Land);
+        for r in &self.supply.railways {
+            if r.provinces.iter().any(|p| !is_land(*p)) {
+                report.push(supply::RAILWAYS, r.line, "map.railways", IssueKind::BrokenReference("land province"));
+            }
+        }
+        for n in &self.supply.nodes {
+            if !is_land(n.province) {
+                report.push(
+                    supply::SUPPLY_NODES,
+                    n.line,
+                    "map.supply_nodes",
+                    IssueKind::BrokenReference("land province"),
+                );
+            }
+        }
+    }
+
+    /// Counter tactics exist, phases are declared in `phases` (`no` is the standard phase), and `only_show_for` names
+    /// a country.
+    fn check_tactic_references(&self, report: &mut Report) {
+        let t = &self.combat_tactics;
+        let file = combat_tactics::FILE;
+        for tactic in &t.list {
+            if let Some(c) = &tactic.countered_by
+                && t.get(c).is_none()
+            {
+                report.push(file, 0, "combat_tactic.countered_by", IssueKind::BrokenReference("combat tactic"));
+            }
+            for (path, phase) in
+                [("combat_tactic.phase", &tactic.phase), ("combat_tactic.display_phase", &tactic.display_phase)]
+            {
+                if let Some(p) = phase
+                    && p != "no"
+                    && !t.phases.contains(p)
+                {
+                    report.push(file, 0, path, IssueKind::BrokenReference("combat phase"));
+                }
+            }
+            if let Some(tag) = tactic.only_show_for
+                && self.countries.get(tag).is_none()
+            {
+                report.push(file, 0, "combat_tactic.only_show_for", IssueKind::BrokenReference("country tag"));
+            }
+        }
+    }
+
+    /// Traits named by traits (parents, exclusions, experience factors) and by commander roles exist; trait sub-unit
+    /// modifiers and unit types name sub-units; ship equipment exists; advisor slots are character slots.
+    fn check_unit_leader_references(&self, report: &mut Report) {
+        let leaders = &self.unit_leaders;
+        let has_trait = |name: &str| leaders.get_trait(name).is_some();
+        for t in &leaders.traits {
+            let broken = |report: &mut Report, path: &str, what: &'static str| {
+                report.push(&t.file, 0, path, IssueKind::BrokenReference(what));
+            };
+            for name in t.parents.iter().flat_map(|p| &p.traits) {
+                if !has_trait(name) {
+                    broken(report, "leader_trait.parent", "leader trait");
+                }
+            }
+            for name in &t.mutually_exclusive {
+                if !has_trait(name) {
+                    broken(report, "leader_trait.mutually_exclusive", "leader trait");
+                }
+            }
+            for (name, _) in &t.trait_xp_factor {
+                if !has_trait(name) {
+                    broken(report, "leader_trait.trait_xp_factor", "leader trait");
+                }
+            }
+            for name in t.sub_unit_modifiers.iter().map(|(k, _)| k).chain(&t.unit_types) {
+                if !self.units.sub_units.contains_key(name) {
+                    broken(report, "leader_trait.<sub_unit>", "sub-unit");
+                }
+            }
+            for name in &t.allowed_ship_equipments {
+                if self.equipment.get(name).is_none() {
+                    broken(report, "leader_trait.allowed_ship_equipments", "equipment");
+                }
+            }
+            for (terrain, _) in t.modifier_blocks.iter().flat_map(|(_, m)| &m.terrain) {
+                if self.terrain.get(terrain).is_none() && !COMBAT_SITUATIONS.contains(&terrain.as_str()) {
+                    broken(report, "leader_trait.<modifier>.<terrain>", "terrain");
+                }
+            }
+            if let Some(slot) = &t.advisor_slot
+                && !self.ideas.has_character_slot(slot)
+            {
+                broken(report, "leader_trait.slot", "character slot");
+            }
+        }
+        for c in &self.characters.list {
+            for name in c.bodies().flat_map(|b| &b.commanders).flat_map(|r| &r.traits) {
+                if !has_trait(name) {
+                    report.push(&c.file, 0, "character.<commander>.traits", IssueKind::BrokenReference("leader trait"));
+                }
+            }
+        }
+    }
+
+    /// Country leaders name a sub-ideology; country histories name ideologies for the ruling party and popularities.
+    fn check_ideology_references(&self, report: &mut Report) {
+        let ideologies = &self.ideologies;
+        for c in &self.characters.list {
+            for i in c.bodies().flat_map(|b| &b.country_leader).filter_map(|r| r.ideology.as_deref()) {
+                if ideologies.of_type(i).is_none() {
+                    report.push(
+                        &c.file,
+                        0,
+                        "character.country_leader.ideology",
+                        IssueKind::BrokenReference("ideology type"),
+                    );
+                }
+            }
+        }
+        for h in self.country_history.by_tag.values() {
+            if let Some(p) = h.politics.as_ref().and_then(|p| p.ruling_party.as_deref())
+                && ideologies.get(p).is_none()
+            {
+                report.push(
+                    &h.file,
+                    0,
+                    "country_history.set_politics.ruling_party",
+                    IssueKind::BrokenReference("ideology"),
+                );
+            }
+            for (i, _) in &h.popularities {
+                if ideologies.get(i).is_none() {
+                    report.push(&h.file, 0, "country_history.set_popularities", IssueKind::BrokenReference("ideology"));
                 }
             }
         }

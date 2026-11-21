@@ -58,6 +58,13 @@ fn main() {
     println!("  ideas         {} ({} categories)", db.ideas.len(), db.ideas.categories.len());
     println!("  characters    {}", db.characters.len());
     println!("  country history {}", db.country_history.len());
+    println!("  continents    {}", db.continents.len());
+    println!("  adjacencies   {} ({} rules)", db.adjacencies.len(), db.adjacencies.rules.len());
+    println!("  strategic regions {}", db.strategic_regions.len());
+    println!("  railways      {} ({} supply nodes)", db.supply.railways.len(), db.supply.nodes.len());
+    println!("  ideologies    {}", db.ideologies.len());
+    println!("  combat tactics {} ({} phases)", db.combat_tactics.len(), db.combat_tactics.phases.len());
+    println!("  leader traits {} ({} skill levels)", db.unit_leaders.traits.len(), db.unit_leaders.skills.len());
     let divisions: usize = db.oobs.by_name.values().map(|o| o.divisions.len()).sum();
     let templates: usize = db.oobs.by_name.values().map(|o| o.templates.len()).sum();
     println!("  OOB files     {} ({templates} templates, {divisions} divisions)", db.oobs.len());
