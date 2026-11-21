@@ -190,6 +190,58 @@ impl Ctx<'_, '_> {
     }
 }
 
+/// Named constants of one file: `@name = value` at the top level, used as `key = @name` further down.
+///
+/// Treated as local to the file that defines them, an assumption (see `docs/CANON.md`, "Script constants").
+/// Inline math (`@[ ... ]`) is reported as unsupported.
+#[derive(Debug, Clone, Default)]
+pub struct Constants {
+    values: std::collections::BTreeMap<String, String>,
+}
+
+impl Constants {
+    /// Takes every `@name = value` entry of a block (normally the file's root).
+    pub fn take(fields: &mut Fields<'_, '_>, ctx: &mut Ctx<'_, '_>) -> Constants {
+        let mut out = Constants::default();
+        for entry in fields.take_matching(|k| k.starts_with('@')) {
+            let Some(value) = ctx.scalar(entry, "@<constant>") else { continue };
+            if out.values.contains_key(entry.key.text) {
+                ctx.issue(entry.span, "@<constant>", IssueKind::Redefinition("first"));
+            } else {
+                out.values.insert(entry.key.text.to_string(), value.text.to_string());
+            }
+        }
+        out
+    }
+
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(String::as_str)
+    }
+
+    /// A number written directly or through a constant of this file.
+    pub fn fixed(&self, ctx: &mut Ctx<'_, '_>, entry: &Entry<'_>, path: &str) -> Option<Fixed> {
+        let s = ctx.scalar(entry, path)?;
+        if s.quoted || !s.text.starts_with('@') {
+            return ctx.fixed(entry, path);
+        }
+        if s.text.starts_with("@[") {
+            ctx.issue(s.span, path, IssueKind::Unsupported("inline math"));
+            return None;
+        }
+        let Some(text) = self.get(s.text) else {
+            ctx.issue(s.span, path, IssueKind::BrokenReference("constant"));
+            return None;
+        };
+        match Fixed::parse(text) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                ctx.issue(s.span, path, IssueKind::InvalidValue("a number"));
+                None
+            }
+        }
+    }
+}
+
 /// Tracks which items of a block a loader has consumed, so that everything else can be reported.
 pub struct Fields<'b, 'a> {
     block: &'b Block<'a>,

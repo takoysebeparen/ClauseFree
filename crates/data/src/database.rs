@@ -2,6 +2,7 @@
 
 use vfs::Vfs;
 
+use crate::buildings::{self, Buildings};
 use crate::countries::{self, Countries};
 use crate::defines::{self, Defines};
 use crate::equipment::{self, Equipment};
@@ -39,6 +40,7 @@ pub struct Database {
     pub equipment: Equipment,
     pub defines: Defines,
     pub oobs: Oobs,
+    pub buildings: Buildings,
 }
 
 impl Database {
@@ -55,6 +57,7 @@ impl Database {
             equipment: equipment::load(vfs, &mut report),
             defines: defines::load(vfs, &mut report),
             oobs: oob::load(vfs, &mut report),
+            buildings: buildings::load(vfs, &mut report),
         };
         db.check_references(&mut report);
         (db, report)
@@ -65,6 +68,7 @@ impl Database {
     pub fn check_references(&self, report: &mut Report) {
         self.check_unit_references(report);
         self.check_oob_references(report);
+        self.check_building_references(report);
         for p in self.provinces.by_id.values() {
             if self.terrain.get(&p.terrain).is_none() {
                 report.push("map/definition.csv", 0, "map.definition.terrain", IssueKind::BrokenReference("terrain"));
@@ -143,6 +147,69 @@ impl Database {
             for m in &u.battalion_mult {
                 if !self.units.categories.contains(&m.category) {
                     broken(report, &u.file, "sub_unit.battalion_mult.category", "sub-unit category");
+                }
+            }
+        }
+    }
+
+    /// Buildings named by other buildings, by terrain and by state history exist; a state history puts a building at
+    /// the state or province level that matches its kind (`province_max` set means provincial).
+    fn check_building_references(&self, report: &mut Report) {
+        let broken = |report: &mut Report, file: &str, path: &str, what: &'static str| {
+            report.push(file, 0, path, IssueKind::BrokenReference(what));
+        };
+        for b in &self.buildings.list {
+            for d in &b.prerequisites {
+                if self.buildings.get(&d.building).is_none() {
+                    broken(report, &b.file, "building.building_prerequisite.building_dependency.building", "building");
+                }
+            }
+            for other in &b.level_cap.exclusive_with {
+                if self.buildings.get(other).is_none() {
+                    broken(report, &b.file, "building.level_cap.exclusive_with", "building");
+                }
+            }
+            if let Some(sp) = b.text("spawn_point")
+                && !self.buildings.spawn_points.contains_key(sp)
+            {
+                broken(report, &b.file, "building.spawn_point", "spawn point");
+            }
+            for (r, _) in &b.local_resources {
+                if self.resources.get(r).is_none() {
+                    broken(report, &b.file, "building.local_resources_<resource>", "resource");
+                }
+            }
+        }
+        for c in &self.terrain.categories {
+            for (name, _) in &c.buildings_max_level {
+                if self.buildings.get(name).is_none() {
+                    broken(report, "common/terrain", "terrain.buildings_max_level", "building");
+                }
+            }
+        }
+        for s in self.states.by_id.values() {
+            let start = &s.history.buildings;
+            for sb in &start.state {
+                match self.buildings.get(&sb.building) {
+                    None => broken(report, &s.file, "state.history.buildings.<building>", "building"),
+                    Some(b) if b.is_provincial() => {
+                        broken(report, &s.file, "state.history.buildings.<building>", "state building")
+                    }
+                    Some(_) => {}
+                }
+            }
+            for list in start.provinces.values() {
+                for pb in list {
+                    match self.buildings.get(&pb.building) {
+                        None => broken(report, &s.file, "state.history.buildings.<province>.<building>", "building"),
+                        Some(b) if !b.is_provincial() => broken(
+                            report,
+                            &s.file,
+                            "state.history.buildings.<province>.<building>",
+                            "provincial building",
+                        ),
+                        Some(_) => {}
+                    }
                 }
             }
         }

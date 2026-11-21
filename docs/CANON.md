@@ -170,6 +170,31 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
   by script (decisions, focuses) before the OOB is loaded, so the reference is resolved by the script VM.
 - Test: `crates/data/tests/oob.rs`
 
+### Buildings
+- Status: verified (files load completely); semantics of most keys unmeasured
+- Source: `common/buildings/00_buildings.txt` and `01_landmark_buildings.txt` (revision `7c6c1c59`), including the
+  comment at the top of the files: "if province_max is set, then building is provincial"; `country_modifiers` accept
+  country modifiers and apply only to the controllers listed in `enable_for_controllers` "or if the list is empty";
+  `local_resources_` may be followed by any resource name.
+- Ours: `data::buildings` stores every value as written (costs, level caps, flags, modifiers, prerequisites, spawn
+  points); what the values do is left to the economy, map and combat systems. `dlc_allowed` (a trigger) and
+  `missing_tech_loc` (bindable localisation) are deferred. 56 buildings and 7 spawn points load with no unknown keys.
+  Every building named by state history, terrain, prerequisites, `exclusive_with` and `spawn_point` exists, and every
+  state history puts provincial buildings on provinces and the others on the state.
+- Original defects found: `damage_factor` written twice (`0`, then `-1`) in the dams and canals, `only_costal` twice
+  in `dockyard` (first kept, see "Duplicate keys inside one block"). Which `damage_factor` the original uses matters for
+  strategic bombing and must be measured.
+- Test: `crates/data/tests/buildings.rs`
+
+### Script constants (`@name`)
+- Status: guess
+- Source: `01_landmark_buildings.txt` defines `@landmark_repair_speed_factor = 0.15` at the top and uses it in the
+  same file. The wiki could not be consulted (its pages served a bot challenge).
+- Ours: `data::source::Constants` treats constants as local to the file that defines them, first definition kept;
+  an unknown constant is reported, inline math `@[ ... ]` is reported as unsupported. **To check:** scope (file vs.
+  folder vs. global) and redefinition behaviour.
+- Test: `crates/data/tests/buildings.rs` (`constants_are_local_to_their_file`)
+
 ### Localisation precedence
 - Status: guess
 - Source: files under `localisation/**/replace/` exist to override keys, which suggests that ordinary duplicates do

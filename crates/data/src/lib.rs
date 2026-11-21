@@ -10,6 +10,7 @@
 //! println!("{} states, {} issues", db.states.len(), report.issues.len());
 //! ```
 
+pub mod buildings;
 pub mod countries;
 mod database;
 pub mod defines;
