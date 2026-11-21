@@ -461,7 +461,8 @@ fn real_installation_loads_with_full_key_coverage() {
     // module `advanced_modern_tank_turret`, which no file defines; ten country histories name OOB files that do not
     // exist (`ARM - Armenia.txt` names `AZR_1936`, which does not exist either); `ARG_juan_tonazzi` lists
     // `trait_cautious,` (a stray comma glued to the name) and `PHI_okawachi_denshichi` gives a navy leader the advisor
-    // trait `navy_fleet_logistics_2`, which is not a unit leader trait.
+    // trait `navy_fleet_logistics_2`, which is not a unit leader trait; a `PER` country leader has `ayatollah_trait`,
+    // which no file defines.
     let broken: Vec<String> = report
         .issues
         .iter()
@@ -485,6 +486,7 @@ fn real_installation_loads_with_full_key_coverage() {
             "history/countries/VIN - Vietnam.txt country_history.oob",
             "common/characters/ARG.txt character.<commander>.traits",
             "common/characters/PHI.txt character.<commander>.traits",
+            "common/characters/PER.txt character.country_leader.traits",
         ]
     );
 }

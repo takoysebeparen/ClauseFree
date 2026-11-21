@@ -383,7 +383,7 @@ fn parse_idea(entry: &Entry<'_>, block: &Block<'_>, ctx: &mut Ctx<'_, '_>) -> Id
         d.modifiers = parse_modifiers(b, "idea.modifier", ctx);
     }
     for e in f.take_all("targeted_modifier") {
-        d.targeted_modifiers.extend(parse_targeted(e, ctx));
+        d.targeted_modifiers.extend(parse_targeted(e, "idea.targeted_modifier", ctx));
     }
     // Repeated bonus blocks occur (16 ideas write one `equipment_bonus` per equipment); all are kept, in order.
     for e in f.take_all("research_bonus") {
@@ -393,7 +393,7 @@ fn parse_idea(entry: &Entry<'_>, block: &Block<'_>, ctx: &mut Ctx<'_, '_>) -> Id
     }
     for e in f.take_all("equipment_bonus") {
         if let Some(b) = ctx.block(e, "idea.equipment_bonus") {
-            d.equipment_bonus.extend(parse_equipment_bonus(b, ctx));
+            d.equipment_bonus.extend(parse_equipment_bonus(b, "idea.equipment_bonus", ctx));
         }
     }
     if let Some(e) = f.take("rule")
@@ -414,18 +414,18 @@ fn parse_idea(entry: &Entry<'_>, block: &Block<'_>, ctx: &mut Ctx<'_, '_>) -> Id
     d
 }
 
-fn parse_targeted(entry: &Entry<'_>, ctx: &mut Ctx<'_, '_>) -> Option<TargetedModifier> {
-    const P: &str = "idea.targeted_modifier";
-    let b = ctx.block(entry, P)?;
-    let mut f = Fields::new(b, P);
-    let target = f.take("tag").and_then(|e| ctx.text(e, "idea.targeted_modifier.tag"));
+/// Reads `targeted_modifier = { tag = X <modifier> = N }`. `path` is the schema path of the block.
+pub(crate) fn parse_targeted(entry: &Entry<'_>, path: &str, ctx: &mut Ctx<'_, '_>) -> Option<TargetedModifier> {
+    let b = ctx.block(entry, path)?;
+    let mut f = Fields::new(b, path);
+    let target = f.take("tag").and_then(|e| ctx.text(e, &format!("{path}.tag")));
     // The rest has the shape of a modifier block; read it with the `tag` entry already consumed.
     let mut m = Modifiers::default();
     for e in f.take_all("custom_modifier_tooltip") {
-        m.custom_tooltips.extend(ctx.text(e, "idea.targeted_modifier.custom_modifier_tooltip"));
+        m.custom_tooltips.extend(ctx.text(e, &format!("{path}.custom_modifier_tooltip")));
     }
     for e in f.take_entries(|e| e.value.as_scalar().is_some()) {
-        if let Some(v) = ctx.fixed(e, "idea.targeted_modifier.<modifier>") {
+        if let Some(v) = ctx.fixed(e, &format!("{path}.<modifier>")) {
             m.values.push((e.key.text.to_string(), v));
         }
     }
@@ -433,28 +433,30 @@ fn parse_targeted(entry: &Entry<'_>, ctx: &mut Ctx<'_, '_>) -> Option<TargetedMo
     match target {
         Some(target) => Some(TargetedModifier { target, modifiers: m }),
         None => {
-            ctx.issue(entry.span, P, IssueKind::Missing("tag"));
+            ctx.issue(entry.span, path, IssueKind::Missing("tag"));
             None
         }
     }
 }
 
-fn parse_equipment_bonus(block: &Block<'_>, ctx: &mut Ctx<'_, '_>) -> Vec<EquipmentBonus> {
-    const P: &str = "idea.equipment_bonus.<equipment>";
+/// Reads the inside of `equipment_bonus = { <equipment> = { <stat> = N instant = yes } }`. `path` is the schema path
+/// of the block.
+pub(crate) fn parse_equipment_bonus(block: &Block<'_>, path: &str, ctx: &mut Ctx<'_, '_>) -> Vec<EquipmentBonus> {
+    let p = format!("{path}.<equipment>");
     let mut out = Vec::new();
-    let mut f = Fields::new(block, "idea.equipment_bonus");
+    let mut f = Fields::new(block, path);
     for e in f.take_matching(|_| true) {
-        let Some(b) = ctx.block(e, P) else { continue };
-        let mut bf = Fields::new(b, P);
+        let Some(b) = ctx.block(e, &p) else { continue };
+        let mut bf = Fields::new(b, p.clone());
         // `instant = yes` is often written after every stat (`build_cost_ic = -0.15 instant = yes`); it holds for the
         // whole block.
         let mut instant = false;
         for v in bf.take_all("instant") {
-            instant |= ctx.bool(v, &format!("{P}.instant")).unwrap_or(false);
+            instant |= ctx.bool(v, &format!("{p}.instant")).unwrap_or(false);
         }
         let mut stats = Vec::new();
         for s in bf.take_matching(|_| true) {
-            if let Some(v) = ctx.fixed(s, &format!("{P}.<stat>")) {
+            if let Some(v) = ctx.fixed(s, &format!("{p}.<stat>")) {
                 stats.push((s.key.text.to_string(), v));
             }
         }

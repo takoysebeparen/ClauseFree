@@ -11,8 +11,8 @@
 //! - `name = { ... }`: stats for a sub-unit or sub-unit category (`infantry = { soft_attack = 0.05 }`,
 //!   `category_light_infantry = { forest = { attack = 0.05 } }`), see [`UnitStats`].
 //!
-//! Doctrines live in `common/doctrines` since 1.17 (a separate system), even though the doctrine folders are still
-//! declared in `technology_folders`.
+//! Doctrines live in `common/doctrines` since 1.17 (a separate system, see [`crate::doctrines`]), even though the
+//! doctrine folders are still declared in `technology_folders`.
 
 use std::collections::BTreeMap;
 
@@ -349,7 +349,7 @@ fn parse_tech(entry: &Entry<'_>, block: &Block<'_>, constants: &Constants, ctx: 
     // What is left: blocks are unit stats, numbers are country modifiers. Anything else is reported by `finish`.
     for e in f.take_entries(|e| e.value.as_block().is_some()) {
         if let Some(b) = e.value.as_block() {
-            t.unit_stats.push(parse_unit_stats(e.key.text, b, ctx));
+            t.unit_stats.push(parse_unit_stats(e.key.text, b, "technology.<unit>", ctx));
         }
     }
     for e in f.take_entries(|e| e.value.as_scalar().is_some_and(|s| !s.quoted && Fixed::parse(s.text).is_ok())) {
@@ -428,24 +428,24 @@ fn parse_unlock(entry: &Entry<'_>, ctx: &mut Ctx<'_, '_>, path: &str) -> Option<
     Some(unlock)
 }
 
-fn parse_unit_stats(target: &str, block: &Block<'_>, ctx: &mut Ctx<'_, '_>) -> UnitStats {
-    const P: &str = "technology.<unit>";
-    let mut f = Fields::new(block, P);
+/// Reads `<sub-unit or category> = { ... }`. `path` is the schema path of the block.
+pub(crate) fn parse_unit_stats(target: &str, block: &Block<'_>, path: &str, ctx: &mut Ctx<'_, '_>) -> UnitStats {
+    let mut f = Fields::new(block, path);
     let mut u = UnitStats { target: target.to_string(), ..Default::default() };
     for e in f.take_all("battalion_mult") {
-        u.battalion_mult.extend(parse_battalion_mult(e, ctx, P));
+        u.battalion_mult.extend(parse_battalion_mult(e, ctx, path));
     }
     for e in f.take_entries(|e| e.value.as_block().is_some()) {
         let Some(b) = e.value.as_block() else { continue };
-        let list = ctx.numbers(b, "technology.<unit>.<terrain>");
+        let list = ctx.numbers(b, &format!("{path}.<terrain>"));
         if u.terrain.contains_key(e.key.text) {
-            ctx.issue(e.span, "technology.<unit>.<terrain>", IssueKind::Duplicate);
+            ctx.issue(e.span, format!("{path}.<terrain>"), IssueKind::Duplicate);
         } else {
             u.terrain.insert(e.key.text.to_string(), list);
         }
     }
     for e in f.take_matching(|_| true) {
-        if let Some(v) = ctx.fixed(e, "technology.<unit>.<stat>") {
+        if let Some(v) = ctx.fixed(e, &format!("{path}.<stat>")) {
             u.stats.push((e.key.text.to_string(), v));
         }
     }

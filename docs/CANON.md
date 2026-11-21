@@ -431,6 +431,46 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
   not a unit leader trait. **To check:** whether the original ignores both.
 - Test: `crates/data/tests/map_and_military.rs` (`leader_traits_and_skills`)
 
+### Country leader traits
+- Status: verified (files load completely); trait effects unmeasured
+- Source: `common/country_leader/*.txt` and a key inventory of them (revision `8873ec77`). No shipped documentation
+  covers them.
+- Ours: `data::country_leader` reads `leader_traits`: 2180 traits of country leaders, political advisors and military
+  advisors (one table for all three). A trait keeps `random`, `sprite`, its inline country modifiers (values may name
+  a constant of the file, `@tier3_cp_cap_increase`), `custom_modifier_tooltip`, `hidden_modifier`,
+  `targeted_modifier`, `equipment_bonus` and `ai_strategy = { type id value }`; `ai_will_do` is deferred. Every trait
+  named by a character's `country_leader` or `advisor` role, by an idea's `traits` and by a unit leader trait's
+  advisor traits exists; every equipment bonus names equipment; every `ai_strategy` id is a country.
+- **Guesses:** `random = no` (1846 traits; 24 say `yes`) keeps the trait away from randomly generated leaders; nothing
+  shipped says what it does. Every number that is not one of the keys above is a country modifier.
+- Original defects found: five traits of `00_traits.txt` are defined twice (`devoted_trotskyist`,
+  `pan_africanist_socialist`, `inventive_genius` identically; `PRC_multi_talented_diplomat_lar` and
+  `PHI_radical_leader` with different contents); the first is kept (see "Evaluation order of files and duplicate
+  definitions"). A `PER` country leader lists `ayatollah_trait`, which no file defines. **To check:** which copy the
+  original uses, and whether it ignores the unknown trait.
+- Test: `crates/data/tests/politics_and_doctrines.rs` (`country_leader_traits`)
+
+### Doctrines
+- Status: verified (documented, files load completely); doctrine mechanics unmeasured
+- Source: the `_documentation.md` files shipped in `common/doctrines` and in each of its directories `folders`,
+  `grand_doctrines`, `tracks`, `subdoctrines` (concepts, every key, "milestones are in the same order as the tracks",
+  reward `mastery` overriding `NDefines.NDoctrines.DEFAULT_REWARD_MASTERY`, `xor` within a folder), and a key
+  inventory of the files (revision `8873ec77`).
+- Ours: `data::doctrines` reads 4 folders, 12 grand doctrines, 14 tracks and 95 subdoctrines (`subdoctrines` with its
+  sub-directories). Grand doctrines, milestones, subdoctrines and rewards share the activation effects: inline country
+  modifiers or a `modifiers` block, `enable_tactic`, `<sub-unit or category> = { <stat> }` (read as technology unit
+  stats), `equipment_bonus`, and `effect` (deferred). Rewards are named blocks in the files (`cavalry_charge = { }`),
+  although the documentation's example shows anonymous ones; its note gives the localisation keys as
+  `<subdoctrine>_<reward>`. Triggers and AI weights (`allowed`, `available`, `visible`, `active`, `ai_will_do`) are
+  deferred. Every grand doctrine has one milestone per track; every folder, track, `xor` subdoctrine, combat tactic,
+  sub-unit, category, terrain, equipment bonus target and mastery equipment type named exists.
+- **Guesses:** six rewards in `navy_capital_subdoctrines.txt` write `modifier = { ... }` where the documentation says
+  `modifiers`; both are read as modifier blocks. Files of `subdoctrines/` are taken in evaluation order by file name
+  across the sub-directories (names are unique, so the order matters only for redefinitions).
+- **To measure:** mastery gain (manpower contribution, `multiplier`), reward unlocking, XP costs with
+  `*_doctrine_cost_factor`, whether the `modifier` spelling applies in game.
+- Test: `crates/data/tests/politics_and_doctrines.rs` (`doctrines_folders_tracks_and_rewards`)
+
 ### Script constants (`@name`)
 - Status: guess
 - Source: `01_landmark_buildings.txt` defines `@landmark_repair_speed_factor = 0.15` at the top and uses it in the

@@ -65,6 +65,15 @@ fn main() {
     println!("  ideologies    {}", db.ideologies.len());
     println!("  combat tactics {} ({} phases)", db.combat_tactics.len(), db.combat_tactics.phases.len());
     println!("  leader traits {} ({} skill levels)", db.unit_leaders.traits.len(), db.unit_leaders.skills.len());
+    println!("  country leader traits {}", db.country_leader_traits.len());
+    let d = &db.doctrines;
+    println!(
+        "  doctrines     {} grand, {} subdoctrines ({} folders, {} tracks)",
+        d.grand_doctrines.len(),
+        d.subdoctrines.len(),
+        d.folders.len(),
+        d.tracks.len()
+    );
     let divisions: usize = db.oobs.by_name.values().map(|o| o.divisions.len()).sum();
     let templates: usize = db.oobs.by_name.values().map(|o| o.templates.len()).sum();
     println!("  OOB files     {} ({templates} templates, {divisions} divisions)", db.oobs.len());

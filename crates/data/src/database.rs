@@ -11,7 +11,9 @@ use crate::combat_tactics::{self, CombatTactics};
 use crate::continents::{self, Continents};
 use crate::countries::{self, Countries};
 use crate::country_history::{self, CountryHistories};
+use crate::country_leader::{self, CountryLeaderTraits};
 use crate::defines::{self, Defines};
+use crate::doctrines::{self, Doctrines};
 use crate::equipment::{self, Equipment};
 use crate::equipment::{LimitMatch, ModuleSlots, SlotSpec};
 use crate::equipment_groups::{self, EquipmentGroups};
@@ -70,6 +72,8 @@ pub struct Database {
     pub ideologies: Ideologies,
     pub combat_tactics: CombatTactics,
     pub unit_leaders: UnitLeaders,
+    pub country_leader_traits: CountryLeaderTraits,
+    pub doctrines: Doctrines,
 }
 
 impl Database {
@@ -100,6 +104,8 @@ impl Database {
             ideologies: ideologies::load(vfs, &mut report),
             combat_tactics: combat_tactics::load(vfs, &mut report),
             unit_leaders: unit_leader::load(vfs, &mut report),
+            country_leader_traits: country_leader::load(vfs, &mut report),
+            doctrines: doctrines::load(vfs, &mut report),
         };
         db.check_references(&mut report);
         (db, report)
@@ -120,6 +126,8 @@ impl Database {
         self.check_tactic_references(report);
         self.check_unit_leader_references(report);
         self.check_ideology_references(report);
+        self.check_country_leader_trait_references(report);
+        self.check_doctrine_references(report);
         for p in self.provinces.by_id.values() {
             if self.terrain.get(&p.terrain).is_none() {
                 report.push("map/definition.csv", 0, "map.definition.terrain", IssueKind::BrokenReference("terrain"));
@@ -808,6 +816,164 @@ impl Database {
             for (i, _) in &h.popularities {
                 if ideologies.get(i).is_none() {
                     report.push(&h.file, 0, "country_history.set_popularities", IssueKind::BrokenReference("ideology"));
+                }
+            }
+        }
+    }
+
+    /// Traits named by country leader and advisor roles, by ideas and by unit leader traits (as advisor traits) are
+    /// country leader traits; trait equipment bonuses name equipment; AI strategies name countries.
+    fn check_country_leader_trait_references(&self, report: &mut Report) {
+        let traits = &self.country_leader_traits;
+        for c in &self.characters.list {
+            for b in c.bodies() {
+                let names = b
+                    .country_leader
+                    .iter()
+                    .flat_map(|r| r.traits.iter().map(|t| ("character.country_leader.traits", t)))
+                    .chain(b.advisors.iter().flat_map(|r| r.traits.iter().map(|t| ("character.advisor.traits", t))));
+                for (path, name) in names {
+                    if traits.get(name).is_none() {
+                        report.push(&c.file, 0, path, IssueKind::BrokenReference("country leader trait"));
+                    }
+                }
+            }
+        }
+        for d in &self.ideas.list {
+            for name in &d.traits {
+                if traits.get(name).is_none() {
+                    report.push(&d.file, 0, "idea.traits", IssueKind::BrokenReference("country leader trait"));
+                }
+            }
+        }
+        for t in &self.unit_leaders.traits {
+            for (_, name) in &t.advisor_traits {
+                if traits.get(name).is_none() {
+                    report.push(
+                        &t.file,
+                        0,
+                        "leader_trait.<advisor_trait>",
+                        IssueKind::BrokenReference("country leader trait"),
+                    );
+                }
+            }
+        }
+        let targets = self.equipment_targets();
+        for t in &traits.list {
+            for b in &t.equipment_bonus {
+                if !targets.contains(b.target.as_str()) && !self.equipment.exists(&b.target) {
+                    report.push(
+                        &t.file,
+                        0,
+                        "country_leader_trait.equipment_bonus.<equipment>",
+                        IssueKind::BrokenReference("equipment, equipment type or group"),
+                    );
+                }
+            }
+            for id in t.ai_strategies.iter().filter_map(|a| a.id.as_deref()) {
+                if crate::types::Tag::parse(id).and_then(|tag| self.countries.get(tag)).is_none() {
+                    report.push(
+                        &t.file,
+                        0,
+                        "country_leader_trait.ai_strategy.id",
+                        IssueKind::BrokenReference("country tag"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Grand doctrines name a folder and tracks; subdoctrines name tracks and other subdoctrines; activation effects
+    /// name combat tactics, sub-units or categories, terrain and equipment; mastery rules name sub-units, categories
+    /// and equipment types.
+    fn check_doctrine_references(&self, report: &mut Report) {
+        let d = &self.doctrines;
+        let is_unit_category = |c: &str| self.units.categories.iter().any(|k| k == c);
+        let is_unit = |c: &str| self.units.sub_units.contains_key(c) || is_unit_category(c);
+        let is_terrain = |k: &str| self.terrain.get(k).is_some() || COMBAT_SITUATIONS.contains(&k);
+        let targets = self.equipment_targets();
+        let equipment_types: BTreeSet<&str> =
+            self.equipment.by_name.values().flat_map(|e| e.types.iter().map(String::as_str)).collect();
+        let check_mastery = |report: &mut Report, file: &str, path: &str, m: &doctrines::MasteryRule| {
+            for name in &m.sub_units {
+                if !self.units.sub_units.contains_key(name) {
+                    report.push(file, 0, format!("{path}.sub_units"), IssueKind::BrokenReference("sub-unit"));
+                }
+            }
+            for name in &m.categories {
+                if !is_unit_category(name) {
+                    report.push(file, 0, format!("{path}.categories"), IssueKind::BrokenReference("sub-unit category"));
+                }
+            }
+            for name in &m.equipment {
+                if !equipment_types.contains(name.as_str()) {
+                    report.push(file, 0, format!("{path}.equipment"), IssueKind::BrokenReference("equipment type"));
+                }
+            }
+        };
+        for g in &d.grand_doctrines {
+            match &g.folder {
+                Some(folder) if d.folder(folder).is_none() => {
+                    report.push(&g.file, 0, "grand_doctrine.folder", IssueKind::BrokenReference("doctrine folder"));
+                }
+                Some(_) => {}
+                None => report.push(&g.file, 0, "grand_doctrine", IssueKind::Missing("folder")),
+            }
+            for t in &g.tracks {
+                if d.track(t).is_none() {
+                    report.push(&g.file, 0, "grand_doctrine.tracks", IssueKind::BrokenReference("doctrine track"));
+                }
+            }
+        }
+        for t in &d.tracks {
+            if let Some(m) = &t.mastery {
+                check_mastery(report, &t.file, "doctrine_track.mastery", m);
+            }
+        }
+        for s in &d.subdoctrines {
+            for t in &s.tracks {
+                if d.track(t).is_none() {
+                    report.push(&s.file, 0, "subdoctrine.track", IssueKind::BrokenReference("doctrine track"));
+                }
+            }
+            for x in &s.xor {
+                if d.subdoctrine(x).is_none() {
+                    report.push(&s.file, 0, "subdoctrine.xor", IssueKind::BrokenReference("subdoctrine"));
+                }
+            }
+            if let Some(m) = &s.mastery {
+                check_mastery(report, &s.file, "subdoctrine.mastery", m);
+            }
+        }
+        for (file, e) in d.all_effects() {
+            for t in &e.tactics {
+                if self.combat_tactics.get(t).is_none() {
+                    report.push(file, 0, "doctrine.enable_tactic", IssueKind::BrokenReference("combat tactic"));
+                }
+            }
+            for u in &e.unit_stats {
+                if !is_unit(&u.target) {
+                    report.push(
+                        file,
+                        0,
+                        "doctrine.<unit>",
+                        IssueKind::BrokenReference("sub-unit or sub-unit category"),
+                    );
+                }
+                for k in u.terrain.keys() {
+                    if !is_terrain(k) {
+                        report.push(file, 0, "doctrine.<unit>.<terrain>", IssueKind::BrokenReference("terrain"));
+                    }
+                }
+            }
+            for b in &e.equipment_bonus {
+                if !targets.contains(b.target.as_str()) && !self.equipment.exists(&b.target) {
+                    report.push(
+                        file,
+                        0,
+                        "doctrine.equipment_bonus.<equipment>",
+                        IssueKind::BrokenReference("equipment, equipment type or group"),
+                    );
                 }
             }
         }
