@@ -1,13 +1,13 @@
 //! Equipment: `common/units/equipment/*.txt`, blocks `equipments` and `duplicate_archetypes`.
 //!
 //! Source: the syntax reference shipped with the game, `common/units/equipment/_documentation.md`, plus a key
-//! inventory of the files (revisions `7c6c1c59` and `8873ec77`). Stats are stored as written. Inheritance (variant -> archetype,
-//! `parent`, upgrades) and modular equipment (`module_slots`, `default_modules`, ...) are resolved by later layers;
-//! the modular keys are reported as deferred until the module loader exists.
+//! inventory of the files (revisions `7c6c1c59` and `8873ec77`). Stats are stored as written. Modular equipment
+//! (`module_slots`, `module_count_limit`, `default_modules`, `module_add_stats_multiplier`) follows the same
+//! reference; the modules themselves are in [`crate::modules`].
 
 use std::collections::BTreeMap;
 
-use clausewitz::Block;
+use clausewitz::{Block, Entry, Operator, Value};
 use vfs::Vfs;
 
 use crate::report::{IssueKind, Report};
@@ -116,14 +116,10 @@ pub const EQUIPMENT_TEXTS: [&str; 15] = [
     "forbid_mission_type",
 ];
 
-/// Keys that hold triggers (script) or modular-equipment data; loaded by later layers.
-const DEFERRED: [&str; 11] = [
+/// Keys that hold triggers (script) or data for later layers.
+const DEFERRED: [&str; 7] = [
     "can_be_produced",
     "can_be_lend_leased",
-    "module_slots",
-    "module_count_limit",
-    "default_modules",
-    "module_add_stats_multiplier",
     "modifier_stat",
     "scaled_by_reliability",
     "for_each",
@@ -148,6 +144,77 @@ pub struct EquipmentDef {
     pub flags: Vec<(String, bool)>,
     pub texts: Vec<(String, String)>,
     pub numbers: NumberList,
+    /// `module_slots`; `None` if the key is absent.
+    pub module_slots: Option<ModuleSlots>,
+    pub module_count_limits: Vec<ModuleCountLimit>,
+    /// `default_modules = { <slot> = <module>|empty }`, as written.
+    pub default_modules: Vec<(String, String)>,
+    pub module_add_stats_multiplier: NumberList,
+}
+
+/// `module_slots = ...`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModuleSlots {
+    /// `module_slots = inherit`: every slot of the parent equipment type.
+    Inherit,
+    /// `module_slots = none`. Comment in `x_plane_airframes.txt`: "Prevent this archetype from being identified as
+    /// using the plane designer".
+    None,
+    List(Vec<ModuleSlot>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleSlot {
+    pub name: String,
+    pub spec: SlotSpec,
+}
+
+impl ModuleSlot {
+    /// "Fixed slots ... always start with `fixed_`" (documentation).
+    pub fn is_fixed(&self) -> bool {
+        self.name.starts_with("fixed_")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SlotSpec {
+    Defined {
+        required: Option<bool>,
+        allowed_categories: Vec<String>,
+        gfx: Option<String>,
+    },
+    /// `<slot> = inherit`: the same slot of the parent equipment type.
+    Inherit,
+    /// `<slot> = <earlier slot>`: the attributes of an earlier slot of the same block.
+    SameAs(String),
+}
+
+/// One match condition of a `module_count_limit`. The names `any` (module or category) and `empty` (module) are
+/// kept as written; the documentation gives them special meanings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LimitMatch {
+    Module(String),
+    Category(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountRule {
+    /// `count < N`
+    Below(u32),
+    /// `count > N`
+    Above(u32),
+    /// `count = N`
+    Exactly(u32),
+    /// `count = any`
+    Any,
+}
+
+/// `module_count_limit = { module = X category = Y count < N title = T }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleCountLimit {
+    pub matches: Vec<LimitMatch>,
+    pub count: CountRule,
+    pub title: Option<String>,
 }
 
 impl EquipmentDef {
@@ -199,47 +266,128 @@ impl Equipment {
     ///   archetypes are all `is_buildable = no`, while their variants are buildable) — an assumption;
     /// - a duplicate archetype does not take `alias`, `type`, `variant_name` and `derived_variant_name` from the
     ///   archetype it copies (header of `x_plane_airframes.txt`);
-    /// - list-valued attributes (`type`, `upgrades`, `resources`, ...) are replaced as a whole, not merged — an
-    ///   assumption.
+    /// - list-valued attributes (`type`, `upgrades`, `resources`, `default_modules`, ...) are replaced as a whole,
+    ///   not merged — an assumption;
+    /// - module slots: `module_slots = inherit`, a slot written `inherit` and a default module written `inherit`
+    ///   take their value from "the parent equipment type" (documentation): the `parent` equipment if there is one,
+    ///   else the archetype. The base game confirms `parent`: `heavy_cruiser_3` (`parent = heavy_cruiser_2`,
+    ///   `module_slots = inherit`) puts default modules in `rear_2_custom_slot`, which only `heavy_cruiser_1`
+    ///   defines, not the archetype. An absent `module_slots` takes the archetype's (general rule above, an
+    ///   assumption). `<slot> = <earlier slot>` copies an earlier slot. The result holds only
+    ///   [`SlotSpec::Defined`] slots;
+    /// - module count limits are inherited from the archetype, and "an inherited limit is overridden if the child
+    ///   has a limit with exactly the same match conditions" (documentation).
     ///
-    /// `None` if the name is unknown or the chain is broken or circular.
+    /// `None` if the name is unknown, a chain is broken or circular, or an `inherit` cannot be resolved.
     pub fn effective(&self, name: &str) -> Option<EquipmentDef> {
         self.resolve(name, 0)
     }
 
     fn resolve(&self, name: &str, depth: usize) -> Option<EquipmentDef> {
-        // The base game's chains are at most three long; anything deeper is a loop.
-        if depth > 16 {
+        // The base game's chains are at most a few steps long; anything deeper is a loop.
+        if depth > 32 {
             return None;
         }
         let own = self.get(name)?;
-        let Some(base_name) = own.text("archetype") else { return Some(own.clone()) };
-        let mut base = self.resolve(base_name, depth + 1)?;
-        base.flags.retain(|(k, _)| k != "is_archetype" && k != "is_buildable");
-        if own.duplicate {
-            base.texts.retain(|(k, _)| k != "alias" && k != "derived_variant_name");
-            base.types.clear();
-        }
+        let base = match own.text("archetype") {
+            Some(a) => Some(self.resolve(a, depth + 1)?),
+            None => None,
+        };
         let mut out = own.clone();
-        merge_pairs(&mut out.numbers, &base.numbers);
-        merge_pairs(&mut out.flags, &base.flags);
-        merge_pairs(&mut out.texts, &base.texts);
-        for (mine, inherited) in [
-            (&mut out.types, &base.types),
-            (&mut out.upgrades, &base.upgrades),
-            (&mut out.can_convert_from, &base.can_convert_from),
-            (&mut out.allowed_types, &base.allowed_types),
-            (&mut out.allow_mission_type, &base.allow_mission_type),
-        ] {
-            if mine.is_empty() {
-                mine.clone_from(inherited);
-            }
+        if let Some(base) = &base {
+            inherit_from_archetype(&mut out, own, base);
         }
-        if out.resources.is_empty() {
-            out.resources.clone_from(&base.resources);
+        // `inherit` in `module_slots` and `default_modules` refers to "the parent equipment type": `parent` if the
+        // equipment has one, else its archetype.
+        let needs_parent = matches!(own.module_slots, Some(ModuleSlots::Inherit))
+            || matches!(&own.module_slots, Some(ModuleSlots::List(l)) if l.iter().any(|s| s.spec == SlotSpec::Inherit))
+            || own.default_modules.iter().any(|(_, m)| m == INHERIT);
+        let parent = match own.text("parent") {
+            Some(p) if needs_parent => Some(self.resolve(p, depth + 1)?),
+            _ => None,
+        };
+        let source = parent.as_ref().or(base.as_ref());
+        out.module_slots = match &own.module_slots {
+            None => base.as_ref().and_then(|b| b.module_slots.clone()),
+            Some(own_slots) => resolve_slots(own_slots, source.and_then(|s| s.module_slots.as_ref()))?,
+        };
+        for (slot, module) in &mut out.default_modules {
+            if module == INHERIT {
+                let inherited = source?.default_modules.iter().find(|(s, _)| s == slot)?;
+                module.clone_from(&inherited.1);
+            }
         }
         Some(out)
     }
+}
+
+/// `inherit` as a value of `module_slots`, of a slot and of a default module.
+const INHERIT: &str = "inherit";
+
+/// Fills in what `out` (a copy of `own`) inherits from its resolved archetype `base`.
+fn inherit_from_archetype(out: &mut EquipmentDef, own: &EquipmentDef, base: &EquipmentDef) {
+    let mut base = base.clone();
+    base.flags.retain(|(k, _)| k != "is_archetype" && k != "is_buildable");
+    if own.duplicate {
+        base.texts.retain(|(k, _)| k != "alias" && k != "derived_variant_name");
+        base.types.clear();
+    }
+    merge_pairs(&mut out.numbers, &base.numbers);
+    merge_pairs(&mut out.flags, &base.flags);
+    merge_pairs(&mut out.texts, &base.texts);
+    merge_pairs(&mut out.module_add_stats_multiplier, &base.module_add_stats_multiplier);
+    for (mine, inherited) in [
+        (&mut out.types, &base.types),
+        (&mut out.upgrades, &base.upgrades),
+        (&mut out.can_convert_from, &base.can_convert_from),
+        (&mut out.allowed_types, &base.allowed_types),
+        (&mut out.allow_mission_type, &base.allow_mission_type),
+    ] {
+        if mine.is_empty() {
+            mine.clone_from(inherited);
+        }
+    }
+    if out.resources.is_empty() {
+        out.resources.clone_from(&base.resources);
+    }
+    if out.default_modules.is_empty() {
+        out.default_modules.clone_from(&base.default_modules);
+    }
+    for limit in &base.module_count_limits {
+        if !own.module_count_limits.iter().any(|l| same_conditions(&l.matches, &limit.matches)) {
+            out.module_count_limits.push(limit.clone());
+        }
+    }
+}
+
+/// The slots of an equipment from its own `module_slots` and the resolved slots of the equipment `inherit` refers
+/// to: `Some(None)` if there are no slots (`inherit` from an equipment without slots), `None` if a slot refers to
+/// something that does not exist.
+fn resolve_slots(own: &ModuleSlots, inherited: Option<&ModuleSlots>) -> Option<Option<ModuleSlots>> {
+    let inherited_slots: &[ModuleSlot] = match inherited {
+        Some(ModuleSlots::List(l)) => l,
+        _ => &[],
+    };
+    let list = match own {
+        ModuleSlots::Inherit => return Some(inherited.cloned()),
+        ModuleSlots::None => return Some(Some(ModuleSlots::None)),
+        ModuleSlots::List(l) => l,
+    };
+    let mut out: Vec<ModuleSlot> = Vec::with_capacity(list.len());
+    for slot in list {
+        let spec = match &slot.spec {
+            SlotSpec::Defined { .. } => slot.spec.clone(),
+            SlotSpec::Inherit => inherited_slots.iter().find(|b| b.name == slot.name)?.spec.clone(),
+            SlotSpec::SameAs(earlier) => out.iter().find(|o| &o.name == earlier)?.spec.clone(),
+        };
+        out.push(ModuleSlot { name: slot.name.clone(), spec });
+    }
+    Some(Some(ModuleSlots::List(out)))
+}
+
+/// "Exactly the same match conditions": the same set of conditions, in any order (order is an assumption).
+fn same_conditions(a: &[LimitMatch], b: &[LimitMatch]) -> bool {
+    a.len() == b.len() && a.iter().all(|m| b.contains(m))
 }
 
 /// Adds the inherited `(key, value)` pairs whose key the equipment does not set itself.
@@ -327,7 +475,125 @@ fn parse_equipment(name: &str, duplicate: bool, block: &Block<'_>, ctx: &mut Ctx
             e.numbers.push((key.to_string(), v));
         }
     }
+    if let Some(entry) = f.take("module_slots") {
+        e.module_slots = parse_module_slots(entry, ctx);
+    }
+    for entry in f.take_all("module_count_limit") {
+        e.module_count_limits.extend(parse_count_limit(entry, ctx));
+    }
+    for entry in f.take_all("default_modules") {
+        const P: &str = "equipment.default_modules";
+        let Some(b) = ctx.block(entry, P) else { continue };
+        let mut df = Fields::new(b, P);
+        for slot in df.take_matching(|_| true) {
+            if let Some(m) = ctx.text(slot, "equipment.default_modules.<slot>") {
+                e.default_modules.push((slot.key.text.to_string(), m));
+            }
+        }
+        df.finish(ctx);
+    }
+    if let Some(entry) = f.take("module_add_stats_multiplier")
+        && let Some(b) = ctx.block(entry, "equipment.module_add_stats_multiplier")
+    {
+        e.module_add_stats_multiplier = ctx.numbers(b, "equipment.module_add_stats_multiplier");
+    }
     f.defer_matching(|k| DEFERRED.contains(&k));
     f.finish(ctx);
     e
+}
+
+fn parse_module_slots(entry: &Entry<'_>, ctx: &mut Ctx<'_, '_>) -> Option<ModuleSlots> {
+    const P: &str = "equipment.module_slots";
+    const SLOT: &str = "equipment.module_slots.<slot>";
+    if let Value::Scalar(s) = &entry.value {
+        return match s.text {
+            "inherit" => Some(ModuleSlots::Inherit),
+            "none" => Some(ModuleSlots::None),
+            _ => {
+                ctx.issue(s.span, P, IssueKind::InvalidValue("inherit, none or a block"));
+                None
+            }
+        };
+    }
+    let block = ctx.block(entry, P)?;
+    let mut f = Fields::new(block, P);
+    let mut out: Vec<ModuleSlot> = Vec::new();
+    for slot in f.take_matching(|_| true) {
+        let name = slot.key.text.to_string();
+        if out.iter().any(|o| o.name == name) {
+            ctx.issue(slot.span, SLOT, IssueKind::Redefinition("first"));
+            continue;
+        }
+        let spec = match &slot.value {
+            Value::Scalar(s) if s.text == "inherit" => SlotSpec::Inherit,
+            Value::Scalar(s) => {
+                if !out.iter().any(|o| o.name == s.text) {
+                    ctx.issue(s.span, SLOT, IssueKind::BrokenReference("earlier slot"));
+                    continue;
+                }
+                SlotSpec::SameAs(s.text.to_string())
+            }
+            _ => {
+                let Some(b) = ctx.block(slot, SLOT) else { continue };
+                parse_slot(b, ctx)
+            }
+        };
+        out.push(ModuleSlot { name, spec });
+    }
+    f.finish(ctx);
+    Some(ModuleSlots::List(out))
+}
+
+fn parse_slot(block: &Block<'_>, ctx: &mut Ctx<'_, '_>) -> SlotSpec {
+    let mut f = Fields::new(block, "equipment.module_slots.<slot>");
+    let required = f.take("required").and_then(|e| ctx.bool(e, "equipment.module_slots.<slot>.required"));
+    let mut allowed_categories = Vec::new();
+    for e in f.take_all("allowed_module_categories") {
+        allowed_categories.extend(ctx.names(e, "equipment.module_slots.<slot>.allowed_module_categories"));
+    }
+    let gfx = f.take("gfx").and_then(|e| ctx.text(e, "equipment.module_slots.<slot>.gfx"));
+    f.finish(ctx);
+    SlotSpec::Defined { required, allowed_categories, gfx }
+}
+
+fn parse_count_limit(entry: &Entry<'_>, ctx: &mut Ctx<'_, '_>) -> Option<ModuleCountLimit> {
+    const P: &str = "equipment.module_count_limit";
+    let block = ctx.block(entry, P)?;
+    let mut f = Fields::new(block, P);
+    let mut matches = Vec::new();
+    for e in f.take_all("module") {
+        matches.extend(ctx.text(e, "equipment.module_count_limit.module").map(LimitMatch::Module));
+    }
+    for e in f.take_all("category") {
+        matches.extend(ctx.text(e, "equipment.module_count_limit.category").map(LimitMatch::Category));
+    }
+    let title = f.take("title").and_then(|e| ctx.text(e, "equipment.module_count_limit.title"));
+    let count = f.take("count").and_then(|e| parse_count(e, ctx));
+    f.finish(ctx);
+    if matches.is_empty() {
+        ctx.issue(entry.span, P, IssueKind::Missing("module or category"));
+        return None;
+    }
+    let Some(count) = count else {
+        ctx.issue(entry.span, P, IssueKind::Missing("count"));
+        return None;
+    };
+    Some(ModuleCountLimit { matches, count, title })
+}
+
+fn parse_count(entry: &Entry<'_>, ctx: &mut Ctx<'_, '_>) -> Option<CountRule> {
+    const P: &str = "equipment.module_count_limit.count";
+    if entry.op == Operator::Eq && entry.value.as_scalar().is_some_and(|s| s.text == "any") {
+        return Some(CountRule::Any);
+    }
+    let rule: fn(u32) -> CountRule = match entry.op {
+        Operator::Lt => CountRule::Below,
+        Operator::Gt => CountRule::Above,
+        Operator::Eq => CountRule::Exactly,
+        _ => {
+            ctx.issue(entry.span, P, IssueKind::InvalidValue("count < N, count > N, count = N or count = any"));
+            return None;
+        }
+    };
+    ctx.u32(entry, P).map(rule)
 }

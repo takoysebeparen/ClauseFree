@@ -6,7 +6,9 @@ use crate::buildings::{self, Buildings};
 use crate::countries::{self, Countries};
 use crate::defines::{self, Defines};
 use crate::equipment::{self, Equipment};
+use crate::equipment::{LimitMatch, ModuleSlots, SlotSpec};
 use crate::localisation::{self, Localisation};
+use crate::modules::{self, ConvertFrom, Modules};
 use crate::oob::{self, Oobs};
 use crate::provinces::{self, Provinces};
 use crate::report::{IssueKind, Report};
@@ -38,6 +40,7 @@ pub struct Database {
     pub resources: Resources,
     pub units: Units,
     pub equipment: Equipment,
+    pub modules: Modules,
     pub defines: Defines,
     pub oobs: Oobs,
     pub buildings: Buildings,
@@ -55,6 +58,7 @@ impl Database {
             resources: resources::load(vfs, &mut report),
             units: units::load(vfs, &mut report),
             equipment: equipment::load(vfs, &mut report),
+            modules: modules::load(vfs, &mut report),
             defines: defines::load(vfs, &mut report),
             oobs: oob::load(vfs, &mut report),
             buildings: buildings::load(vfs, &mut report),
@@ -69,6 +73,7 @@ impl Database {
         self.check_unit_references(report);
         self.check_oob_references(report);
         self.check_building_references(report);
+        self.check_module_references(report);
         for p in self.provinces.by_id.values() {
             if self.terrain.get(&p.terrain).is_none() {
                 report.push("map/definition.csv", 0, "map.definition.terrain", IssueKind::BrokenReference("terrain"));
@@ -210,6 +215,101 @@ impl Database {
                         ),
                         Some(_) => {}
                     }
+                }
+            }
+        }
+    }
+
+    /// Modules and module categories named by modules and by modular equipment exist; every equipment's slots
+    /// resolve; default modules go into slots the equipment has. A category exists if some module belongs to it.
+    fn check_module_references(&self, report: &mut Report) {
+        let broken = |report: &mut Report, file: &str, path: &str, what: &'static str| {
+            report.push(file, 0, path, IssueKind::BrokenReference(what));
+        };
+        let categories = self.modules.categories();
+        let category_ok = |c: &str| categories.contains(c);
+        let module_ok = |m: &str| self.modules.get(m).is_some();
+        for m in &self.modules.list {
+            if let Some(p) = m.text("parent")
+                && !module_ok(p)
+            {
+                broken(report, &m.file, "module.parent", "module");
+            }
+            for c in &m.conversions {
+                match &c.from {
+                    ConvertFrom::Module(n) if !module_ok(n) => {
+                        broken(report, &m.file, "module.can_convert_from.module", "module")
+                    }
+                    ConvertFrom::Category(n) if !category_ok(n) => {
+                        broken(report, &m.file, "module.can_convert_from.module_category", "module category")
+                    }
+                    _ => {}
+                }
+            }
+            let named_categories = m
+                .list("forbid_module_categories")
+                .iter()
+                .chain(m.allowed_module_categories.iter().flat_map(|(_, c)| c))
+                .chain(m.forbid_exact_match_for_category.iter().map(|(c, _)| c));
+            for c in named_categories {
+                if !category_ok(c) {
+                    broken(report, &m.file, "module.<module category>", "module category");
+                }
+            }
+            for (r, _) in m.build_cost_resources.iter().chain(&m.dismantle_cost_resources) {
+                if self.resources.get(r).is_none() {
+                    broken(report, &m.file, "module.<cost resources>", "resource");
+                }
+            }
+        }
+        for e in self.equipment.by_name.values() {
+            if let Some(ModuleSlots::List(slots)) = &e.module_slots {
+                for s in slots {
+                    if let SlotSpec::Defined { allowed_categories, .. } = &s.spec {
+                        for c in allowed_categories {
+                            if !category_ok(c) {
+                                broken(
+                                    report,
+                                    &e.file,
+                                    "equipment.module_slots.<slot>.allowed_module_categories",
+                                    "module category",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            for l in &e.module_count_limits {
+                for m in &l.matches {
+                    match m {
+                        LimitMatch::Module(n) if n != "any" && n != "empty" && !module_ok(n) => {
+                            broken(report, &e.file, "equipment.module_count_limit.module", "module")
+                        }
+                        LimitMatch::Category(n) if n != "any" && !category_ok(n) => {
+                            broken(report, &e.file, "equipment.module_count_limit.category", "module category")
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if e.module_slots.is_none() && e.default_modules.is_empty() {
+                continue;
+            }
+            let Some(eff) = self.equipment.effective(&e.name) else {
+                broken(report, &e.file, "equipment.module_slots", "inherited slot");
+                continue;
+            };
+            let slots = match &eff.module_slots {
+                Some(ModuleSlots::List(l)) => l.as_slice(),
+                _ => &[],
+            };
+            for (slot, module) in &e.default_modules {
+                if !slots.iter().any(|s| &s.name == slot) {
+                    broken(report, &e.file, "equipment.default_modules.<slot>", "slot of this equipment");
+                }
+                // `inherit` was resolved by `effective` above.
+                if module != "empty" && module != "inherit" && !module_ok(module) {
+                    broken(report, &e.file, "equipment.default_modules.<slot>", "module");
                 }
             }
         }

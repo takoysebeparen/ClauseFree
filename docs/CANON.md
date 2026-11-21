@@ -132,8 +132,7 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
   ("This file must be evaluated after the file(s) defining the archetypes being duplicated. The equipment
   attributes alias, type, variant_name, and derived_variant_name are not duplicated.").
 - Ours: `data::equipment` loads `equipments` and `duplicate_archetypes`; entries of the latter count as archetypes.
-  Inheritance (variant -> archetype -> parent) and modular equipment (`module_slots`, `default_modules`, ...) are
-  not resolved yet (reported as deferred).
+  Inheritance is described in "Equipment inheritance"; modular equipment in "Equipment modules".
 - Original defects found: `max_strength = 250§` in `ship_hull_carrier.txt`; several duplicated stat keys in equipment
   and sub-units (first one kept, reported).
 
@@ -167,6 +166,31 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
   their variants are buildable); list attributes (`type`, `upgrades`, `resources`) are replaced as a whole, not
   merged. All 342 equipment entries of the real installation resolve.
 - Test: `crates/data/tests/oob.rs` (`equipment_inherits_from_its_archetype`)
+
+### Equipment modules
+- Status: verified (files load completely); module stat arithmetic unmeasured
+- Source: `common/units/equipment/modules/*.txt` (revision `8873ec77`, a key inventory of the files) for the module
+  blocks, which the shipped documentation does not cover; `common/units/equipment/_documentation.md` for
+  `module_slots`, `module_count_limit` and `default_modules` on equipment.
+- Ours: `data::modules` stores every module as written: `category`, `add_stats` / `multiply_stats` /
+  `add_average_stats`, per-mission stats, costs, conversions, restrictions and the slots a module opens
+  (`allowed_module_categories`). An `equipment_modules` block with a `limit` (a `has_dlc` trigger) marks its modules
+  as conditional; the trigger is deferred to the script VM. Module categories are not declared anywhere: a category
+  exists when a module names it. Stat names are not checked (no file lists them; modules use names such as `thrust`
+  that no equipment sets). 312 modules in 95 categories load with no unknown keys; every module, category and resource
+  named by modules and equipment exists.
+- Slot inheritance: `module_slots = inherit`, `<slot> = inherit` and `<default module> = inherit` (the last is
+  undocumented, used by `ship_hull_midget_submarine`) take "the parent equipment type" (documentation): the `parent`
+  equipment if set, else the archetype. **Verified by data consistency:** with the archetype, `heavy_cruiser_3` and
+  `heavy_cruiser_4` would put default modules into `front_1_custom_slot` / `rear_2_custom_slot`, which only
+  `heavy_cruiser_1` (reached through `parent`) defines. Inherited count limits follow the documentation (overridden by
+  a limit with the same match conditions; "same" is taken as the same set, in any order — a guess).
+- **To measure:** how `add_stats`, `multiply_stats` and `add_average_stats` combine with the frame's stats and with
+  `module_add_stats_multiplier`; what `need_equipment_modules = { any = { ... } }` in sub-units means (still deferred).
+- Original defects found: `ship_hull_escort_carrier` sets a default module for `mid_2_custom_slot`, a slot it does
+  not have; `module_slots = inherit` written twice in three light cruisers; duplicated `xp_cost` and
+  `dismantle_cost_ic` in two tank modules (first kept); six empty `can_convert_from = { }` blocks (ignored).
+- Test: `crates/data/tests/modules.rs`
 
 ### Orders of battle (history/units)
 - Status: verified (files load completely)
