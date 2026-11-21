@@ -4,7 +4,7 @@
 //! file into an [`OobDef`] keyed by its file stem (`GER_1936`). It reads the land part (division templates and
 //! divisions). Fleets, air wings, starting production (`instant_effect`) and officers are reported as deferred.
 //!
-//! Source: the files (key inventory of revision `7c6c1c59`, 609 files, 5074 divisions, 804 templates).
+//! Source: the files (key inventory of revisions `7c6c1c59` and `8873ec77`, 609 files, 5074 divisions, 804 templates).
 
 use std::collections::BTreeMap;
 

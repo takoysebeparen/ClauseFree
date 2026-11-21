@@ -1,7 +1,7 @@
 //! Sub-units (battalions, support companies, ships, air wings): `common/units/*.txt`, block `sub_units`, and the
 //! sub-unit categories of `common/unit_tags/*.txt`.
 //!
-//! Sources: the files themselves (key inventory of revision `7c6c1c59`) and the community wiki page "Unit modding"
+//! Sources: the files themselves (key inventory of revisions `7c6c1c59` and `8873ec77`) and the community wiki page "Unit modding"
 //! (<https://hoi4.paradoxwikis.com/Unit_modding>). Per the wiki, many numeric keys of a sub-unit are *modifiers*
 //! applied on top of what its equipment provides (for example `soft_attack = -0.1` means 10% less soft attack than
 //! the equipment gives), while others are absolute (`max_organisation`, `combat_width`, `manpower`). The data layer
@@ -95,7 +95,7 @@ pub const SUB_UNIT_FLAGS: [&str; 16] = [
 
 /// Combat situations that take a modifier block like terrain categories do, but are not terrain categories in
 /// `common/terrain`: crossing a river, landing from the sea, attacking a fort, and fighting in snow. Observed in the
-/// files (revision `7c6c1c59`); the list is engine-defined and may be incomplete.
+/// files (revisions `7c6c1c59` and `8873ec77`); the list is engine-defined and may be incomplete.
 pub const COMBAT_SITUATIONS: [&str; 4] = ["river", "amphibious", "fort", "snow"];
 
 /// `battalion_mult = { category = X add = yes <stat> = N }`: modifies other battalions of a category.

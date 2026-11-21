@@ -1,6 +1,6 @@
 //! Buildings: `common/buildings/*.txt`, blocks `buildings` and `spawn_points`.
 //!
-//! Source: the files themselves (revision `7c6c1c59`) and the comments at the top of `00_buildings.txt`, which say
+//! Source: the files themselves (revision `8873ec77`, game 1.20.0.0) and the comments at the top of `00_buildings.txt`, which say
 //! that a building with `province_max` in its `level_cap` is a provincial building, that `country_modifiers` take
 //! country modifiers (optionally limited by `enable_for_controllers`) and `state_modifiers` take state modifiers.
 //! Values are stored as written; what they do (costs, slots, damage) is decided by the systems that use them.

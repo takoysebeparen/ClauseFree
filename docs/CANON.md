@@ -14,6 +14,14 @@ where our behaviour comes from and where it knowingly differs.
 
 Disassembling or decompiling the game executable is **not** a permitted source. See CONTRIBUTING.md.
 
+## Reference game build
+
+Entries below were checked against the installation's `hoi4_rev.txt`. Current reference: **game 1.20.0.0, revision
+`8873ec77`** (with DLC up to `dlc054_to_the_bitter_end`). Earlier entries were first made on revision `7c6c1c59`
+and re-checked on `8873ec77`: the parser baseline is identical, the data loaders report no unknown keys, and the
+counts (provinces, states, equipment, sub-units, OOB files, buildings) did not change. When the game updates, re-run
+`parse_all --baseline` and the `coverage` example, then update this section.
+
 ## Entry template
 
 ```
@@ -50,10 +58,10 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
 
 ### Script syntax and malformed original files
 - Status: verified (by parsing a full installation)
-- Source: all `.txt/.gfx/.gui/.asset/.mod/.map` files of game revision `7c6c1c59` (base game, `integrated_dlc/`, `dlc/`).
+- Source: all `.txt/.gfx/.gui/.asset/.mod/.map` files of game revisions `7c6c1c59` and `8873ec77` (base game, `integrated_dlc/`, `dlc/`).
 - Behaviour: the original ships files with defects and still runs, so it evidently tolerates them: an unclosed `{` at end of file (60 occurrences), a stray `}`,
-  stray quotes, a key with no value. 40 files are affected; they are listed in
-  `crates/clausewitz/baseline/hoi4-7c6c1c59.txt`. `interface/credits.txt` is plain text, not script.
+  stray quotes, a key with no value. 39 files are affected; they are listed in
+  `crates/clausewitz/baseline/hoi4-8873ec77.txt`. `interface/credits.txt` is plain text, not script.
 - Ours: the parser reports each defect as a diagnostic and recovers (the tree keeps everything parsed so far), so
   engine behaviour for these files matches "tolerate". **Unmeasured:** how the original recovers (for example whether a
   quoted string may span lines). To be checked with an oracle scenario before relying on it.
@@ -87,7 +95,7 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
 - Source: https://hoi4.paradoxwikis.com/Modding, section "Code structure": "A space will not interrupt the string, but a direct newline will." The
   same section says strings are limited to 255 characters (not enforced by us yet).
 - Ours: the lexer ends an unterminated string at the end of the line. On the real installation this turned all stray
-  quotes in the original files into local problems (39 malformed files remain, all unclosed braces).
+  quotes in the original files into local problems (39 malformed files remain: 60 unclosed braces, 3 stray `}` and one key without a value).
 - Test: `crates/clausewitz/tests/parser.rs` (`unterminated_string_and_math`)
 
 ### Number representation
@@ -137,7 +145,8 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
 
 ### Balance constants live in Lua
 - Status: verified (files load completely)
-- Source: `common/defines/00_defines.lua`, `00_graphics.lua`, `01_career_profile.lua` (revision `7c6c1c59`).
+- Source: `common/defines/00_defines.lua`, `00_graphics.lua`, `01_career_profile.lua` (revision `7c6c1c59`; re-checked on `8873ec77`, where
+  patch 1.20 changed `00_defines.lua` and `NDefines` has 5927 values).
 - Behaviour: three global tables (`NDefines`, `NDefines_Graphics`, `NDefines_CareerProfile`); the last two are copied
   into `NDefines` by a `for k,v in pairs(...) do NDefines[k] = v end` loop at the end of their files. Five constants
   are written as products (`7 * 24`). Mods override single values with `NDefines.<section>.<key> = <value>`.
@@ -161,7 +170,7 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
 
 ### Orders of battle (history/units)
 - Status: verified (files load completely)
-- Source: 609 files in `history/units` (revision `7c6c1c59`).
+- Source: 609 files in `history/units` (revisions `7c6c1c59` and `8873ec77`).
 - Ours: `data::oob` reads division templates (regiments, support, regimental support grid) and divisions (name or
   ordered name, location, template, start experience and equipment factors, forced variants). Fleets, air wings,
   officers and `instant_effect` (starting production, a script) are deferred. 804 templates and 5074 divisions load.
@@ -172,7 +181,7 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
 
 ### Buildings
 - Status: verified (files load completely); semantics of most keys unmeasured
-- Source: `common/buildings/00_buildings.txt` and `01_landmark_buildings.txt` (revision `7c6c1c59`), including the
+- Source: `common/buildings/00_buildings.txt` and `01_landmark_buildings.txt` (revision `8873ec77`), including the
   comment at the top of the files: "if province_max is set, then building is provincial"; `country_modifiers` accept
   country modifiers and apply only to the controllers listed in `enable_for_controllers` "or if the list is empty";
   `local_resources_` may be followed by any resource name.

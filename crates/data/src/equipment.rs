@@ -1,7 +1,7 @@
 //! Equipment: `common/units/equipment/*.txt`, blocks `equipments` and `duplicate_archetypes`.
 //!
 //! Source: the syntax reference shipped with the game, `common/units/equipment/_documentation.md`, plus a key
-//! inventory of the files (revision `7c6c1c59`). Stats are stored as written. Inheritance (variant -> archetype,
+//! inventory of the files (revisions `7c6c1c59` and `8873ec77`). Stats are stored as written. Inheritance (variant -> archetype,
 //! `parent`, upgrades) and modular equipment (`module_slots`, `default_modules`, ...) are resolved by later layers;
 //! the modular keys are reported as deferred until the module loader exists.
 
