@@ -1,0 +1,13 @@
+[package]
+name = "sim"
+description = "Deterministic headless world simulation: clock, command queue, seeded RNG, state hash"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+data = { path = "../data" }
+
+[dev-dependencies]
+vfs = { path = "../vfs" }

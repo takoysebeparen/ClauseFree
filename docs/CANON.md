@@ -488,3 +488,42 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
   not override.
 - Ours: `replace` files first, then the rest in evaluation order; the first definition of a key wins.
 - Test: `crates/data/tests/loaders.rs` (`localisation_lines_and_precedence`)
+
+### Calendar
+- Status: wiki-only (community claim, not measured in HOI4)
+- Source: the author of the pdx.tools Clausewitz parser writes that Clausewitz dates do not incorporate leap years
+  (https://pdx.tools/blog/a-tour-of-pds-clausewitz-syntax/); a Paradox forum thread says the same for the engine's
+  date system in general (https://forum.paradoxplaza.com/forum/threads/while-everyone-is-debating-about-wars-i-have-a-more-important-question-is-february-29-a-thing-in-vic3.1497656/).
+  Consistent with the data: no file of the base game uses a 29 February date. Dates carry an hour
+  (`START_DATE = "1936.1.1.12"`); history files also use hour `1` (`1936.11.9.1`).
+- Ours: `sim::time::GameTime` counts hours since `0.1.1.0`; every year has 365 days, February 28; hours are 0..=23.
+  29 February and hour 24 are rejected as invalid dates. **To measure (oracle):** run 1936 past February in the
+  original and see whether 29.2.1936 is shown; whether the original counts hours 0..23 or 1..24.
+- Test: `crates/sim/src/time.rs`
+
+### Clock pulses
+- Status: guess
+- Source: none yet. The original has daily, weekly and monthly script hooks (on_actions), but when its daily and
+  monthly work runs relative to the hour is unmeasured.
+- Ours: each hour, commands due at that hour execute first, then hourly systems, then daily (at hour 0), monthly
+  (hour 0 of day 1) and yearly (hour 0 of 1 January) systems. No weekly pulse yet (how the original counts weeks is
+  unknown). A game starting at 12:00 therefore has its first daily pulse 12 hours in.
+- Test: `crates/sim/src/time.rs` (`pulses`)
+
+### Start of a game
+- Status: guess for the controller rule; the start date is read from data
+- Source: `NDefines.NGame.START_DATE` (`common/defines/00_defines.lua`); `history/states/*`.
+- Ours: `sim::World::from_database` starts at the define's date and takes owner and controller of each state from
+  its undated history; a state with an owner and no `controller` is controlled by its owner. Dated history blocks
+  (later bookmarks) are not applied yet.
+- Test: `crates/sim/tests/determinism.rs` (`real_game_runs_reproducibly`)
+
+### Random numbers and the state hash
+- Status: knowingly-different (by design)
+- Source: the original's generator is not observable in detail and must not be copied; console commands
+  `random_seed` and `SetRandomCount` (`documentation/console_commands_documentation.md`) show it is a seeded,
+  counted generator.
+- Ours: PCG32 (XSH RR) by M. E. O'Neill, checked against the reference implementation's output; the generator is
+  part of the world state. The state hash is FNV-1a 64 over explicitly ordered little-endian bytes. Results are
+  meant to be statistically like the original, never draw-for-draw identical.
+- Test: `crates/sim/src/rng.rs`, `crates/sim/src/hash.rs`, golden hash in `crates/sim/tests/determinism.rs`
