@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use clausewitz::Block;
+use clausewitz::{Block, Entry};
 use vfs::Vfs;
 
 use crate::report::{IssueKind, Report};
@@ -103,6 +103,8 @@ pub const COMBAT_SITUATIONS: [&str; 4] = ["river", "amphibious", "fort", "snow"]
 pub struct BattalionMult {
     pub category: String,
     pub add: bool,
+    /// `display_as_percentage = yes` (technologies only): how the tooltip shows the values.
+    pub display_as_percentage: bool,
     pub values: NumberList,
 }
 
@@ -254,22 +256,9 @@ fn parse_sub_unit(name: &str, block: &Block<'_>, ctx: &mut Ctx<'_, '_>) -> SubUn
         }
     }
     for e in f.take_all("battalion_mult") {
-        let Some(b) = ctx.block(e, &format!("{S}.battalion_mult")) else { continue };
-        let mut bf = Fields::new(b, format!("{S}.battalion_mult"));
-        let mut m = BattalionMult::default();
-        if let Some(c) = bf.take("category") {
-            m.category = ctx.text(c, &format!("{S}.battalion_mult.category")).unwrap_or_default();
+        if let Some(m) = parse_battalion_mult(e, ctx, S) {
+            u.battalion_mult.push(m);
         }
-        if let Some(a) = bf.take("add") {
-            m.add = ctx.bool(a, &format!("{S}.battalion_mult.add")).unwrap_or(false);
-        }
-        for v in bf.take_matching(|_| true) {
-            if let Some(n) = ctx.fixed(v, &format!("{S}.battalion_mult.<stat>")) {
-                m.values.push((v.key.text.to_string(), n));
-            }
-        }
-        bf.finish(ctx);
-        u.battalion_mult.push(m);
     }
     // Modifier blocks for leaders deployed with the unit, and module requirements, need the modifier and
     // equipment-module systems.
@@ -285,4 +274,29 @@ fn parse_sub_unit(name: &str, block: &Block<'_>, ctx: &mut Ctx<'_, '_>) -> SubUn
     }
     f.finish(ctx);
     u
+}
+
+/// Reads `battalion_mult = { ... }`; `schema` is the path of the enclosing block.
+pub(crate) fn parse_battalion_mult(entry: &Entry<'_>, ctx: &mut Ctx<'_, '_>, schema: &str) -> Option<BattalionMult> {
+    let path = format!("{schema}.battalion_mult");
+    let b = ctx.block(entry, &path)?;
+    let mut bf = Fields::new(b, path.clone());
+    let mut m = BattalionMult::default();
+    match bf.take("category") {
+        Some(c) => m.category = ctx.text(c, &format!("{path}.category")).unwrap_or_default(),
+        None => ctx.issue(entry.span, path.clone(), IssueKind::Missing("category")),
+    }
+    if let Some(a) = bf.take("add") {
+        m.add = ctx.bool(a, &format!("{path}.add")).unwrap_or(false);
+    }
+    if let Some(a) = bf.take("display_as_percentage") {
+        m.display_as_percentage = ctx.bool(a, &format!("{path}.display_as_percentage")).unwrap_or(false);
+    }
+    for v in bf.take_matching(|_| true) {
+        if let Some(n) = ctx.fixed(v, &format!("{path}.<stat>")) {
+            m.values.push((v.key.text.to_string(), n));
+        }
+    }
+    bf.finish(ctx);
+    Some(m)
 }

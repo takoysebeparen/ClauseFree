@@ -456,13 +456,20 @@ fn real_installation_loads_with_full_key_coverage() {
     let unknown: Vec<String> =
         report.issues.iter().filter(|i| i.kind == IssueKind::UnknownKey).map(|i| i.to_string()).take(5).collect();
     assert!(unknown.is_empty(), "{unknown:?}");
-    // The one broken reference is a defect of the original: `ship_hull_escort_carrier` gives a default module
-    // (`empty`) for `mid_2_custom_slot`, a slot it does not have.
+    // Both broken references are defects of the original: `ship_hull_escort_carrier` gives a default module
+    // (`empty`) for `mid_2_custom_slot`, a slot it does not have, and `advanced_modern_tank_turret_tech` enables the
+    // module `advanced_modern_tank_turret`, which no file defines.
     let broken: Vec<String> = report
         .issues
         .iter()
         .filter(|i| matches!(i.kind, IssueKind::BrokenReference(_)))
         .map(|i| format!("{} {}", i.file, i.path))
         .collect();
-    assert_eq!(broken, ["common/units/equipment/ship_hull_carrier.txt equipment.default_modules.<slot>"]);
+    assert_eq!(
+        broken,
+        [
+            "common/units/equipment/ship_hull_carrier.txt equipment.default_modules.<slot>",
+            "common/technologies/special_projects_tech.txt technology.enable_equipment_modules",
+        ]
+    );
 }

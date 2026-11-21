@@ -323,6 +323,20 @@ impl<'b, 'a> Fields<'b, 'a> {
         out
     }
 
+    /// Every unused bare value (`{ a b c }` items without a key), in order.
+    pub fn take_values(&mut self) -> Vec<&'b Value<'a>> {
+        let mut out = Vec::new();
+        for i in 0..self.used.len() {
+            if let clausewitz::Item::Value(v) = &self.block.items[i]
+                && !self.used[i]
+            {
+                self.used[i] = true;
+                out.push(v);
+            }
+        }
+        out
+    }
+
     /// Marks every unused entry whose key matches as understood-but-deferred (reported as such, not as unknown).
     pub fn defer_matching(&mut self, mut pred: impl FnMut(&str) -> bool) {
         for i in 0..self.used.len() {

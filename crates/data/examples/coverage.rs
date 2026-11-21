@@ -46,6 +46,12 @@ fn main() {
     println!("  equipment     {}", db.equipment.len());
     println!("  modules       {} ({} categories)", db.modules.len(), db.modules.categories().len());
     println!("  buildings     {} ({} spawn points)", db.buildings.len(), db.buildings.spawn_points.len());
+    println!(
+        "  technologies  {} ({} categories, {} folders)",
+        db.technologies.len(),
+        db.technologies.categories.len(),
+        db.technologies.folders.len()
+    );
     let divisions: usize = db.oobs.by_name.values().map(|o| o.divisions.len()).sum();
     let templates: usize = db.oobs.by_name.values().map(|o| o.templates.len()).sum();
     println!("  OOB files     {} ({templates} templates, {divisions} divisions)", db.oobs.len());

@@ -14,6 +14,7 @@ use crate::provinces::{self, Provinces};
 use crate::report::{IssueKind, Report};
 use crate::resources::{self, Resources};
 use crate::states::{self, States};
+use crate::technologies::{self, Technologies};
 use crate::terrain::{self, Terrain};
 use crate::units::{self, COMBAT_SITUATIONS, Units};
 
@@ -44,6 +45,7 @@ pub struct Database {
     pub defines: Defines,
     pub oobs: Oobs,
     pub buildings: Buildings,
+    pub technologies: Technologies,
 }
 
 impl Database {
@@ -62,6 +64,7 @@ impl Database {
             defines: defines::load(vfs, &mut report),
             oobs: oob::load(vfs, &mut report),
             buildings: buildings::load(vfs, &mut report),
+            technologies: technologies::load(vfs, &mut report),
         };
         db.check_references(&mut report);
         (db, report)
@@ -74,6 +77,7 @@ impl Database {
         self.check_oob_references(report);
         self.check_building_references(report);
         self.check_module_references(report);
+        self.check_technology_references(report);
         for p in self.provinces.by_id.values() {
             if self.terrain.get(&p.terrain).is_none() {
                 report.push("map/definition.csv", 0, "map.definition.terrain", IssueKind::BrokenReference("terrain"));
@@ -358,6 +362,75 @@ impl Database {
                             "oob.division.force_equipment_variants",
                             IssueKind::BrokenReference("equipment"),
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_technology_references(&self, report: &mut Report) {
+        let broken = |report: &mut Report, file: &str, path: &str, what: &'static str| {
+            report.push(file, 0, path, IssueKind::BrokenReference(what));
+        };
+        let techs = &self.technologies;
+        let is_unit_category = |c: &str| self.units.categories.iter().any(|k| k == c);
+        let is_terrain = |k: &str| self.terrain.get(k).is_some() || COMBAT_SITUATIONS.contains(&k);
+        for t in &techs.list {
+            let f = t.file.as_str();
+            for c in &t.categories {
+                if !techs.has_category(c) {
+                    broken(report, f, "technology.categories", "technology category");
+                }
+            }
+            for p in &t.folders {
+                if techs.folder(&p.folder).is_none() {
+                    broken(report, f, "technology.folder.name", "technology folder");
+                }
+            }
+            let tech_refs = t
+                .paths
+                .iter()
+                .map(|p| ("technology.path.leads_to_tech", p.leads_to.as_str()))
+                .chain(t.xor.iter().map(|x| ("technology.XOR", x.as_str())))
+                .chain(t.dependencies.iter().map(|(d, _)| ("technology.dependencies", d.as_str())))
+                .chain(t.sub_technologies.iter().map(|s| ("technology.sub_technologies", s.as_str())));
+            for (path, name) in tech_refs {
+                if techs.get(name).is_none() {
+                    broken(report, f, path, "technology");
+                }
+            }
+            for name in t.enabled_equipment() {
+                if !self.equipment.exists(name) {
+                    broken(report, f, "technology.enable_equipments", "equipment");
+                }
+            }
+            for name in t.enable_equipment_modules.iter().flat_map(|u| &u.names) {
+                if self.modules.get(name).is_none() {
+                    broken(report, f, "technology.enable_equipment_modules", "module");
+                }
+            }
+            for name in t.enable_subunits.iter().flat_map(|u| &u.names) {
+                if !self.units.sub_units.contains_key(name) {
+                    broken(report, f, "technology.enable_subunits", "sub-unit");
+                }
+            }
+            for (b, _) in &t.enable_buildings {
+                if self.buildings.get(b).is_none() {
+                    broken(report, f, "technology.enable_building.building", "building");
+                }
+            }
+            for u in &t.unit_stats {
+                if !self.units.sub_units.contains_key(&u.target) && !is_unit_category(&u.target) {
+                    broken(report, f, "technology.<unit>", "sub-unit or sub-unit category");
+                }
+                for k in u.terrain.keys() {
+                    if !is_terrain(k) {
+                        broken(report, f, "technology.<unit>.<terrain>", "terrain");
+                    }
+                }
+                for m in &u.battalion_mult {
+                    if !is_unit_category(&m.category) {
+                        broken(report, f, "technology.<unit>.battalion_mult.category", "sub-unit category");
                     }
                 }
             }

@@ -24,6 +24,7 @@ pub mod report;
 pub mod resources;
 pub mod source;
 pub mod states;
+pub mod technologies;
 pub mod terrain;
 pub mod types;
 pub mod units;

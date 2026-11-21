@@ -165,7 +165,16 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
   **Guesses:** `is_archetype` and `is_buildable` are never inherited (base-game archetypes are all unbuildable while
   their variants are buildable); list attributes (`type`, `upgrades`, `resources`) are replaced as a whole, not
   merged. All 342 equipment entries of the real installation resolve.
-- Test: `crates/data/tests/oob.rs` (`equipment_inherits_from_its_archetype`)
+- Copies made by duplicate archetypes: a duplicate archetype (`light_tank_aa_chassis`, archetype
+  `light_tank_chassis`) also copies every equipment of its archetype. The copy of `light_tank_chassis_1` is named
+  `light_tank_aa_chassis_1`: the comment in `x_tank_chassis.txt` says "For each duplicated equipment type (excluding
+  the archetype)" and gives that name as its example. These names are defined nowhere in the files, yet
+  technologies enable 99 of them and AI files and `variant_name` lists use them. `Equipment::duplicate_source`
+  resolves such a name (duplicate name + what follows the archetype name in the source's name; the source must have
+  that archetype and not be an archetype); the copies themselves, with `for_each` changes, are not built yet.
+  **Status of the naming rule:** read from one example and confirmed by every reference in the base game.
+- Test: `crates/data/tests/oob.rs` (`equipment_inherits_from_its_archetype`), `crates/data/tests/technologies.rs`
+  (`duplicate_archetypes_imply_copies_of_their_variants`)
 
 ### Equipment modules
 - Status: verified (files load completely); module stat arithmetic unmeasured
@@ -219,10 +228,41 @@ flags, `.dds` decoding, BMFont, localisation), map rendering, camera.
   strategic bombing and must be measured.
 - Test: `crates/data/tests/buildings.rs`
 
+### Technologies
+- Status: verified (files load completely); research mechanics unmeasured
+- Source: `common/technologies/*.txt` and `common/technology_tags/00_technology.txt` (revision `8873ec77`, a key
+  inventory of the files). No shipped documentation covers technologies.
+- Ours: `data::technologies` stores, as written: research cost, start year, research screen positions (`folder`),
+  categories, `path` arrows (`leads_to_tech`, `research_cost_coeff`, `ignore_for_layout`), `XOR`, `dependencies`,
+  sub-technologies, unlocks (`enable_equipments`, `enable_equipment_modules`, `enable_subunits`, `enable_building`),
+  special project specialisations, `ai_research_weights`, experience-research keys and display switches. Every other
+  `name = number` entry is kept as a country modifier, every other block as stats for a sub-unit or sub-unit category
+  (stats, terrain / combat situation blocks, `battalion_mult`). Triggers, effects and AI weights (`allow`,
+  `allow_branch`, `ai_will_do`, `on_research_complete`, `on_research_complete_limit`) and the `limit` of an unlock
+  block are deferred to the script VM; an unlock with a `limit` is marked conditional. Categories and folders come
+  from `technology_categories` / `technology_folders` (a folder's `available` trigger is deferred). 553
+  technologies, 133 categories and 16 folders load with no unknown keys. Every category, folder, technology,
+  equipment (counting duplicate-archetype copies, see "Equipment inheritance"), sub-unit, building, terrain and
+  sub-unit category named by technologies exists, with one exception below.
+- `XOR` is written in upper case in `industry.txt` and `MTG_naval.txt` (one empty block) and as `xor` in two
+  special-forces technologies of `infantry.txt`; both are read. **Guess:** the original accepts both spellings;
+  whether `xor` actually excludes `improved_special_forces` / `advanced_special_forces` in game is unverified.
+- Doctrines are no longer technologies (since 1.17 they live in `common/doctrines`), though the doctrine folders
+  are still declared in `technology_folders`. Technology sharing groups (`common/technology_sharing`) are not loaded
+  yet.
+- **To measure:** how `research_cost`, `start_year` (ahead-of-time penalty) and `research_cost_coeff` combine into
+  research time; what a `dependencies` value (`= 1`) means; what `XOR` does when both sides are researched by effect.
+- Original defects found: `excavation1`-`excavation5` have `path = { research_cost_coeff = 1 }` without a target
+  (reported); three empty `path = { }` blocks (ignored); `air_equipment` declared twice in `technology_categories`;
+  `advanced_modern_tank_turret_tech` enables the module `advanced_modern_tank_turret`, which no file defines.
+- Test: `crates/data/tests/technologies.rs`
+
 ### Script constants (`@name`)
 - Status: guess
 - Source: `01_landmark_buildings.txt` defines `@landmark_repair_speed_factor = 0.15` at the top and uses it in the
-  same file. The wiki could not be consulted (its pages served a bot challenge).
+  same file. Seven files of `common/technologies` define constants inside the `technologies` block (`@1936 = 2`, used
+  for research screen positions); `@1936` is defined in three of them, and no file uses a constant it does not define,
+  consistent with file scope. The wiki could not be consulted (its pages served a bot challenge).
 - Ours: `data::source::Constants` treats constants as local to the file that defines them, first definition kept;
   an unknown constant is reported, inline math `@[ ... ]` is reported as unsupported. **To check:** scope (file vs.
   folder vs. global) and redefinition behaviour.

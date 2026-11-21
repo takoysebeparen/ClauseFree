@@ -256,6 +256,35 @@ impl Equipment {
         self.by_name.is_empty()
     }
 
+    /// For a name the files do not define but a duplicate archetype implies, the duplicate archetype and the
+    /// equipment it copies: `light_tank_aa_chassis_1` is `light_tank_chassis_1` copied for `light_tank_aa_chassis`
+    /// (whose archetype is `light_tank_chassis`).
+    ///
+    /// Source: the comment in `x_tank_chassis.txt` ("For each duplicated equipment type (excluding the archetype) ...
+    /// Example: light_tank_aa_chassis_1 gets variant_name light_tank_aa_equipment_1"). The naming rule (the copy takes
+    /// the duplicate's name followed by what follows the archetype's name in the source's name) is read from that
+    /// example and from technologies, AI files and `variant_name` lists that use such names; see `docs/CANON.md`,
+    /// "Equipment inheritance". The copies are not materialised here.
+    pub fn duplicate_source(&self, name: &str) -> Option<(&EquipmentDef, &EquipmentDef)> {
+        if self.by_name.contains_key(name) {
+            return None;
+        }
+        self.by_name.values().filter(|d| d.duplicate && name.starts_with(d.name.as_str())).find_map(|dup| {
+            let suffix = &name[dup.name.len()..];
+            let archetype = dup.text("archetype")?;
+            if suffix.is_empty() {
+                return None;
+            }
+            let source = self.by_name.get(&format!("{archetype}{suffix}"))?;
+            (source.text("archetype") == Some(archetype) && !source.is_archetype()).then_some((dup, source))
+        })
+    }
+
+    /// Defined in the files, or implied by a duplicate archetype (see [`Equipment::duplicate_source`]).
+    pub fn exists(&self, name: &str) -> bool {
+        self.by_name.contains_key(name) || self.duplicate_source(name).is_some()
+    }
+
     /// The equipment with everything it inherits through its `archetype` chain filled in.
     ///
     /// Rules (community wiki "Equipment modding": "Archetype equipment is used to assign more general attributes
